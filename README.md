@@ -213,6 +213,15 @@ and no pass-through arguments** — only which flake ref to activate:
   display arguments, so you couldn't see it happening.
 - A failed or unauthorized apply restores the previous `flake.lock`, leaving the repo as
   it was.
+- Before anything is written, the candidate lock is checked against `exclude_inputs`: if a
+  pinned input would move, the apply is refused. `check.rs` already restricts which inputs
+  advance, so this only fires if that logic is wrong — which is exactly when you want it,
+  since silently advancing e.g. a rev-pinned kernel input can leave a machine unbootable.
+- The D-Bus methods that change state (`Apply`, `Dismiss`) verify the caller's executable
+  is the notifier's own client. This is **defence in depth, not a boundary**: anyone who
+  can run code as you can just run our client. It stops confined callers (a Flatpak app
+  with bus access) and buggy ones — notably from silently suppressing update notifications
+  forever via `Dismiss`. Same-uid isolation isn't something D-Bus can provide.
 
 **The inherent limit — please read before enabling `polkit.passwordlessUsers`.** Root
 evaluates the flake in your checkout, and that checkout is writable by you. So anyone who

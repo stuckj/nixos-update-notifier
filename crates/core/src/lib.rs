@@ -9,6 +9,7 @@ pub mod changelog;
 pub mod check;
 pub mod config;
 pub mod diff;
+pub mod lock;
 pub mod nix;
 
 /// D-Bus well-known name, object path, and interface the daemon exposes and the GTK

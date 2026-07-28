@@ -41,6 +41,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             Updater {
                 shared: shared.clone(),
                 tx: tx.clone(),
+                allowed_exes: allowed_caller_exes(),
             },
         )
         .context("exporting D-Bus object")?
@@ -188,6 +189,22 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Verify the candidate lock leaves every `exclude_inputs` entry untouched, and log what it
+/// *does* advance. Errors carry a user-presentable message.
+async fn verify_pins(cfg: &Config, candidate_lock: &Path) -> Result<()> {
+    let current = tokio::fs::read_to_string(cfg.flake_path.join("flake.lock"))
+        .await
+        .context("reading the repo's current flake.lock")?;
+    let candidate = tokio::fs::read_to_string(candidate_lock)
+        .await
+        .context("reading the candidate flake.lock")?;
+
+    let changed =
+        nun_core::lock::ensure_pinned_unchanged(&current, &candidate, &cfg.exclude_inputs)?;
+    tracing::info!(?changed, "candidate advances these inputs");
+    Ok(())
+}
+
 /// Update both the shared state (for D-Bus readers) and the tray icon.
 async fn set_status(shared: &SharedState, handle: &ksni::Handle<NixTray>, status: Status) {
     shared.lock().await.status = status;
@@ -206,6 +223,16 @@ fn summarize(changes: &[PackageChange]) -> String {
 
 fn self_exe() -> Result<PathBuf> {
     std::env::current_exe().context("locating own executable path")
+}
+
+/// Executables allowed to call the state-changing D-Bus methods: our GTK client and the
+/// daemon itself. Canonicalised so the comparison against `/proc/<pid>/exe` (which is
+/// already fully resolved) is like-for-like.
+fn allowed_caller_exes() -> Vec<PathBuf> {
+    [gtk_client_exe(), self_exe().unwrap_or_default()]
+        .into_iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect()
 }
 
 /// Locate the GTK client binary (installed next to the daemon), falling back to PATH.
@@ -248,6 +275,20 @@ async fn apply_flow(
             return;
         }
     };
+
+    // Last-chance safety net before anything is written: verify this candidate does not
+    // advance a pinned input. check.rs already restricts `nix flake update` to the
+    // configured set, so this only fires if that logic is wrong — which is exactly when you
+    // want it, since silently advancing e.g. a rev-pinned kernel input can leave the
+    // machine unbootable.
+    if let Err(e) = verify_pins(cfg, candidate_lock).await {
+        tracing::error!("apply aborted: {e:#}");
+        if cfg.notify {
+            let _ = notify::notify("NixOS update blocked", &e.to_string(), &cfg.icons.error).await;
+        }
+        set_status(shared, handle, Status::Error).await;
+        return;
+    }
 
     // Install the candidate lock ourselves, UNPRIVILEGED — it's the user's own file, and
     // keeping root away from user-writable paths is a deliberate security property (see
