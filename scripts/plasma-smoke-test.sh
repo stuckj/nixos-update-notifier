@@ -136,6 +136,28 @@ else
   no "GetUpdates failed"
 fi
 
+# Regression guard. The command loop used to await the check inline, so for the whole
+# duration of a check (40s to minutes, and one runs at startup) the daemon accepted no menu
+# actions: clicks queued silently and then all fired at once when the check finished. It
+# looked exactly like "the tray menu is broken". SIGUSR1 is a command the loop must handle,
+# so if the daemon is mid-check and still logs/handles it promptly, the loop is not blocked.
+echo "== Responsiveness while checking =="
+status_now() { $BUS call "$SVC" "$OBJ" "$IFACE" GetStatus 2>/dev/null; }
+if [[ "$(status_now)" == *checking* ]]; then
+  if [[ -n "${DPID:-}" ]] && kill -USR1 "$DPID" 2>/dev/null; then
+    sleep 2
+    if [[ "$(status_now)" == *checking* ]]; then
+      ok "daemon still responsive mid-check (accepted SIGUSR1, check undisturbed)"
+    else
+      info "status changed while probing; inconclusive"
+    fi
+  else
+    info "no daemon PID to signal (reusing an existing daemon); skipping"
+  fi
+else
+  info "daemon is not mid-check right now; skipping this probe"
+fi
+
 echo "== Tray (SNI) =="
 items=$($BUS get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
   org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems 2>/dev/null)
