@@ -67,19 +67,41 @@ fn build_updates_window(app: &Application) {
                 Some(c) => match c.updates() {
                     Ok(changes) => {
                         let status = c.status().map(|(s, _)| s).unwrap_or_default();
-                        header.set_text(&format!(
-                            "{} package change(s){}",
-                            changes.len(),
-                            if status.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" — {status}")
-                            }
-                        ));
-                        if changes.is_empty() {
-                            let row = gtk::Label::new(Some("No pending updates."));
+
+                        // An empty list is ambiguous on its own, so let the daemon's status
+                        // disambiguate. Advancing an input can change the system derivation
+                        // without changing any package version (a flake rev bump with no
+                        // rebuilt packages) — there IS something to apply, and saying "no
+                        // pending updates" here would flatly contradict the tray icon.
+                        let (heading, empty_note) = match (status.as_str(), changes.is_empty()) {
+                            ("updates", true) => (
+                                "System update available — no package version changes".to_string(),
+                                Some(
+                                    "Input revisions advanced, but no package versions changed.\n\
+                                     Applying will rebuild the system with the new inputs.",
+                                ),
+                            ),
+                            ("checking", true) => (
+                                "Checking for updates…".to_string(),
+                                Some("The daemon is evaluating your flake."),
+                            ),
+                            ("error", true) => (
+                                "Last check failed".to_string(),
+                                Some("See the daemon log; press Check now to retry."),
+                            ),
+                            (_, true) => (
+                                "System is up to date".to_string(),
+                                Some("No pending updates."),
+                            ),
+                            (_, false) => (format!("{} package change(s)", changes.len()), None),
+                        };
+                        header.set_text(&heading);
+
+                        if let Some(note) = empty_note {
+                            let row = gtk::Label::new(Some(note));
                             row.set_margin_top(16);
                             row.set_margin_bottom(16);
+                            row.set_justify(gtk::Justification::Center);
                             list.append(&row);
                         }
                         for change in &changes {
