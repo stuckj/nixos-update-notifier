@@ -55,6 +55,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
         .context("installing SIGUSR1 handler")?;
 
+    // Checks run in their own task and report back here. Awaiting `check::run` inline
+    // would block this loop for the entire check — 40s to several minutes on a cold
+    // evaluation — during which every tray menu action (Settings, View updates, Quit)
+    // would sit unprocessed in the channel and the daemon would look dead. Menu clicks
+    // then all fired at once when the check finally finished.
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<Result<check::CheckOutcome>>();
+    let mut checking = false;
+
     // Kick off an initial check shortly after startup.
     let _ = tx.send(Command::CheckNow);
 
@@ -62,6 +70,13 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         let cmd = tokio::select! {
             _ = ticker.tick() => Command::CheckNow,
             _ = sigusr1.recv() => Command::CheckNow,
+            // A finished check is handled here rather than as a Command, so it can never
+            // block command processing.
+            Some(result) = done_rx.recv() => {
+                checking = false;
+                handle_check_result(result, &cfg, &shared, &tray_handle).await;
+                continue;
+            }
             maybe = rx.recv() => match maybe {
                 Some(c) => c,
                 None => break,
@@ -70,6 +85,13 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 
         match cmd {
             Command::CheckNow => {
+                // Collapse overlapping requests: a timer tick or a second click while a
+                // check is already in flight is a no-op rather than a queued duplicate.
+                if checking {
+                    tracing::debug!("check already in progress; ignoring request");
+                    continue;
+                }
+
                 set_status(&shared, &tray_handle, Status::Checking).await;
 
                 // Hot-reload config so Settings changes take effect (except interval,
@@ -84,75 +106,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                         .await;
                 }
 
-                match check::run(&cfg).await {
-                    Ok(outcome) if outcome.updates_available => {
-                        let count = outcome.count();
-                        set_status(&shared, &tray_handle, Status::UpdatesAvailable(count)).await;
-
-                        let (is_new, dismissed) = {
-                            let s = shared.lock().await;
-                            (
-                                s.last_notified_drv.as_deref() != Some(&outcome.candidate_drv),
-                                s.dismissed_drv.as_deref() == Some(&outcome.candidate_drv),
-                            )
-                        };
-
-                        let notified = if cfg.notify && is_new && !dismissed {
-                            let (title, body) = if count == 0 {
-                                (
-                                    "NixOS system update available".to_string(),
-                                    "Input revisions advanced; no package version changes \
-                                     detected."
-                                        .to_string(),
-                                )
-                            } else {
-                                (
-                                    format!("{count} NixOS update(s) available"),
-                                    summarize(&outcome.changes),
-                                )
-                            };
-                            if let Err(e) =
-                                notify::notify(&title, &body, &cfg.icons.updates_available).await
-                            {
-                                tracing::warn!("notification failed: {e:#}");
-                            }
-                            true
-                        } else {
-                            false
-                        };
-
-                        let mut s = shared.lock().await;
-                        s.changes = outcome.changes.clone();
-                        s.candidate_lock = Some(outcome.candidate_lock.clone());
-                        s.candidate_drv = Some(outcome.candidate_drv.clone());
-                        if notified {
-                            s.last_notified_drv = Some(outcome.candidate_drv.clone());
-                        }
-                    }
-                    Ok(_up_to_date) => {
-                        set_status(&shared, &tray_handle, Status::Idle).await;
-                        let mut s = shared.lock().await;
-                        s.changes.clear();
-                        s.candidate_lock = None;
-                        s.candidate_drv = None;
-                        s.dismissed_drv = None;
-                    }
-                    Err(e) => {
-                        tracing::error!("update check failed: {e:#}");
-                        set_status(&shared, &tray_handle, Status::Error).await;
-                        // Drop the previous candidate. The working copy is wiped at the
-                        // start of every check, so after a failure the retained lock path
-                        // may be gone or hold the unmodified lock — applying it would
-                        // rebuild from the wrong input. Clearing also stops `GetUpdates`
-                        // from serving a stale list alongside an error status.
-                        // `dismissed_drv`/`last_notified_drv` are deliberately left alone
-                        // so a transient failure doesn't re-notify an already-seen set.
-                        let mut s = shared.lock().await;
-                        s.changes.clear();
-                        s.candidate_lock = None;
-                        s.candidate_drv = None;
-                    }
-                }
+                checking = true;
+                let cfg_for_check = cfg.clone();
+                let done_tx = done_tx.clone();
+                tokio::spawn(async move {
+                    let _ = done_tx.send(check::run(&cfg_for_check).await);
+                });
             }
 
             Command::ViewUpdates => {
@@ -187,6 +146,83 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Fold a finished check into the shared state, the tray, and (if warranted) a
+/// notification. Split out of the loop so the check itself can run in its own task.
+async fn handle_check_result(
+    result: Result<check::CheckOutcome>,
+    cfg: &Config,
+    shared: &SharedState,
+    tray_handle: &ksni::Handle<NixTray>,
+) {
+    match result {
+        Ok(outcome) if outcome.updates_available => {
+            let count = outcome.count();
+            set_status(shared, tray_handle, Status::UpdatesAvailable(count)).await;
+
+            let (is_new, dismissed) = {
+                let s = shared.lock().await;
+                (
+                    s.last_notified_drv.as_deref() != Some(&outcome.candidate_drv),
+                    s.dismissed_drv.as_deref() == Some(&outcome.candidate_drv),
+                )
+            };
+
+            let notified = if cfg.notify && is_new && !dismissed {
+                let (title, body) = if count == 0 {
+                    (
+                        "NixOS system update available".to_string(),
+                        "Input revisions advanced; no package version changes \
+                                     detected."
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        format!("{count} NixOS update(s) available"),
+                        summarize(&outcome.changes),
+                    )
+                };
+                if let Err(e) = notify::notify(&title, &body, &cfg.icons.updates_available).await {
+                    tracing::warn!("notification failed: {e:#}");
+                }
+                true
+            } else {
+                false
+            };
+
+            let mut s = shared.lock().await;
+            s.changes = outcome.changes.clone();
+            s.candidate_lock = Some(outcome.candidate_lock.clone());
+            s.candidate_drv = Some(outcome.candidate_drv.clone());
+            if notified {
+                s.last_notified_drv = Some(outcome.candidate_drv.clone());
+            }
+        }
+        Ok(_up_to_date) => {
+            set_status(shared, tray_handle, Status::Idle).await;
+            let mut s = shared.lock().await;
+            s.changes.clear();
+            s.candidate_lock = None;
+            s.candidate_drv = None;
+            s.dismissed_drv = None;
+        }
+        Err(e) => {
+            tracing::error!("update check failed: {e:#}");
+            set_status(shared, tray_handle, Status::Error).await;
+            // Drop the previous candidate. The working copy is wiped at the
+            // start of every check, so after a failure the retained lock path
+            // may be gone or hold the unmodified lock — applying it would
+            // rebuild from the wrong input. Clearing also stops `GetUpdates`
+            // from serving a stale list alongside an error status.
+            // `dismissed_drv`/`last_notified_drv` are deliberately left alone
+            // so a transient failure doesn't re-notify an already-seen set.
+            let mut s = shared.lock().await;
+            s.changes.clear();
+            s.candidate_lock = None;
+            s.candidate_drv = None;
+        }
+    }
 }
 
 /// Verify the candidate lock leaves every `exclude_inputs` entry untouched, and log what it
