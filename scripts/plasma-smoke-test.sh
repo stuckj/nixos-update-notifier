@@ -159,6 +159,31 @@ else
 fi
 
 echo "== Tray (SNI) =="
+# An icon name the theme cannot resolve renders as a blank gap and logs nothing anywhere,
+# so check the names the item actually publishes against the icon theme. This is how the
+# tray silently showed no icon: three of the defaults were plausible freedesktop names that
+# Breeze does not ship.
+if [[ -n "${DPID:-}" ]]; then
+  sni="org.kde.StatusNotifierItem-${DPID}-1"
+  for prop in IconName AttentionIconName; do
+    name=$($BUS get-property "$sni" /StatusNotifierItem org.kde.StatusNotifierItem "$prop" 2>/dev/null \
+             | awk '{print $2}' | tr -d '"')
+    if [[ -z "$name" ]]; then
+      info "$prop not published (yet)"
+      continue
+    fi
+    found=""
+    IFS=':' read -r -a datadirs <<< "${XDG_DATA_DIRS:-/usr/share}"
+    for d in "${datadirs[@]}" "$HOME/.local/share" "$HOME/.nix-profile/share" /run/current-system/sw/share; do
+      [[ -d "$d/icons" ]] || continue
+      if find "$d/icons" -name "${name}.*" -print -quit 2>/dev/null | grep -q .; then found=1; break; fi
+    done
+    # Plasma resolves against its own Breeze copy, which may not be in our XDG_DATA_DIRS,
+    # so a miss here is a warning to check by eye rather than an outright failure.
+    if [[ -n "$found" ]]; then ok "$prop '$name' resolves in an icon theme"
+    else info "$prop '$name' not found in this process's icon paths — confirm it renders"; fi
+  done
+fi
 items=$($BUS get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
   org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems 2>/dev/null)
 if echo "$items" | grep -qi "UpdateNotifier"; then
