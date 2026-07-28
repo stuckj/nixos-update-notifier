@@ -71,11 +71,20 @@ pub struct Icons {
 
 impl Default for Icons {
     fn default() -> Self {
-        // These are standard freedesktop / Plasma icon names.
+        // Names verified to exist in Breeze (KDE's default theme) — this is the
+        // `update-*` status family KDE's own updater uses, plus `view-refresh` and
+        // `dialog-error` from the standard action/status sets.
+        //
+        // Do not be tempted by plausible-sounding freedesktop names: `nix-snowflake`
+        // (needs the nixos-icons package), `emblem-synchronizing` and
+        // `software-update-available` are NOT in Breeze, and an unresolvable name makes
+        // the tray item render as a blank gap with no error anywhere.
+        //
+        // On a non-KDE desktop these may not resolve either; override them in `[icons]`.
         Self {
-            idle: "nix-snowflake".into(),
-            checking: "emblem-synchronizing".into(),
-            updates_available: "software-update-available".into(),
+            idle: "update-none".into(),
+            checking: "view-refresh".into(),
+            updates_available: "update-medium".into(),
             error: "dialog-error".into(),
         }
     }

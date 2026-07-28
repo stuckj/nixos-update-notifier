@@ -37,9 +37,15 @@ notify = true
 # what root evaluates and builds — more than "rebuild my machine", and not shown on the
 # polkit prompt. Setting it now fails config parsing rather than being silently ignored.
 
-# Freedesktop icon names per tray state (override if your icon theme lacks the defaults).
+# Icon names per tray state. The defaults below are verified to exist in Breeze (KDE's
+# default theme) — an icon name the theme cannot resolve makes the tray item render as a
+# blank gap, with no error logged anywhere, so change these only to names you have checked.
+#
+# On a non-KDE desktop, or to use the Nix logo (needs the `nixos-icons` package), override:
+#   idle = "nix-snowflake"
+#
 # [icons]
-# idle = "nix-snowflake"
-# checking = "emblem-synchronizing"
-# updates_available = "software-update-available"
+# idle = "update-none"
+# checking = "view-refresh"
+# updates_available = "update-medium"   # "update-high" is more attention-grabbing
 # error = "dialog-error"
