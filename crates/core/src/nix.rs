@@ -76,21 +76,45 @@ pub async fn flake_input_names(flake_dir: &Path) -> Result<Vec<String>> {
 
 /// Advance the given inputs in the flake located at `flake_dir`, rewriting its
 /// `flake.lock` *in place*. Callers must only ever point this at a throwaway copy during
-/// a check — never at the user's real repo (except from the privileged apply path).
+/// a check — never at the user's real repo.
 ///
 /// With no inputs, this is a no-op (we never advance "everything" implicitly here; the
-/// caller resolves the effective set first).
-pub async fn flake_update_inputs(flake_dir: &Path, inputs: &[String]) -> Result<()> {
-    if inputs.is_empty() {
-        return Ok(());
+/// caller resolves the effective set first). Returns the inputs that could NOT be
+/// advanced, with the reason; an empty vec means all of them advanced.
+///
+/// Inputs are updated ONE AT A TIME rather than in a single `nix flake update a b c`.
+/// A single invocation is atomic: if any one input fails, none of them advance and the
+/// whole check errors out. That is a bad trade in practice — a flake input pointing at a
+/// local fork that has been moved or deleted (`error: Git repository "…" does not exist`)
+/// would then hide pending nixpkgs updates behind a bare "check failed". Per-input updates
+/// cost a few more nix invocations but let one broken input be reported while everything
+/// else still gets checked.
+pub async fn flake_update_inputs(
+    flake_dir: &Path,
+    inputs: &[String],
+) -> Result<Vec<(String, String)>> {
+    let mut failures = Vec::new();
+    for input in inputs {
+        let mut c = nix_base();
+        c.current_dir(flake_dir);
+        // `nix flake update <input>` (Nix 2.19+) advances exactly the named input.
+        c.args(["flake", "update", input]);
+        if let Err(e) = run_capture(&mut c).await {
+            // Keep only the most specific line of nix's multi-line error for display.
+            let reason = e
+                .to_string()
+                .lines()
+                .rfind(|l| l.trim_start().starts_with("error:"))
+                .unwrap_or("update failed")
+                .trim()
+                .trim_start_matches("error:")
+                .trim()
+                .to_string();
+            tracing::warn!(input = %input, %reason, "could not advance flake input");
+            failures.push((input.clone(), reason));
+        }
     }
-    let mut c = nix_base();
-    c.current_dir(flake_dir);
-    // `nix flake update <input>...` (Nix 2.19+) advances exactly the named inputs.
-    c.args(["flake", "update"]);
-    c.args(inputs);
-    run_capture(&mut c).await?;
-    Ok(())
+    Ok(failures)
 }
 
 /// Evaluate the `.drvPath` of a host's `system.build.toplevel` for a given flake ref.

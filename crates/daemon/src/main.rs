@@ -106,6 +106,13 @@ async fn run_check_cli(config_path: &std::path::Path, json: bool, exact: bool) -
     }
 
     println!("Advanced inputs: {}", outcome.advanced_inputs.join(", "));
+    if !outcome.failed_inputs.is_empty() {
+        println!("\nWARNING — these inputs could not be advanced and were skipped:");
+        for (name, reason) in &outcome.failed_inputs {
+            println!("  {name}: {reason}");
+        }
+        println!("The results below reflect only the inputs that did advance.\n");
+    }
     if !outcome.updates_available {
         println!("System is up to date — no changes from advancing those inputs.");
         return Ok(());

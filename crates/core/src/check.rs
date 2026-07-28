@@ -35,6 +35,10 @@ pub struct CheckOutcome {
     /// The candidate toplevel `.drvPath` — identifies this pending update set (used for
     /// dismiss tracking and as the build target for an exact diff).
     pub candidate_drv: String,
+    /// Inputs that could not be advanced, with the reason (e.g. a local fork whose repo has
+    /// been moved away). The check still reports whatever the remaining inputs produced,
+    /// rather than failing outright.
+    pub failed_inputs: Vec<(String, String)>,
 }
 
 impl CheckOutcome {
@@ -141,10 +145,21 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         .await
         .context("evaluating current toplevel drvPath")?;
 
-    // Advance only the configured inputs.
-    nix::flake_update_inputs(&work, &inputs)
+    // Advance only the configured inputs. A failure here is per-input and non-fatal: we
+    // report which ones could not move and continue with the rest, so one broken input
+    // cannot hide pending updates from all the others.
+    let failed_inputs = nix::flake_update_inputs(&work, &inputs)
         .await
         .context("running nix flake update in working copy")?;
+    anyhow::ensure!(
+        failed_inputs.len() < inputs.len(),
+        "no inputs could be advanced: {}",
+        failed_inputs
+            .iter()
+            .map(|(n, r)| format!("{n}: {r}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
 
     // Candidate: updated lock, from the same copy.
     let candidate_drv = nix::toplevel_drv_path(&work_ref, &cfg.host_attr)
@@ -167,6 +182,7 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
             candidate_lock,
             advanced_inputs: inputs,
             candidate_drv,
+            failed_inputs,
         });
     }
 
@@ -184,5 +200,6 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         candidate_lock,
         advanced_inputs: inputs,
         candidate_drv,
+        failed_inputs,
     })
 }

@@ -282,8 +282,12 @@ fn parse_version_set(s: &str) -> Vec<String> {
 
 /// A token that is a source/patch/archive artefact rather than a real version string.
 fn is_artefact_token(t: &str) -> bool {
-    const BAD: [&str; 9] = [
-        ".patch", ".diff", ".tar", ".tgz", ".zip", ".xz", ".gz", ".bz2", ".zst",
+    // Extensions seen leaking through in the wild: a `.dmg` source for a macOS-packaged
+    // app showed up as `Claude: <sha>.dmg -> <sha>.dmg`, which is a source bump, not a
+    // package version change.
+    const BAD: [&str; 15] = [
+        ".patch", ".diff", ".tar", ".tgz", ".zip", ".xz", ".gz", ".bz2", ".zst", ".dmg", ".exe",
+        ".deb", ".rpm", ".jar", ".whl",
     ];
     BAD.iter().any(|ext| t.contains(ext))
 }
@@ -402,6 +406,19 @@ bootstrap-stage2-stdenv-linux.drv: 1.drv \u{2192} 2.drv\n";
         c.retain(PackageChange::is_meaningful);
         let names: Vec<&str> = c.iter().map(|x| x.name.as_str()).collect();
         assert_eq!(names, vec!["firefox-unwrapped"]);
+    }
+
+    #[test]
+    fn filters_binary_source_artefacts() {
+        // Observed in the wild against a real config: a macOS .dmg source bump was
+        // reported as if it were a package version change.
+        let out = "\
+Claude: 1dc8f7b0.dmg \u{2192} 03c61d06.dmg\n\
+brave: 1.91.180.drv \u{2192} 1.92.144.drv\n";
+        let mut c = parse_diff_closures(out);
+        c.retain(PackageChange::is_meaningful);
+        let names: Vec<&str> = c.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, vec!["brave"]);
     }
 
     #[test]
