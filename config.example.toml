@@ -47,5 +47,6 @@ notify = true
 # [icons]
 # idle = "update-none"
 # checking = "view-refresh"
+# system_changes = "update-low"         # inputs moved but no package changed version
 # updates_available = "update-medium"   # "update-high" is more attention-grabbing
 # error = "dialog-error"

@@ -159,7 +159,15 @@ async fn handle_check_result(
     match result {
         Ok(outcome) if outcome.updates_available => {
             let count = outcome.count();
-            set_status(shared, tray_handle, Status::UpdatesAvailable(count)).await;
+            // Distinguish "packages moved" from "the system derivation changed but no
+            // package version did" — the latter is a config regeneration and gets a
+            // quieter state (no attention highlight, no notification).
+            let status = if count == 0 {
+                Status::SystemChangesOnly
+            } else {
+                Status::UpdatesAvailable(count)
+            };
+            set_status(shared, tray_handle, status).await;
 
             let (is_new, dismissed) = {
                 let s = shared.lock().await;
@@ -169,20 +177,14 @@ async fn handle_check_result(
                 )
             };
 
-            let notified = if cfg.notify && is_new && !dismissed {
-                let (title, body) = if count == 0 {
-                    (
-                        "NixOS system update available".to_string(),
-                        "Input revisions advanced; no package version changes \
-                                     detected."
-                            .to_string(),
-                    )
-                } else {
-                    (
-                        format!("{count} NixOS update(s) available"),
-                        summarize(&outcome.changes),
-                    )
-                };
+            // A config-only change is deliberately not notified: nothing the user
+            // recognises has changed, so a popup would be noise. The tray still shows the
+            // quieter state and the update is still applicable from the menu.
+            let notified = if cfg.notify && is_new && !dismissed && count > 0 {
+                let (title, body) = (
+                    format!("{count} NixOS update(s) available"),
+                    summarize(&outcome.changes),
+                );
                 if let Err(e) = notify::notify(&title, &body, &cfg.icons.updates_available).await {
                     tracing::warn!("notification failed: {e:#}");
                 }

@@ -74,6 +74,14 @@ fn build_updates_window(app: &Application) {
                         // rebuilt packages) — there IS something to apply, and saying "no
                         // pending updates" here would flatly contradict the tray icon.
                         let (heading, empty_note) = match (status.as_str(), changes.is_empty()) {
+                            ("system-changes", _) => (
+                                "Configuration changes — no package updates".to_string(),
+                                Some(
+                                    "Your flake inputs moved, but no package changed version.\n\
+                                     This is usually a module regenerating its configuration.\n\
+                                     Applying is safe but not urgent.",
+                                ),
+                            ),
                             ("updates", true) => (
                                 "System update available — no package version changes".to_string(),
                                 Some(

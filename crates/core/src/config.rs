@@ -65,6 +65,9 @@ pub struct Config {
 pub struct Icons {
     pub idle: String,
     pub checking: String,
+    /// System derivation changed but no package versions did — a deliberately low-key
+    /// state, so it uses a quieter icon than `updates_available`.
+    pub system_changes: String,
     pub updates_available: String,
     pub error: String,
 }
@@ -84,6 +87,7 @@ impl Default for Icons {
         Self {
             idle: "update-none".into(),
             checking: "view-refresh".into(),
+            system_changes: "update-low".into(),
             updates_available: "update-medium".into(),
             error: "dialog-error".into(),
         }

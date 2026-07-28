@@ -7,11 +7,21 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 /// Tray/notifier status, which drives the icon.
+///
+/// `SystemChangesOnly` and `UpdatesAvailable` are deliberately separate states. Advancing
+/// an input can change the system derivation while changing zero package versions — e.g. a
+/// home-manager bump that only regenerates its activation script, units and /etc entries
+/// (observed: 10 of 20,042 derivations differing, none of them a package). Badging that as
+/// "updates available" over-signals: the user sees an update badge, opens the window, and
+/// finds nothing to update. It is still worth applying, just not worth nagging about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Status {
     #[default]
     Idle,
     Checking,
+    /// The system derivation differs but no package version changed.
+    SystemChangesOnly,
+    /// At least one package version changed; `usize` is how many.
     UpdatesAvailable(usize),
     Error,
 }
@@ -21,6 +31,7 @@ impl Status {
         match self {
             Status::Idle => &icons.idle,
             Status::Checking => &icons.checking,
+            Status::SystemChangesOnly => &icons.system_changes,
             Status::UpdatesAvailable(_) => &icons.updates_available,
             Status::Error => &icons.error,
         }
@@ -30,10 +41,10 @@ impl Status {
         match self {
             Status::Idle => "NixOS: system up to date".to_string(),
             Status::Checking => "NixOS: checking for updates…".to_string(),
-            Status::UpdatesAvailable(0) => {
-                "NixOS: system changes available (no package version changes)".to_string()
+            Status::SystemChangesOnly => {
+                "NixOS: system configuration changes available (no package updates)".to_string()
             }
-            Status::UpdatesAvailable(n) => format!("NixOS: {n} update(s) available"),
+            Status::UpdatesAvailable(n) => format!("NixOS: {n} package update(s) available"),
             Status::Error => "NixOS update check failed".to_string(),
         }
     }
@@ -43,6 +54,7 @@ impl Status {
         match self {
             Status::Idle => "idle",
             Status::Checking => "checking",
+            Status::SystemChangesOnly => "system-changes",
             Status::UpdatesAvailable(_) => "updates",
             Status::Error => "error",
         }
@@ -53,6 +65,20 @@ impl Status {
             Status::UpdatesAvailable(n) => *n as u32,
             _ => 0,
         }
+    }
+
+    /// Whether this state warrants the tray's attention highlight. A config-only change
+    /// deliberately does not.
+    pub fn needs_attention(&self) -> bool {
+        matches!(self, Status::UpdatesAvailable(_))
+    }
+
+    /// Whether this state has something the user could apply.
+    pub fn is_applicable(&self) -> bool {
+        matches!(
+            self,
+            Status::UpdatesAvailable(_) | Status::SystemChangesOnly
+        )
     }
 }
 

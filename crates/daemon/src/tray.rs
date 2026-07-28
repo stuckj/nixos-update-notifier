@@ -24,8 +24,11 @@ impl NixTray {
         }
     }
 
+    /// Whether there is something to apply — enables the action menu items. Note this is
+    /// broader than `needs_attention()`: a config-only change is applicable but does not
+    /// light up the tray.
     fn has_updates(&self) -> bool {
-        matches!(self.status, Status::UpdatesAvailable(_))
+        self.status.is_applicable()
     }
 
     fn send(&self, cmd: Command) {
@@ -53,7 +56,9 @@ impl ksni::Tray for NixTray {
     }
 
     fn status(&self) -> ksni::Status {
-        if self.has_updates() {
+        // Only real package updates get the attention highlight. A config-only change is
+        // applicable but not worth nagging about, so it stays Active.
+        if self.status.needs_attention() {
             ksni::Status::NeedsAttention
         } else {
             ksni::Status::Active
