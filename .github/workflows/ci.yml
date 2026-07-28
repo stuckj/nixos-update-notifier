@@ -32,6 +32,8 @@ jobs:
         run: cargo clippy -p nun-core -p nixos-update-notifier --all-targets -- -D warnings
       - name: unit tests (core + daemon)
         run: cargo test -p nun-core -p nixos-update-notifier
+      - name: shellcheck scripts
+        run: shellcheck scripts/*.sh
 
   # Tier 2: build the whole flake (package incl. the GTK client + both Nix modules) and run
   # the in-sandbox test suite. This is what proves the GUI compiles and the flake is sound.

@@ -1,9 +1,21 @@
 name: Release
 
-# Modelled on stuckj/mkvdup's release flow (incl. the PR #200 improvements): the tag is
-# created by the `release` job via target_commitish, ONLY after every build has passed —
-# so a failed build never leaves a dangling tag pointing at a release that never happened.
-# Canary builds are marked as GitHub pre-releases.
+# Release flow modelled on stuckj/mkvdup (incl. PR #200 and the PR #207 canary rework),
+# adapted for a Rust + Nix flake:
+#
+#   prepare  → resolve version/tag/commit/is_canary; check the REMOTE for an existing tag.
+#   sync-version → write the version into the source ON THE RELEASED REF and commit it, so
+#                  the tag carries its own version (`--version` and the Nix store path are
+#                  correct). Canaries are cut from development branches, so this commits to
+#                  that branch — never to main-regardless-of-dispatch, which #207 fixed.
+#   build    → build the package from the version-bumped commit; assemble a tarball.
+#   release  → create the tag (at the bumped commit, via target_commitish) AND the GitHub
+#              release, only after the build passed. `-canary.` versions are pre-releases.
+#
+# There is no canary "channel": the flake ref is the selector, so a canary installs with
+#   nix profile install github:stuckj/nixos-update-notifier/<branch-or-tag>#default
+# And there is no vendorHash to refresh (cargoLock.lockFile vendors from the committed
+# Cargo.lock) — the whole class of problem #207's hash job solves does not exist here.
 
 on:
   workflow_dispatch:
@@ -12,7 +24,7 @@ on:
         description: 'Version without v prefix (e.g. 1.2.3, or 1.2.3-canary.1 for a canary)'
         required: true
       commit:
-        description: 'Commit SHA to release (optional; defaults to the latest commit on the branch)'
+        description: 'Commit SHA to release (optional; defaults to the head of the dispatched branch)'
         required: false
         default: ''
 
@@ -30,14 +42,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 50
+          fetch-depth: 0
 
       - name: Resolve version and commit
         id: resolve
         run: |
           VERSION="${{ github.event.inputs.version }}"
 
-          # Validate: bare semver-ish, no leading 'v'.
           if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+)*([.-][0-9A-Za-z]+)*$ ]]; then
             echo "::error::Invalid version '${VERSION}'. Expected e.g. '1.2.3' or '1.2.3-canary.1'."
             exit 1
@@ -47,46 +58,85 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-          # Canary = version contains "-canary." → published as a GitHub pre-release.
           IS_CANARY=false
-          if [[ "$VERSION" == *-canary.* ]]; then
-            IS_CANARY=true
-          fi
+          [[ "$VERSION" == *-canary.* ]] && IS_CANARY=true
           echo "is_canary=${IS_CANARY}" >> "$GITHUB_OUTPUT"
 
-          # Check the REMOTE for an existing tag (checkout is shallow; a local rev-parse
-          # can miss tags that exist upstream).
+          # Check the REMOTE for the tag (checkout history may not carry all tags).
           if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
             echo "::error::Tag ${TAG} already exists on origin"
             exit 1
           fi
 
-          # Resolve the commit to release.
           if [[ -n "${{ github.event.inputs.commit }}" ]]; then
-            COMMIT="${{ github.event.inputs.commit }}"
+            COMMIT=$(git rev-parse "${{ github.event.inputs.commit }}")
           else
             COMMIT=$(git rev-parse "origin/${{ github.ref_name }}")
           fi
-          FULL_SHA=$(git rev-parse "${COMMIT}")
-          echo "commit=${FULL_SHA}" >> "$GITHUB_OUTPUT"
-          echo "Will release ${TAG} at ${FULL_SHA} (canary=${IS_CANARY})"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "Will release ${TAG} at ${COMMIT} (canary=${IS_CANARY}) on branch ${{ github.ref_name }}"
 
-      # NOTE: the tag is deliberately NOT created here — see the release job.
+  sync-version:
+    # Writes the version into the source on the released ref, so the tag created by the
+    # release job actually contains it. Runs before build so the built artifact reports
+    # the right version too.
+    needs: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.sync.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Write version onto the released ref
+        id: sync
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          WANT_COMMIT: ${{ needs.prepare.outputs.commit }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          HEAD_SHA=$(git rev-parse HEAD)
+
+          # Only write the bump when releasing the branch head; a bump committed here would
+          # land on the head, so tagging a different requested commit would be wrong. In
+          # that case, tag exactly what prepare resolved.
+          if [[ "$WANT_COMMIT" != "$HEAD_SHA" ]]; then
+            echo "Releasing a specific commit (${WANT_COMMIT}), not branch head — not writing a bump."
+            echo "commit=${WANT_COMMIT}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          scripts/set-version.sh "$VERSION"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "Version already ${VERSION}; nothing to commit."
+            echo "commit=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "Release ${TAG} [skip ci]"
+          git push origin "HEAD:${BRANCH}"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: prepare
+    needs: [prepare, sync-version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.commit }}
+          ref: ${{ needs.sync-version.outputs.commit }}
       - uses: DeterminateSystems/nix-installer-action@main
 
       - name: Build package
         run: nix build -L
 
       - name: Assemble release tarball
-        id: pkg
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
           NAME="nixos-update-notifier_${VERSION}_x86_64-linux"
@@ -105,7 +155,7 @@ jobs:
             *.sha256
 
   release:
-    needs: [prepare, build]
+    needs: [prepare, sync-version, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -113,16 +163,16 @@ jobs:
           name: release-artifacts
           path: dist
 
-      - name: List artifacts
-        run: ls -la dist/
+      - run: ls -la dist/
 
-      # Creates the tag (via target_commitish) as well as the release, so the tag only
-      # comes into existence after the build has succeeded. Canary → pre-release.
+      # Creates the tag (at the version-bumped commit, via target_commitish) as well as the
+      # release — so the tag exists only after the build succeeded and carries its version.
+      # Canary → pre-release.
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
-          target_commitish: ${{ needs.prepare.outputs.commit }}
+          target_commitish: ${{ needs.sync-version.outputs.commit }}
           name: ${{ needs.prepare.outputs.tag }}
           files: dist/*
           generate_release_notes: true

@@ -289,6 +289,23 @@ $ nix eval --json nixpkgs#vlc.meta.changelog     # errors/absent → no link sho
 - Reboot is offered only when kernel/initrd/kernel-modules/systemd changed between
   `/run/booted-system` and `/run/current-system`.
 
+### 5. Smoke test on a real Plasma session
+
+The tray/SNI, notifications, D-Bus service, and GTK client can't be exercised headlessly.
+Run the guided, **read-only** (never applies) smoke test from inside your Plasma 6 session:
+
+```console
+$ nix build
+$ scripts/plasma-smoke-test.sh --bin-dir ./result/bin \
+    --flake ~/dev/personal/nixos-config --host nixos-x1
+# or against an already-running daemon (systemd user service):
+$ scripts/plasma-smoke-test.sh
+```
+
+It checks the SNI host + notification daemon, that the daemon owns `org.nixos.UpdateNotifier`
+and answers `GetStatus`/`GetUpdates`, that the tray item is registered, and that the GTK
+client opens and connects — with a PASS/FAIL summary.
+
 ---
 
 ## Gotchas (things that bit us)
@@ -336,8 +353,11 @@ crates/
   daemon/ src/{main,daemon,tray,notify,state,dbus}.rs
   gtk/    src/{main,ui,client}.rs
 nix/      package.nix, hm-module.nix, nixos-module.nix
+scripts/  set-version.sh (release), plasma-smoke-test.sh (manual Plasma smoke test)
 .github/  workflows/{ci,release}.yml
 ```
+
+Releasing (stable + canary) is documented in [`RELEASING.md`](RELEASING.md).
 
 ## Development
 
@@ -359,11 +379,18 @@ $ cargo test -p nun-core --test integration -- --ignored
   in-sandbox suite); (3) the fixture-flake **integration tests** that drive real `nix`
   invocations and lock the `diff-closures` output format against version drift.
 - **`release.yml`** is a manual `workflow_dispatch` (`version`, optional `commit`) modelled
-  on the mkvdup flow: a `prepare` job resolves the version and checks the **remote** for an
-  existing tag; `build` produces the package via `nix build` and a binary tarball; `release`
-  creates the **tag and GitHub release together** (via `target_commitish`) *only after the
-  build passes*, so a failed build never leaves a dangling tag. A version containing
-  `-canary.` (e.g. `1.2.0-canary.1`) is published as a **pre-release**.
+  on the mkvdup flow (PRs #200 + #207). A `sync-version` job writes the version into the
+  source **on the released ref** (so the tag reports its own version); `build` builds from
+  that commit; `release` creates the **tag and GitHub release together** (via
+  `target_commitish`) *only after the build passes*, so a failed build never leaves a
+  dangling tag. A version containing `-canary.` (e.g. `1.2.0-canary.1`) is a **pre-release**.
+  - **Canaries are cut from development branches** — the bump + tag land on that branch.
+    There's no canary channel to publish: with a flake the ref is the selector, so a canary
+    installs straight from its tag or branch,
+    `nix profile install 'github:stuckj/nixos-update-notifier/<branch-or-tag>#default'`.
+  - There is **no vendorHash to refresh** (`cargoLock.lockFile` vendors from the committed
+    `Cargo.lock`), so the Go-modules hash-refresh machinery from #207 isn't needed here.
+  - Full details in [`RELEASING.md`](RELEASING.md).
 
 ---
 
