@@ -1,13 +1,13 @@
 # nixos-update-notifier
 
-A system-tray update notifier for **flake-based NixOS** systems — think "the Ubuntu
-update notifier, but for NixOS flakes." It lives in your tray, periodically checks whether
-advancing your flake inputs would change your system, shows you a `name: old -> new`
-package diff **without downloading anything**, and applies updates on request via an
-authenticated `nixos-rebuild`.
+A system-tray update notifier for **flake-based NixOS** — the Ubuntu update notifier, but
+for NixOS flakes.
 
-> Status: v0.1. The core check/diff/apply mechanics are implemented and the no-download
-> check path has been validated against a real flake config (see [Verification](#verification)).
+It sits in your tray, periodically checks whether advancing your flake inputs would change
+your system, shows you a `name: old -> new` package list **without downloading anything**,
+and applies updates on request through an authenticated `nixos-rebuild`.
+
+Built for **KDE Plasma 6 on Wayland** (native StatusNotifierItem tray).
 
 ![tray icon states](docs/screenshot-tray.png)
 *Placeholder: tray icon showing idle / checking / updates-available states.*
@@ -19,104 +19,35 @@ authenticated `nixos-rebuild`.
 
 ## Features
 
-- **Native StatusNotifierItem (SNI) tray** via [`ksni`](https://crates.io/crates/ksni) —
-  works on **KDE Plasma 6 / Wayland** (legacy X11 XEmbed trays do not).
-- Tray icon reflects state: idle / checking / updates-available / error.
-- Configurable background check interval; on-demand check via the menu, a `SIGUSR1`, or an
-  optional systemd timer.
-- Desktop notifications through `org.freedesktop.Notifications` (D-Bus, no `notify-send`).
-- Tray menu: **Check now · View updates… · Apply updates · Dismiss until next check ·
-  Settings · Quit**.
-- **View updates** window (GTK4): each changed package as `name: old -> new` (added /
-  removed / upgraded), with a clickable **changelog** link where nixpkgs exposes
-  `meta.changelog`.
-- **Apply**: copies the candidate `flake.lock` into your repo and runs
-  `nixos-rebuild switch` under **polkit/`pkexec`** (never silent `sudo`, never auto-apply),
-  with a backup + auto-restore on failure, and a reboot prompt when the kernel/initrd
-  changed.
-- **Pinned-input exclusion**: an `exclude_inputs` list so deliberately rev-pinned inputs
-  (e.g. a `nixpkgs-kernel` that provides kernel + ZFS) are never advanced.
-- Everything is **config-driven** — nothing is hardcoded to one machine.
-
----
-
-## How it works (the crux)
-
-Updating a flake system means advancing `flake.lock` (via `nix flake update <input>…`) and
-rebuilding. A *check* must figure out what that would change **without touching your repo
-and without downloading package builds**:
-
-1. **Copy, don't mutate.** The flake repo is copied to a throwaway working dir under
-   `$XDG_CACHE_HOME`. Your real repo is only ever written to on **Apply**.
-2. **Baseline drv.** Evaluate the current `system.build.toplevel.drvPath` from the copy.
-   Evaluating `.drvPath` *instantiates* the derivation but does **not** realise it — no
-   substitutes are downloaded.
-3. **Advance inputs.** Run `nix flake update <inputs>` in the copy (only the inputs you
-   configured, minus `exclude_inputs`).
-4. **Candidate drv.** Evaluate the toplevel `.drvPath` again. If it equals the baseline →
-   no updates. If it differs → updates are available.
-5. **Diff, offline.** Run `nix store diff-closures <baseline.drv> <candidate.drv>` over the
-   two **derivation** paths and parse the result into a package list. Diffing *derivation*
-   closures (not realised outputs) never downloads substitutes.
-6. **Changelogs (best-effort).** For changed packages, resolve `meta.changelog` from a
-   configurable nixpkgs ref. Coverage in nixpkgs is partial; misses degrade gracefully.
-
-Only **Apply** realises anything (downloads + builds), and only after you click it.
-
-### What "downloads nothing" really means
-
-A check does **not** download or build any package outputs (the GB-scale traffic). It
-*does* fetch the **source of the flake inputs you advance** — e.g. advancing `nixpkgs`
-fetches the new nixpkgs tree (tens of MB), which is unavoidable because you can't evaluate
-against a revision you don't have. This is tiny compared to realising a system closure.
-
-### `diff-closures` reality (and why the list is filtered)
-
-Diffing **derivation** closures is what keeps the check download-free, but the raw output
-is messy — validated against a real `nixpkgs` bump:
-
-- It is **ANSI-coloured even when redirected** (we strip escapes).
-- Every node is a `.drv`, so upgrades read as `aws-c-http: 0.10.4.drv → 0.11.0.drv` (we
-  strip `.drv`).
-- It uses **two empty markers**: `∅` (U+2205, absent from the closure) and `ε` (U+03B5,
-  present but versionless).
-- The closure contains **source tarballs, patch files, CVE-named artefacts and toolchain
-  bootstrap stages**, and the name/version heuristic mangles some of them
-  (`CVE-2026-…​.patch` → name `CVE`). We filter these out.
-
-After parsing + filtering, what remains is a clean, useful list (in the validated run:
-**107** genuine changes like `brave`, `firefox-unwrapped`, `mesa`, `nix`, `libadwaita`,
-`ffmpeg`, …). It **does** still include build-time libraries and split derivations (e.g.
-the many `nix-*` components), because that is what a derivation-closure diff sees. That is
-the honest price of a no-download check.
-
-**Want the pristine runtime list?** `nixos-update-notifier check --exact` builds the
-candidate (this **downloads**) and diffs realised **output** closures against
-`/run/current-system` for the clean runtime-only view. It is never run in the background.
+- **Tray icon** that reflects state: up to date / checking / updates available / error.
+- **Background checks** on a configurable interval that **download nothing** — no package
+  builds are fetched just to tell you an update exists.
+- **Desktop notifications** when new updates appear.
+- **Update list** showing each change as `name: old -> new`, with a changelog link where
+  nixpkgs provides one.
+- **Apply** from the menu: installs the new `flake.lock` and runs `nixos-rebuild switch`
+  behind a polkit prompt, then tells you if a reboot is warranted.
+- **Pinned inputs are never advanced** — an `exclude_inputs` list protects things like a
+  rev-pinned `nixpkgs-kernel` that provides your kernel + ZFS.
+- Fully config-driven; nothing is hardcoded to a particular machine.
 
 ---
 
 ## Requirements
 
 - NixOS managed as a flake, rebuilt with `nixos-rebuild switch --flake <path>#<host>`.
-- A running **StatusNotifierHost** (KDE Plasma provides one; on wlroots compositors use
-  something like `waybar`).
-- `nix` with flakes enabled, `polkit`/`pkexec` for apply.
+- A running **StatusNotifierHost** — KDE Plasma provides one; on wlroots compositors use
+  something like `waybar`.
+- `nix` with flakes enabled, and `polkit`/`pkexec` for applying updates.
 
 ---
 
 ## Install
 
-This flake exposes `packages.<system>.default`, a **home-manager module**, a **NixOS
-module**, and a **devShell**.
+The flake exposes `packages.<system>.default`, a **home-manager module**, a **NixOS
+module**, and a devShell.
 
-> **Cargo.lock:** the package builds with `rustPlatform.buildRustPackage` using
-> `cargoLock.lockFile = ./Cargo.lock`. Generate it once in the devShell
-> (`nix develop -c cargo generate-lockfile`) and commit it before building the package.
-
-### Run from a local clone (before it's published anywhere)
-
-Point another flake at this repo with a path/`git+file` input:
+### 1. Add it as a flake input
 
 ```nix
 # in your system flake.nix
@@ -125,24 +56,24 @@ Point another flake at this repo with a path/`git+file` input:
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     home-manager.url = "github:nix-community/home-manager";
 
-    # Local clone as a flake input (either form works):
-    nixos-update-notifier.url = "git+file:///home/you/dev/personal/nixos-update-notifier";
-    # nixos-update-notifier.url = "path:/home/you/dev/personal/nixos-update-notifier";
+    nixos-update-notifier.url = "github:stuckj/nixos-update-notifier";
     nixos-update-notifier.inputs.nixpkgs.follows = "nixpkgs";
   };
 }
 ```
 
-Later, publishing to GitHub is a one-line change:
+To run from a local clone instead:
 
 ```nix
-nixos-update-notifier.url = "github:stuckj/nixos-update-notifier";
+nixos-update-notifier.url = "git+file:///home/you/dev/personal/nixos-update-notifier";
+# or: "path:/home/you/dev/personal/nixos-update-notifier"
 ```
 
-### Home-manager module (primary path — the tray is per-user)
+### 2. Enable the home-manager module
+
+This is the main way to use it — the tray is a per-user thing.
 
 ```nix
-# home configuration
 { inputs, ... }:
 {
   imports = [ inputs.nixos-update-notifier.homeManagerModules.default ];
@@ -152,292 +83,173 @@ nixos-update-notifier.url = "github:stuckj/nixos-update-notifier";
     flakePath = "/home/you/dev/personal/nixos-config";
     hostAttr = "nixos-x1";
 
-    # Advance everything EXCEPT the rev-pinned kernel input:
+    # Advance everything EXCEPT a rev-pinned input:
     excludeInputs = [ "nixpkgs-kernel" ];
     # …or allow-list specific inputs instead:
     # updateInputs = [ "nixpkgs" "home-manager" ];
 
-    interval = 21600;      # seconds (6h)
+    interval = 21600;   # seconds (6h)
     notify = true;
-    # nixpkgsRefForChangelogs = "github:NixOS/nixpkgs/nixos-unstable";
-
-    # Optional extra systemd timer that also pokes a check on a schedule:
-    # timer = { enable = true; onCalendar = "hourly"; };
   };
 }
 ```
 
-This installs the binary, writes `~/.config/nixos-update-notifier/config.toml`, and runs a
-user systemd service bound to `graphical-session.target` (with a `PATH` that includes the
-system `nix`/`nixos-rebuild` and the `pkexec` wrapper).
+That installs both binaries, writes `~/.config/nixos-update-notifier/config.toml`, and runs
+a user systemd service tied to your graphical session.
 
-### NixOS module (optional)
+### 3. Optional: the NixOS module
 
-Installs the package system-wide and can grant a trusted user **passwordless** apply:
+Only needed to install the package system-wide, or to grant passwordless apply (read
+[Security](#security) first — it is off by default for good reason).
 
 ```nix
 { inputs, ... }:
 {
   imports = [ inputs.nixos-update-notifier.nixosModules.default ];
-
-  services.nixos-update-notifier = {
-    enable = true;
-    # OFF by default → normal polkit admin prompt on each apply (the safe choice).
-    # Read the security note below before enabling this.
-    # polkit.passwordlessUsers = [ "you" ];
-  };
+  services.nixos-update-notifier.enable = true;
 }
 ```
 
 ---
 
-## Security model
-
-Worth understanding before you enable anything, and stated plainly rather than buried.
-
-**Exactly one operation needs root:** `nixos-rebuild switch`, which activates the new
-system (new profile generation, activation scripts, bootloader). Everything else runs as
-your normal user — checking, diffing, changelog lookups, the tray, notifications, and the
-GTK client. Even downloading and building doesn't need app-level root, because `nix` talks
-to the (already root-owned) nix-daemon over a socket.
-
-Consequently the privileged helper is deliberately tiny. It takes **no file paths to write
-and no pass-through arguments** — only which flake ref to activate:
-
-- The candidate `flake.lock` is backed up and installed by the **unprivileged** daemon.
-  Those are your own files, and keeping root out of user-writable directories removes a
-  whole class of symlink/TOCTOU problems by construction rather than by careful coding.
-- There is deliberately **no `rebuild_extra_args`** option. Free-form arguments reaching
-  root's `nixos-rebuild` (`--override-input`, `-I`, `--substituters`, …) would let anything
-  that can write your config change what root evaluates — and the polkit prompt doesn't
-  display arguments, so you couldn't see it happening.
-- A failed or unauthorized apply restores the previous `flake.lock`, leaving the repo as
-  it was.
-- Before anything is written, the candidate lock is checked against `exclude_inputs`: if a
-  pinned input would move, the apply is refused. `check.rs` already restricts which inputs
-  advance, so this only fires if that logic is wrong — which is exactly when you want it,
-  since silently advancing e.g. a rev-pinned kernel input can leave a machine unbootable.
-- The D-Bus methods that change state (`Apply`, `Dismiss`) verify the caller's executable
-  is the notifier's own client. This is **defence in depth, not a boundary**: anyone who
-  can run code as you can just run our client. It stops confined callers (a Flatpak app
-  with bus access) and buggy ones — notably from silently suppressing update notifications
-  forever via `Dismiss`. Same-uid isolation isn't something D-Bus can provide.
-
-**The inherent limit — please read before enabling `polkit.passwordlessUsers`.** Root
-evaluates the flake in your checkout, and that checkout is writable by you. So anyone who
-can execute code as your user can edit `flake.nix` and have root run it at the next apply.
-That is inherent to "rebuild my system from my flake" — it is the same trust you extend by
-running `sudo nixos-rebuild` from a repo you can edit.
-
-The polkit prompt is what makes this safe in practice: you are present and approving.
-**Enabling `polkit.passwordlessUsers` removes that check, and is therefore equivalent to
-`NOPASSWD` sudo for that user.** It is off by default. Enable it only if you would also be
-comfortable granting passwordless root.
-
----
-
 ## Configuration
 
-Generated for you by the home-manager module; if running standalone, copy
+The home-manager module generates the config for you. Running standalone, copy
 [`config.example.toml`](config.example.toml) to
-`~/.config/nixos-update-notifier/config.toml`. Key options:
+`~/.config/nixos-update-notifier/config.toml`.
 
-| key | meaning |
-|-----|---------|
-| `flake_path` | absolute path to the flake repo |
-| `host_attr` | the `nixosConfigurations.<name>` to evaluate/rebuild |
-| `update_inputs` | inputs to advance (empty = all, minus excludes) |
-| `exclude_inputs` | inputs to **never** advance (e.g. `nixpkgs-kernel`) |
-| `interval` | check cadence in seconds (min 60) |
-| `notify` | fire desktop notifications |
-| `nixpkgs_ref_for_changelogs` | nixpkgs ref for `meta.changelog` lookups |
+| Option | Meaning |
+|---|---|
+| `flake_path` | Absolute path to your flake repo. **Required.** |
+| `host_attr` | The `nixosConfigurations.<name>` to build. **Required.** |
+| `update_inputs` | Inputs to advance. Empty = all of them, minus the excludes. |
+| `exclude_inputs` | Inputs to **never** advance, e.g. a pinned kernel. |
+| `interval` | Seconds between checks (minimum 60). |
+| `notify` | Whether to show desktop notifications. |
+| `nixpkgs_ref_for_changelogs` | Which nixpkgs to resolve changelog links against. |
+| `[icons]` | Icon name per state — see the example file before changing. |
+
+Settings can also be edited from the tray's **Settings** window.
 
 ---
 
 ## Usage
 
-- **Tray menu** covers everything. Left-click opens **View updates**.
-- **CLI** (`nixos-update-notifier` — the daemon + headless commands):
+The tray menu covers everything: **Check now**, **View updates…**, **Apply updates**,
+**Dismiss until next check**, **Settings**, **Quit**. Left-click opens the update list.
+
+There is also a CLI, useful for scripting or a quick look:
 
 ```console
-$ nixos-update-notifier check          # one-shot check; prints the diff; downloads nothing
+$ nixos-update-notifier check          # one-shot check; downloads nothing
 $ nixos-update-notifier check --json   # machine-readable
-$ nixos-update-notifier check --exact  # pristine runtime diff (DOWNLOADS: builds candidate)
-$ nixos-update-notifier run            # run the tray daemon (default); exports the D-Bus service
+$ nixos-update-notifier check --exact  # exact runtime diff (this DOWNLOADS: it builds)
 ```
 
-- **GTK client** (`nixos-update-notifier-gtk` — talks to the running daemon over D-Bus;
-  normally launched from the tray, but works standalone too):
-
-```console
-$ nixos-update-notifier-gtk updates    # the "View updates" window (live from the daemon)
-$ nixos-update-notifier-gtk settings   # the settings editor
-```
-
-Trigger an out-of-band check of the running daemon:
+Force the running daemon to check immediately:
 
 ```console
 $ systemctl --user kill -s SIGUSR1 nixos-update-notifier.service
 ```
 
----
+### Applying updates
 
-## Verification
+**Apply updates** installs the new `flake.lock` into your repo and runs
+`nixos-rebuild switch` behind a polkit prompt. Your previous lock is backed up first and
+restored automatically if the rebuild fails or you cancel the prompt.
 
-These are the exact checks used to validate the mechanics (run against a real
-`nixos-config` flake with inputs `nixpkgs`, `nixpkgs-kernel` (pinned), `home-manager`,
-`sops-nix`, `disko`, `znapzend`, `claude-for-linux`; host `nixos-x1`).
-
-### 1. The check path downloads nothing
+If you want to see what a rebuild would do before trusting it:
 
 ```console
-# Baseline drv (instantiate-only; watch for copy/download lines — there should be none)
-$ nix eval --raw <repo>#nixosConfigurations.<host>.config.system.build.toplevel.drvPath
-
-# In a COPY of the repo, advance an input and re-eval — still no build-output downloads:
-$ cp -a --reflink=auto <repo> /tmp/cand && rm -rf /tmp/cand/.git
-$ ( cd /tmp/cand && nix flake update home-manager )   # fetches input source only
-$ nix eval --raw /tmp/cand#nixosConfigurations.<host>.config.system.build.toplevel.drvPath
-```
-Confirmed: no `copying path …`/`downloaded`/`substituting` lines during either eval. (A
-cold eval of a full system took ~36 s; subsequent evals hit the nix eval cache.)
-
-### 2. The offline diff
-
-```console
-$ nix store diff-closures <baseline.drv> <candidate.drv>
-```
-Confirmed download-free. Note the raw output is ANSI-coloured, `.drv`-suffixed, and uses
-`∅`/`ε`; the app strips/normalises/filters it (see [How it works](#diff-closures-reality-and-why-the-list-is-filtered)).
-The pure parser is unit-tested against captured real output:
-
-```console
-$ nix develop -c cargo test          # runs the parser/config/changelog unit tests
+$ nixos-rebuild dry-activate --flake <repo>#<host>
 ```
 
-### 3. Changelog rendering
+That runs the real activation logic against your running system and reports which units
+would start, stop and restart, without switching.
 
-`meta.changelog` coverage is partial. Verified present: `firefox`, `git`, `ripgrep`,
-`brave`. Verified absent: `vlc`, `obs-studio`. Check a package by hand:
+`nixos-rebuild build-vm` boots the new configuration in a VM, which is useful for
+software-only changes. Be aware it only virtualises the **root** filesystem: if your config
+declares swap, extra filesystems or a hibernation resume device on real hardware (e.g.
+generated by disko), the VM will hang waiting for devices that don't exist. Overriding them
+for the VM build only:
 
-```console
-$ nix eval --json nixpkgs#firefox.meta.changelog
-$ nix eval --json nixpkgs#vlc.meta.changelog     # errors/absent → no link shown
+```nix
+virtualisation.vmVariant = {
+  swapDevices = lib.mkForce [ ];
+  boot.resumeDevice = lib.mkForce "";
+  virtualisation = { memorySize = 4096; cores = 4; };
+};
 ```
 
-### 4. Applying safely
-
-- Prefer a **VM** first: `nixos-rebuild build-vm --flake <repo>#<host>` and boot it.
-- Or dry-run the activation: `nixos-rebuild dry-activate --flake <repo>#<host>`.
-- The privileged helper backs up `flake.lock` to `flake.lock.bak.<epoch>` and **restores
-  it automatically** if `nixos-rebuild` fails.
-- Reboot is offered only when kernel/initrd/kernel-modules/systemd changed between
-  `/run/booted-system` and `/run/current-system`.
-
-### 5. Smoke test on a real Plasma session
-
-The tray/SNI, notifications, D-Bus service, and GTK client can't be exercised headlessly.
-Run the guided, **read-only** (never applies) smoke test from inside your Plasma 6 session:
-
-```console
-$ nix build
-$ scripts/plasma-smoke-test.sh --bin-dir ./result/bin \
-    --flake ~/dev/personal/nixos-config --host nixos-x1
-# or against an already-running daemon (systemd user service):
-$ scripts/plasma-smoke-test.sh
-```
-
-It checks the SNI host + notification daemon, that the daemon owns `org.nixos.UpdateNotifier`
-and answers `GetStatus`/`GetUpdates`, that the tray item is registered, and that the GTK
-client opens and connects — with a PASS/FAIL summary.
+For a hardware-specific config (ZFS root, disko partitioning), `dry-activate` is usually
+the more informative check.
 
 ---
 
-## Gotchas (things that bit us)
+## What the states mean
 
-- **SNI on KDE Wayland:** you must use a native StatusNotifierItem. `ksni` (used here)
-  speaks the SNI D-Bus protocol; X11 XEmbed trays silently don't appear on Plasma 6
-  Wayland. The daemon needs a running StatusNotifierHost — under a bare systemd user
-  service make sure it's ordered after `graphical-session.target` (the HM module does).
-- **`diff-closures` over `.drv` paths is noisy and coloured.** It emits ANSI escapes even
-  when not a TTY, suffixes every token with `.drv`, uses `∅` (absent) vs `ε` (versionless),
-  and carries source/patch/toolchain artefacts with mangled names. Budget for parsing +
-  filtering (done here) — don't expect a clean list from the raw command.
-- **"No download" ≠ "no network."** Advancing an input fetches that input's *source*
-  (small); only package *builds* are avoided. Slow-link users still pay the input-source
-  fetch, not the closure.
-- **Rev bump with zero package changes.** Advancing e.g. `home-manager` can change the
-  system `.drv` without changing any package version — the tool reports "system update
-  available (no package version changes)" rather than an empty "0 updates."
-- **`pkexec` + wrappers.** The binary is `makeBinaryWrapper`-wrapped, so it re-execs its
-  `.…-wrapped` path; the generated polkit rule matches the package `bin/` prefix rather
-  than an exact filename.
-- **Cargo.lock must be committed** for the Nix package to build reproducibly.
+| Tray state | Meaning |
+|---|---|
+| **Up to date** | Advancing your inputs would not change the system. |
+| **Checking** | A check is running. |
+| **Configuration changes** | Inputs moved, but no package changed version — usually a module regenerating its config. Safe to apply, not urgent. |
+| **Updates available** | One or more packages changed version. The window lists them. |
+| **Error** | The check failed; see `journalctl --user -u nixos-update-notifier`. |
+
+A **⚠ input skipped** banner in the update window means one of your flake inputs could not
+be advanced (e.g. a local fork whose repo has moved). The rest were still checked — but
+"up to date" means less while an input is being skipped, so it is worth fixing.
 
 ---
 
-## Architecture
+## Security
 
-Three crates in a Cargo workspace, split so the logic and the daemon carry **no GUI
-dependency** — which is what lets CI test them on a bare runner with no system libraries
-(ksni 0.3 / zbus / tokio are pure Rust; only the GTK crate links C libraries):
+**One operation needs root:** `nixos-rebuild switch`, which activates the new system.
+Everything else — checking, diffing, the tray, notifications, the GTK window — runs as your
+normal user. Even downloading and building doesn't need the app to be root, because `nix`
+talks to the already-root nix-daemon.
 
-- **`nun-core`** (lib) — config, nix orchestration, the offline diff parser, changelog
-  resolution, and the privileged apply. No GTK, no ksni. Fully unit-tested.
-- **`nixos-update-notifier`** (bin) — the long-lived **daemon/service**: the SNI tray, the
-  periodic checker, notifications, and a D-Bus interface (`org.nixos.UpdateNotifier1`) it
-  exports on the session bus.
-- **`nixos-update-notifier-gtk`** (bin) — the **GTK client**. Launched independently (from
-  the tray or by hand), it drives the daemon purely over D-Bus (`CheckNow`, `Apply`,
-  `GetUpdates`, `GetStatus`) and repaints from the daemon's state — so the updater runs as
-  a standalone service and the GUI is a thin client, not a spawned data dump.
+The privileged helper is correspondingly tiny: it takes **no file paths and no pass-through
+arguments**, only which flake ref to activate. The new `flake.lock` is written by the
+*unprivileged* daemon, since it's your own file. A failed or cancelled apply restores it.
 
-```
-crates/
-  core/   src/{config,nix,check,diff,changelog,apply}.rs, lib.rs   +  tests/integration.rs
-  daemon/ src/{main,daemon,tray,notify,state,dbus}.rs
-  gtk/    src/{main,ui,client}.rs
-nix/      package.nix, hm-module.nix, nixos-module.nix
-scripts/  set-version.sh (release), plasma-smoke-test.sh (manual Plasma smoke test)
-.github/  workflows/{ci,release}.yml
-```
+**Before enabling `polkit.passwordlessUsers`, understand this:** root evaluates the flake
+in your checkout, and that checkout is writable by you. Anyone who can run code as your user
+can edit `flake.nix` and have root execute it at the next apply. That is inherent to
+"rebuild my system from my flake" — the same trust you extend running `sudo nixos-rebuild`
+from a repo you can edit.
 
-Releasing (stable + canary) is documented in [`RELEASING.md`](RELEASING.md).
-
-## Development
-
-```console
-$ nix develop                        # rust toolchain + gtk4 + pkg-config + nvd
-$ cargo test -p nun-core             # pure-logic unit tests (no system deps)
-$ cargo clippy --workspace -- -D warnings
-$ cargo run -p nixos-update-notifier -- check    # exercise the no-download check
-$ nix build                          # build both binaries via the flake
-# Integration tests that shell out to real `nix` (guarded behind #[ignore]):
-$ cargo test -p nun-core --test integration -- --ignored
-```
-
-## Continuous integration & releases
-
-- **`ci.yml`** runs three tiers on every push/PR: (1) `rustfmt` + `clippy -D warnings` +
-  unit tests for `nun-core`/`nixos-update-notifier` on a bare runner (no apt packages);
-  (2) `nix flake check` + `nix build` (builds the GTK client + both Nix modules, runs the
-  in-sandbox suite); (3) the fixture-flake **integration tests** that drive real `nix`
-  invocations and lock the `diff-closures` output format against version drift.
-- **`release.yml`** is a manual `workflow_dispatch` (`version`, optional `commit`) modelled
-  on the mkvdup flow (PRs #200 + #207). A `sync-version` job writes the version into the
-  source **on the released ref** (so the tag reports its own version); `build` builds from
-  that commit; `release` creates the **tag and GitHub release together** (via
-  `target_commitish`) *only after the build passes*, so a failed build never leaves a
-  dangling tag. A version containing `-canary.` (e.g. `1.2.0-canary.1`) is a **pre-release**.
-  - **Canaries are cut from development branches** — the bump + tag land on that branch.
-    There's no canary channel to publish: with a flake the ref is the selector, so a canary
-    installs straight from its tag or branch,
-    `nix profile install 'github:stuckj/nixos-update-notifier/<branch-or-tag>#default'`.
-  - There is **no vendorHash to refresh** (`cargoLock.lockFile` vendors from the committed
-    `Cargo.lock`), so the Go-modules hash-refresh machinery from #207 isn't needed here.
-  - Full details in [`RELEASING.md`](RELEASING.md).
+The polkit prompt is what keeps that safe: you're present and approving. **Enabling
+passwordless apply removes that check and is equivalent to `NOPASSWD` sudo for that user.**
+It's off by default. Only enable it if you'd also be comfortable granting passwordless root.
 
 ---
+
+## Troubleshooting
+
+**The tray icon is blank or missing.** The icon names must exist in your icon theme; an
+unresolvable name renders as an empty gap with nothing logged. The defaults are Breeze
+names. On another desktop, override them under `[icons]` in the config.
+
+**The tray icon never appears at all.** Check a StatusNotifierHost is running — on KDE it's
+part of Plasma. Verify the service is up with
+`systemctl --user status nixos-update-notifier`.
+
+**The update window says "Daemon not running".** The GTK window is a client; start the
+service with `systemctl --user start nixos-update-notifier`.
+
+**Checks fail.** Look at `journalctl --user -u nixos-update-notifier -e`. A common cause is
+a flake input that can't be fetched — that now appears as a ⚠ banner naming the input.
+
+**A check takes a long time.** The first check after a reboot evaluates your whole system
+config and can take a minute or more. The tray stays responsive throughout.
+
+---
+
+## Contributing
+
+Architecture, internals, and development setup are in
+[CONTRIBUTING.md](CONTRIBUTING.md). Release process is in [RELEASING.md](RELEASING.md).
 
 ## License
 
