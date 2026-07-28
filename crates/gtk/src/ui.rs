@@ -10,6 +10,7 @@ use gtk::prelude::*;
 use gtk::{glib, Align, Application, ApplicationWindow, Orientation};
 use nun_core::config::Config;
 use nun_core::diff::{ChangeKind, PackageChange};
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -54,13 +55,34 @@ fn build_updates_window(app: &Application) {
     header.set_margin_top(8);
     header.set_margin_bottom(4);
 
+    // What the list currently displays. The periodic poll compares against this and
+    // returns early when nothing has changed — rebuilding the rows resets the scroll
+    // position, which made a long update list impossible to read: scroll down, and a
+    // few seconds later you are back at the top.
+    type Rendered = (String, Vec<PackageChange>, Vec<(String, String)>);
+    let rendered: Rc<RefCell<Option<Rendered>>> = Rc::new(RefCell::new(None));
+
     // Rebuild the list from the daemon's current state. Cloneable so we can hand it to
     // several button handlers and a periodic poll.
     let refresh = {
         let list = list.clone();
         let header = header.clone();
         let client = client.clone();
+        let rendered = rendered.clone();
         move || {
+            // Cheap poll: fetch first, and only touch the widgets if something moved.
+            if let Some(c) = &client {
+                let now: Rendered = (
+                    c.status().map(|(s, _)| s).unwrap_or_default(),
+                    c.updates().unwrap_or_default(),
+                    c.warnings().unwrap_or_default(),
+                );
+                if rendered.borrow().as_ref() == Some(&now) {
+                    return;
+                }
+                *rendered.borrow_mut() = Some(now);
+            }
+
             while let Some(child) = list.first_child() {
                 list.remove(&child);
             }
