@@ -32,8 +32,10 @@ notify = true
 # If omitted, the registry alias "nixpkgs" is used.
 # nixpkgs_ref_for_changelogs = "github:NixOS/nixpkgs/nixos-24.11"
 
-# Extra args forwarded verbatim to `nixos-rebuild` on apply.
-# rebuild_extra_args = ["--option", "eval-cache", "false"]
+# NOTE: there is deliberately no `rebuild_extra_args` option. Arbitrary arguments
+# forwarded into root's `nixos-rebuild` would let anything that can write this file change
+# what root evaluates and builds — more than "rebuild my machine", and not shown on the
+# polkit prompt. Setting it now fails config parsing rather than being silently ignored.
 
 # Freedesktop icon names per tray state (override if your icon theme lacks the defaults).
 # [icons]

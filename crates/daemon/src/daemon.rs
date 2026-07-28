@@ -249,19 +249,36 @@ async fn apply_flow(
         }
     };
 
-    // pkexec <self> apply-privileged --repo <path> --host <host> --lock <candidate> [--extra-arg …]
+    // Install the candidate lock ourselves, UNPRIVILEGED — it's the user's own file, and
+    // keeping root away from user-writable paths is a deliberate security property (see
+    // nun_core::apply docs). Root only ever activates the result.
+    let backup =
+        match nun_core::apply::install_candidate_lock(&cfg.flake_path, candidate_lock).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("could not install candidate lock: {e:#}");
+                if cfg.notify {
+                    let _ = notify::notify(
+                        "NixOS update failed",
+                        "Could not stage the new flake.lock; nothing was changed.",
+                        &cfg.icons.error,
+                    )
+                    .await;
+                }
+                set_status(shared, handle, Status::Error).await;
+                return;
+            }
+        };
+
+    // pkexec <self> apply-privileged --repo <path> --host <host>
+    // No lock path and no pass-through rebuild args cross the privilege boundary.
     let mut cmd = tokio::process::Command::new("pkexec");
     cmd.arg(&exe)
         .arg("apply-privileged")
         .arg("--repo")
         .arg(&cfg.flake_path)
         .arg("--host")
-        .arg(&cfg.host_attr)
-        .arg("--lock")
-        .arg(candidate_lock);
-    for a in &cfg.rebuild_extra_args {
-        cmd.arg("--extra-arg").arg(a);
-    }
+        .arg(&cfg.host_attr);
 
     if cfg.notify {
         let _ = notify::notify(
@@ -293,11 +310,15 @@ async fn apply_flow(
             }
         }
         Ok(status) => {
+            // Covers a failed rebuild and a cancelled/denied polkit prompt alike: put the
+            // previous lock back so a failed apply leaves the repo exactly as it was.
             tracing::error!("apply failed: pkexec exited with {status}");
+            nun_core::apply::restore_lock(&cfg.flake_path, &backup).await;
             if cfg.notify {
                 let _ = notify::notify(
                     "NixOS update failed",
-                    "nixos-rebuild did not complete. The previous lock was restored.",
+                    "nixos-rebuild did not complete (or was not authorized). The previous \
+                     flake.lock was restored.",
                     &cfg.icons.error,
                 )
                 .await;
@@ -306,6 +327,7 @@ async fn apply_flow(
         }
         Err(e) => {
             tracing::error!("could not launch pkexec: {e:#}");
+            nun_core::apply::restore_lock(&cfg.flake_path, &backup).await;
             if cfg.notify {
                 let _ = notify::notify(
                     "NixOS update failed",

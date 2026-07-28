@@ -47,10 +47,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nixpkgs_ref_for_changelogs: Option<String>,
 
-    /// Extra args passed through to `nixos-rebuild` on apply (e.g. `--option ...`).
-    #[serde(default)]
-    pub rebuild_extra_args: Vec<String>,
-
+    // NOTE: there is deliberately no `rebuild_extra_args` option. Arbitrary arguments
+    // forwarded into root's `nixos-rebuild` (`--override-input`, `-I`, `--substituters`, …)
+    // would let anything that can write this file change what root evaluates and builds —
+    // materially more than "rebuild my machine", and invisible on the polkit prompt. If a
+    // specific option is ever needed, add it as a typed, vetted field rather than a
+    // free-form pass-through. `deny_unknown_fields` means an old config carrying the key
+    // fails loudly instead of silently ignoring it.
     /// Icon theme names for each tray state. Freedesktop icon names are resolved by the
     /// active KDE/Plasma icon theme; override here if your theme lacks them.
     #[serde(default)]
@@ -161,7 +164,6 @@ mod tests {
             interval_secs: DEFAULT_INTERVAL_SECS,
             notify: true,
             nixpkgs_ref_for_changelogs: None,
-            rebuild_extra_args: vec![],
             icons: Icons::default(),
         }
     }

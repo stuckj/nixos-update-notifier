@@ -1,16 +1,24 @@
-//! Applying updates: privileged rebuild + reboot detection.
+//! Applying updates: unprivileged lock handling + the one privileged operation.
 //!
-//! The unprivileged daemon never runs `nixos-rebuild` itself. Instead it invokes this
-//! binary's hidden `apply-privileged` subcommand through `pkexec`, so the user gets an
-//! explicit polkit auth prompt. We NEVER call `sudo` silently or auto-apply.
+//! Exactly one step of an apply genuinely needs root: activating the new system
+//! (`nixos-rebuild switch` writes a new system profile generation, runs activation
+//! scripts, and updates the bootloader). Everything else — backing up `flake.lock`,
+//! installing the candidate lock, restoring it if the rebuild fails — operates on files
+//! in the user's own repo and is done by the UNPRIVILEGED daemon.
 //!
-//! Flow (privileged side):
-//!   1. Back up the real repo's `flake.lock` to `flake.lock.bak.<timestamp>`.
-//!   2. Copy the candidate lock over it.
-//!   3. `nixos-rebuild switch --flake <repo>#<host>` (streaming output).
-//!   4. Report whether a reboot is warranted (kernel / initrd / systemd changed).
+//! That split is deliberate and is a security property, not a stylistic one: root never
+//! opens a path inside a user-writable directory, which removes an entire class of
+//! symlink/TOCTOU problems (a `flake.lock` symlinked at `/etc/shadow` would otherwise let
+//! root's copy leak or clobber arbitrary files). There is no validation to get subtly
+//! wrong because root does no file I/O on those paths at all.
 //!
-//! On rebuild failure, the backed-up lock is restored.
+//! Flow:
+//!   1. (unprivileged) back up `flake.lock` to `flake.lock.bak.<epoch>`.
+//!   2. (unprivileged) copy the candidate lock over it.
+//!   3. (root, via pkexec) `nixos-rebuild switch --flake <repo>#<host>`.
+//!   4. (unprivileged) restore the backup if the rebuild failed; report reboot need.
+//!
+//! We NEVER call `sudo` silently or auto-apply — step 3 always goes through polkit.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -33,14 +41,11 @@ fn timestamp() -> String {
     format!("bak.{secs}")
 }
 
-/// Privileged entry point (runs as root via pkexec). Streams rebuild output to stdout so
-/// the calling daemon can surface progress.
-pub async fn apply_privileged(
-    repo: &Path,
-    host: &str,
-    candidate_lock: &Path,
-    rebuild_extra_args: &[String],
-) -> Result<RebootNeeded> {
+/// Back up the repo's current `flake.lock` and install the candidate over it, returning
+/// the backup path so the caller can restore it on failure.
+///
+/// UNPRIVILEGED on purpose — these are the user's own files. See the module docs.
+pub async fn install_candidate_lock(repo: &Path, candidate_lock: &Path) -> Result<PathBuf> {
     let real_lock = repo.join("flake.lock");
     anyhow::ensure!(
         real_lock.exists(),
@@ -53,52 +58,57 @@ pub async fn apply_privileged(
         candidate_lock.display()
     );
 
-    // Snapshot the current system's kernel/initrd BEFORE switching (for the debug log
-    // below). The actual reboot decision compares booted vs current after activation, in
-    // `current_vs_booted_differs()`.
-    let before = boot_signature().await;
-
-    // 1. Back up the current lock.
     let backup: PathBuf = repo.join(format!("flake.lock.{}", timestamp()));
     tokio::fs::copy(&real_lock, &backup)
         .await
         .with_context(|| format!("backing up {} -> {}", real_lock.display(), backup.display()))?;
-    println!("backed up flake.lock to {}", backup.display());
+    tracing::info!("backed up flake.lock to {}", backup.display());
 
-    // 2. Install the candidate lock.
     tokio::fs::copy(candidate_lock, &real_lock)
         .await
         .with_context(|| format!("installing candidate lock into {}", real_lock.display()))?;
 
-    // 3. Rebuild.
+    Ok(backup)
+}
+
+/// Restore a lock backup taken by [`install_candidate_lock`], leaving the repo as it was.
+/// Best-effort: a failure here is logged, not propagated, since it runs on an error path.
+pub async fn restore_lock(repo: &Path, backup: &Path) {
+    let real_lock = repo.join("flake.lock");
+    match tokio::fs::copy(backup, &real_lock).await {
+        Ok(_) => tracing::info!("restored previous flake.lock from {}", backup.display()),
+        Err(e) => tracing::error!(
+            "could not restore {} -> {}: {e}",
+            backup.display(),
+            real_lock.display()
+        ),
+    }
+}
+
+/// Privileged entry point (runs as root via pkexec): the ONE operation that requires root.
+///
+/// It takes no file paths to write and no pass-through arguments — only the flake ref to
+/// activate. Streams rebuild output to stdout so the caller can surface progress.
+pub async fn rebuild_privileged(repo: &Path, host: &str) -> Result<RebootNeeded> {
     let flake_target = format!("{}#{}", repo.display(), host);
     println!("running: nixos-rebuild switch --flake {flake_target}");
-    let mut cmd = Command::new("nixos-rebuild");
-    cmd.arg("switch")
+
+    let status = Command::new("nixos-rebuild")
+        .arg("switch")
         .arg("--flake")
         .arg(&flake_target)
-        .args(rebuild_extra_args)
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .context("spawning nixos-rebuild")?;
 
-    let status = cmd.status().await.context("spawning nixos-rebuild")?;
+    anyhow::ensure!(
+        status.success(),
+        "nixos-rebuild switch failed with {status}"
+    );
 
-    if !status.success() {
-        // Restore the original lock so a failed apply leaves the repo untouched.
-        eprintln!("nixos-rebuild failed ({status}); restoring previous flake.lock");
-        tokio::fs::copy(&backup, &real_lock).await.ok();
-        anyhow::bail!("nixos-rebuild switch failed with {status}");
-    }
-
-    // 4. Decide whether a reboot is warranted.
-    let after = boot_signature().await;
-    // If the booted signature no longer matches the (new) current signature, a reboot is
-    // needed to run the new kernel/initrd. We compare the freshly-activated system's
-    // signature against what is actually booted.
-    let needs = current_vs_booted_differs().await;
-    tracing::debug!(?before, ?after, needs, "reboot decision");
-
-    Ok(RebootNeeded(needs))
+    Ok(RebootNeeded(current_vs_booted_differs().await))
 }
 
 /// A stable signature of the security-relevant boot artefacts of a system profile.
@@ -111,10 +121,6 @@ async fn signature_of(system: &Path) -> Vec<(String, String)> {
         }
     }
     out
-}
-
-async fn boot_signature() -> Vec<(String, String)> {
-    signature_of(Path::new("/run/current-system")).await
 }
 
 /// True if `/run/current-system` (just activated) differs from `/run/booted-system` in

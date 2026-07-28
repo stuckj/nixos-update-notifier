@@ -311,7 +311,6 @@ struct SettingsEntries {
     notify: gtk::Switch,
     nixpkgs_ref: gtk::Entry,
     // Fields the form doesn't expose but must not clobber on Save.
-    preserved_extra_args: Vec<String>,
     preserved_icons: nun_core::config::Icons,
 }
 
@@ -345,9 +344,6 @@ impl SettingsEntries {
                 cfg.and_then(|c| c.nixpkgs_ref_for_changelogs.clone())
                     .unwrap_or_default(),
             ),
-            preserved_extra_args: cfg
-                .map(|c| c.rebuild_extra_args.clone())
-                .unwrap_or_default(),
             preserved_icons: cfg.map(|c| c.icons.clone()).unwrap_or_default(),
         }
     }
@@ -399,7 +395,6 @@ impl SettingsEntries {
             } else {
                 Some(nixpkgs)
             },
-            rebuild_extra_args: self.preserved_extra_args.clone(),
             icons: self.preserved_icons.clone(),
         })
     }

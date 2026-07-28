@@ -45,17 +45,16 @@ enum Cmd {
         #[arg(long)]
         exact: bool,
     },
-    /// (internal) Privileged apply, invoked via pkexec — do not call directly.
+    /// (internal) Privileged rebuild, invoked via pkexec — do not call directly.
+    ///
+    /// Takes only the flake ref to activate: the candidate lock is installed beforehand by
+    /// the unprivileged daemon, and no pass-through arguments reach root's `nixos-rebuild`.
     #[command(hide = true)]
     ApplyPrivileged {
         #[arg(long)]
         repo: PathBuf,
         #[arg(long)]
         host: String,
-        #[arg(long)]
-        lock: PathBuf,
-        #[arg(long = "extra-arg")]
-        extra_arg: Vec<String>,
     },
 }
 
@@ -79,13 +78,8 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Cmd::Run) {
         Cmd::Run => rt.block_on(daemon::run(config_path)),
         Cmd::Check { json, exact } => rt.block_on(run_check_cli(&config_path, json, exact)),
-        Cmd::ApplyPrivileged {
-            repo,
-            host,
-            lock,
-            extra_arg,
-        } => rt.block_on(async move {
-            let reboot = apply::apply_privileged(&repo, &host, &lock, &extra_arg).await?;
+        Cmd::ApplyPrivileged { repo, host } => rt.block_on(async move {
+            let reboot = apply::rebuild_privileged(&repo, &host).await?;
             if reboot.0 {
                 println!("REBOOT_RECOMMENDED");
             }

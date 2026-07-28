@@ -32,6 +32,14 @@ in
         Users allowed to run the notifier's privileged apply via pkexec WITHOUT
         re-authenticating. Leave empty to require the normal polkit admin prompt each time
         (the safe default).
+
+        SECURITY: enabling this is equivalent to granting NOPASSWD sudo to these users.
+        The privileged step runs `nixos-rebuild switch` against the flake in the configured
+        checkout, and that checkout is writable by its owner — so anyone able to execute
+        code as such a user can edit flake.nix and have root run it at the next apply,
+        with no prompt. The interactive polkit prompt is what normally prevents this by
+        requiring a present, consenting human. Only enable this if you would also be
+        comfortable giving these users passwordless root.
       '';
     };
   };

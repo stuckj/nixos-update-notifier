@@ -183,10 +183,47 @@ Installs the package system-wide and can grant a trusted user **passwordless** a
   services.nixos-update-notifier = {
     enable = true;
     # OFF by default → normal polkit admin prompt on each apply (the safe choice).
+    # Read the security note below before enabling this.
     # polkit.passwordlessUsers = [ "you" ];
   };
 }
 ```
+
+---
+
+## Security model
+
+Worth understanding before you enable anything, and stated plainly rather than buried.
+
+**Exactly one operation needs root:** `nixos-rebuild switch`, which activates the new
+system (new profile generation, activation scripts, bootloader). Everything else runs as
+your normal user — checking, diffing, changelog lookups, the tray, notifications, and the
+GTK client. Even downloading and building doesn't need app-level root, because `nix` talks
+to the (already root-owned) nix-daemon over a socket.
+
+Consequently the privileged helper is deliberately tiny. It takes **no file paths to write
+and no pass-through arguments** — only which flake ref to activate:
+
+- The candidate `flake.lock` is backed up and installed by the **unprivileged** daemon.
+  Those are your own files, and keeping root out of user-writable directories removes a
+  whole class of symlink/TOCTOU problems by construction rather than by careful coding.
+- There is deliberately **no `rebuild_extra_args`** option. Free-form arguments reaching
+  root's `nixos-rebuild` (`--override-input`, `-I`, `--substituters`, …) would let anything
+  that can write your config change what root evaluates — and the polkit prompt doesn't
+  display arguments, so you couldn't see it happening.
+- A failed or unauthorized apply restores the previous `flake.lock`, leaving the repo as
+  it was.
+
+**The inherent limit — please read before enabling `polkit.passwordlessUsers`.** Root
+evaluates the flake in your checkout, and that checkout is writable by you. So anyone who
+can execute code as your user can edit `flake.nix` and have root run it at the next apply.
+That is inherent to "rebuild my system from my flake" — it is the same trust you extend by
+running `sudo nixos-rebuild` from a repo you can edit.
+
+The polkit prompt is what makes this safe in practice: you are present and approving.
+**Enabling `polkit.passwordlessUsers` removes that check, and is therefore equivalent to
+`NOPASSWD` sudo for that user.** It is off by default. Enable it only if you would also be
+comfortable granting passwordless root.
 
 ---
 
@@ -205,7 +242,6 @@ Generated for you by the home-manager module; if running standalone, copy
 | `interval` | check cadence in seconds (min 60) |
 | `notify` | fire desktop notifications |
 | `nixpkgs_ref_for_changelogs` | nixpkgs ref for `meta.changelog` lookups |
-| `rebuild_extra_args` | extra args for `nixos-rebuild` on apply |
 
 ---
 

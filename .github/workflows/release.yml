@@ -46,8 +46,16 @@ jobs:
 
       - name: Resolve version and commit
         id: resolve
+        # Inputs are passed through `env:` and referenced as shell variables. Never splice
+        # `${{ … }}` directly into a `run:` block: that is template-substituted into the
+        # script text before bash parses it, so a value containing shell metacharacters
+        # would execute in a job that holds `contents: write`.
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_COMMIT: ${{ github.event.inputs.commit }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          VERSION="${{ github.event.inputs.version }}"
+          VERSION="$INPUT_VERSION"
 
           if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+)*([.-][0-9A-Za-z]+)*$ ]]; then
             echo "::error::Invalid version '${VERSION}'. Expected e.g. '1.2.3' or '1.2.3-canary.1'."
@@ -68,13 +76,13 @@ jobs:
             exit 1
           fi
 
-          if [[ -n "${{ github.event.inputs.commit }}" ]]; then
-            COMMIT=$(git rev-parse "${{ github.event.inputs.commit }}")
+          if [[ -n "$INPUT_COMMIT" ]]; then
+            COMMIT=$(git rev-parse "$INPUT_COMMIT")
           else
-            COMMIT=$(git rev-parse "origin/${{ github.ref_name }}")
+            COMMIT=$(git rev-parse "origin/${BRANCH}")
           fi
           echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
-          echo "Will release ${TAG} at ${COMMIT} (canary=${IS_CANARY}) on branch ${{ github.ref_name }}"
+          echo "Will release ${TAG} at ${COMMIT} (canary=${IS_CANARY}) on branch ${BRANCH}"
 
   sync-version:
     # Writes the version into the source on the released ref, so the tag created by the

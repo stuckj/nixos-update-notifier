@@ -15,7 +15,6 @@ let
       exclude_inputs = cfg.excludeInputs;
       interval = cfg.interval;
       notify = cfg.notify;
-      rebuild_extra_args = cfg.rebuildExtraArgs;
     }
     // lib.optionalAttrs (cfg.nixpkgsRefForChangelogs != null) {
       nixpkgs_ref_for_changelogs = cfg.nixpkgsRefForChangelogs;
@@ -94,11 +93,10 @@ in
       description = "nixpkgs flake ref to resolve meta.changelog against. Null = registry \"nixpkgs\".";
     };
 
-    rebuildExtraArgs = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      description = "Extra arguments forwarded to nixos-rebuild on apply.";
-    };
+    # NOTE: there is deliberately no `rebuildExtraArgs`. Free-form arguments forwarded into
+    # root's `nixos-rebuild` (--override-input, -I, --substituters, …) would let anything
+    # that can write the config change what root evaluates and builds, which the polkit
+    # prompt does not show. Add a typed, vetted option if a specific flag is ever needed.
 
     icons = lib.mkOption {
       type = lib.types.nullOr (lib.types.attrsOf lib.types.str);
