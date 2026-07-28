@@ -139,6 +139,17 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     Err(e) => {
                         tracing::error!("update check failed: {e:#}");
                         set_status(&shared, &tray_handle, Status::Error).await;
+                        // Drop the previous candidate. The working copy is wiped at the
+                        // start of every check, so after a failure the retained lock path
+                        // may be gone or hold the unmodified lock — applying it would
+                        // rebuild from the wrong input. Clearing also stops `GetUpdates`
+                        // from serving a stale list alongside an error status.
+                        // `dismissed_drv`/`last_notified_drv` are deliberately left alone
+                        // so a transient failure doesn't re-notify an already-seen set.
+                        let mut s = shared.lock().await;
+                        s.changes.clear();
+                        s.candidate_lock = None;
+                        s.candidate_drv = None;
                     }
                 }
             }
