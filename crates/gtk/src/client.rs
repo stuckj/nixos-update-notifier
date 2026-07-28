@@ -17,6 +17,7 @@ trait Updater {
     fn dismiss(&self) -> zbus::Result<()>;
     fn get_updates(&self) -> zbus::Result<String>;
     fn get_status(&self) -> zbus::Result<(String, u32)>;
+    fn get_warnings(&self) -> zbus::Result<String>;
 }
 
 pub struct Client {
@@ -42,6 +43,12 @@ impl Client {
 
     pub fn status(&self) -> Result<(String, u32)> {
         self.proxy.get_status().context("GetStatus")
+    }
+
+    /// Inputs the last check could not advance: `(name, reason)`.
+    pub fn warnings(&self) -> Result<Vec<(String, String)>> {
+        let json = self.proxy.get_warnings().context("GetWarnings")?;
+        Ok(serde_json::from_str(&json).unwrap_or_default())
     }
 
     pub fn check_now(&self) -> Result<()> {

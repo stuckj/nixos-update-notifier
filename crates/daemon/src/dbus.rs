@@ -128,9 +128,17 @@ impl Updater {
         serde_json::to_string(&s.changes).unwrap_or_else(|_| "[]".to_string())
     }
 
-    /// Current status string (`idle`/`checking`/`updates`/`error`) and update count.
+    /// Current status string (`idle`/`checking`/`system-changes`/`updates`/`error`) and
+    /// the package-update count.
     async fn get_status(&self) -> (String, u32) {
         let s = self.shared.lock().await;
         (s.status.as_str().to_string(), s.status.count())
+    }
+
+    /// Inputs skipped on the last check, as a JSON array of `[name, reason]` pairs.
+    /// Empty when every configured input advanced.
+    async fn get_warnings(&self) -> String {
+        let s = self.shared.lock().await;
+        serde_json::to_string(&s.failed_inputs).unwrap_or_else(|_| "[]".to_string())
     }
 }

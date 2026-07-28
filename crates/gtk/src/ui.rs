@@ -18,13 +18,23 @@ const APP_ID_UPDATES: &str = "org.nixos.UpdateNotifier.Updates";
 const APP_ID_SETTINGS: &str = "org.nixos.UpdateNotifier.Settings";
 
 /// Show the update list, live from the daemon over D-Bus. Blocks until the window closes.
+///
+/// Single-instance: the tray spawns a fresh process on every click, so without this a
+/// second click stacks another identical window on top of the first. Registering under a
+/// unique application id makes GTK hand the activation to the already-running instance,
+/// which presents its existing window and the new process exits.
 pub fn run_updates_window() -> Result<()> {
     let app = Application::builder()
         .application_id(APP_ID_UPDATES)
-        .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
-    app.connect_activate(build_updates_window);
+    app.connect_activate(|app| {
+        if let Some(existing) = app.active_window() {
+            existing.present();
+            return;
+        }
+        build_updates_window(app);
+    });
     // Don't let GTK parse our process args (clap already did).
     app.run_with_args::<&str>(&[]);
     Ok(())
@@ -67,6 +77,26 @@ fn build_updates_window(app: &Application) {
                 Some(c) => match c.updates() {
                     Ok(changes) => {
                         let status = c.status().map(|(s, _)| s).unwrap_or_default();
+
+                        // Surface skipped inputs prominently: "no updates" (or any count)
+                        // means something different if an input could not be advanced at
+                        // all, and the user is the only one who can fix a moved local fork.
+                        for (name, reason) in c.warnings().unwrap_or_default() {
+                            let w = gtk::Label::new(None);
+                            w.set_markup(&format!(
+                                "<b>⚠ input '{}' was skipped</b>\n<small>{}</small>",
+                                glib::markup_escape_text(&name),
+                                glib::markup_escape_text(&reason)
+                            ));
+                            w.set_wrap(true);
+                            w.set_xalign(0.0);
+                            w.set_margin_start(8);
+                            w.set_margin_end(8);
+                            w.set_margin_top(8);
+                            w.set_margin_bottom(8);
+                            w.add_css_class("warning");
+                            list.append(&w);
+                        }
 
                         // An empty list is ambiguous on its own, so let the daemon's status
                         // disambiguate. Advancing an input can change the system derivation
@@ -245,13 +275,21 @@ fn update_row(change: &PackageChange) -> gtk::Box {
 }
 
 /// Show the settings editor. Blocks until closed.
+///
+/// Single-instance for the same reason as the updates window — and more importantly here,
+/// since two editors open on the same file would let the second overwrite the first's save.
 pub fn run_settings_window(config_path: PathBuf) -> Result<()> {
     let app = Application::builder()
         .application_id(APP_ID_SETTINGS)
-        .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
-    app.connect_activate(move |app| build_settings_window(app, &config_path));
+    app.connect_activate(move |app| {
+        if let Some(existing) = app.active_window() {
+            existing.present();
+            return;
+        }
+        build_settings_window(app, &config_path);
+    });
     app.run_with_args::<&str>(&[]);
     Ok(())
 }

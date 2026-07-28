@@ -109,6 +109,10 @@ pub struct Shared {
     /// Dismiss / re-notify bookkeeping.
     pub dismissed_drv: Option<String>,
     pub last_notified_drv: Option<String>,
+    /// Inputs that could not be advanced on the last check, with the reason. Surfaced to
+    /// the client so a silently-skipped input (a moved local fork, an unreachable remote)
+    /// is visible rather than quietly narrowing what "up to date" means.
+    pub failed_inputs: Vec<(String, String)>,
 }
 
 pub type SharedState = Arc<Mutex<Shared>>;

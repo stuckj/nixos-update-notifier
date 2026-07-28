@@ -197,17 +197,21 @@ async fn handle_check_result(
             s.changes = outcome.changes.clone();
             s.candidate_lock = Some(outcome.candidate_lock.clone());
             s.candidate_drv = Some(outcome.candidate_drv.clone());
+            s.failed_inputs = outcome.failed_inputs.clone();
             if notified {
                 s.last_notified_drv = Some(outcome.candidate_drv.clone());
             }
         }
-        Ok(_up_to_date) => {
+        Ok(up_to_date) => {
             set_status(shared, tray_handle, Status::Idle).await;
             let mut s = shared.lock().await;
             s.changes.clear();
             s.candidate_lock = None;
             s.candidate_drv = None;
             s.dismissed_drv = None;
+            // Keep these even when up to date: "no updates" means much less if an input
+            // was silently skipped, so the client must still be able to say so.
+            s.failed_inputs = up_to_date.failed_inputs.clone();
         }
         Err(e) => {
             tracing::error!("update check failed: {e:#}");
