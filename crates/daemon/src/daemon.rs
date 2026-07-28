@@ -226,10 +226,24 @@ fn self_exe() -> Result<PathBuf> {
 }
 
 /// Executables allowed to call the state-changing D-Bus methods: our GTK client and the
-/// daemon itself. Canonicalised so the comparison against `/proc/<pid>/exe` (which is
-/// already fully resolved) is like-for-like.
+/// daemon itself.
+///
+/// Each is listed in both spellings, because under `makeBinaryWrapper` the file in `bin/`
+/// is a small compiled launcher that execs a hidden `.<name>-wrapped` sibling — so
+/// `/proc/<pid>/exe` reports the *wrapped* path while the path we spawn (or resolve) is the
+/// wrapper. They are distinct real files, not symlinks, so `canonicalize()` does not bridge
+/// them; listing only one silently rejects our own client.
 fn allowed_caller_exes() -> Vec<PathBuf> {
-    [gtk_client_exe(), self_exe().unwrap_or_default()]
+    let mut candidates = Vec::new();
+    for p in [gtk_client_exe(), self_exe().unwrap_or_default()] {
+        if let (Some(dir), Some(name)) = (p.parent(), p.file_name().and_then(|n| n.to_str())) {
+            // The `.…-wrapped` form of an already-wrapped path simply won't exist and is
+            // dropped by the canonicalize filter below.
+            candidates.push(dir.join(format!(".{name}-wrapped")));
+        }
+        candidates.push(p);
+    }
+    candidates
         .into_iter()
         .filter_map(|p| p.canonicalize().ok())
         .collect()
