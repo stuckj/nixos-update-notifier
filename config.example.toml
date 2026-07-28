@@ -1,0 +1,43 @@
+# nixos-update-notifier configuration.
+# Copy to $XDG_CONFIG_HOME/nixos-update-notifier/config.toml (usually
+# ~/.config/nixos-update-notifier/config.toml), or point the daemon at it with --config.
+#
+# When installed via the home-manager module, this file is generated for you from the
+# module options — you normally don't edit it by hand in that case.
+
+# Absolute path to your flake repo (the directory containing flake.nix). Required.
+flake_path = "/home/youruser/dev/personal/nixos-config"
+
+# The nixosConfigurations.<name> attribute to evaluate and rebuild. Required.
+host_attr = "nixos-x1"
+
+# Inputs to advance during a check/apply.
+#   - If omitted or empty: ALL inputs are candidates, minus `exclude_inputs`.
+#   - If set: ONLY these inputs are advanced (still minus `exclude_inputs`).
+# update_inputs = ["nixpkgs", "home-manager"]
+
+# Inputs that must NEVER be advanced. This is the safety valve for deliberately
+# rev-pinned inputs. Classic example: a `nixpkgs-kernel` input pinned to an immutable
+# commit that provides your kernel + ZFS — advancing it could break ZFS-on-root.
+exclude_inputs = ["nixpkgs-kernel"]
+
+# Background check cadence, in seconds. Default: 21600 (6 hours). Minimum: 60.
+interval = 21600
+
+# Fire desktop notifications when updates appear.
+notify = true
+
+# Which nixpkgs to resolve meta.changelog against when rendering the update list.
+# Any flake ref works: "nixpkgs", "github:NixOS/nixpkgs/nixos-24.11", or a path.
+# If omitted, the registry alias "nixpkgs" is used.
+# nixpkgs_ref_for_changelogs = "github:NixOS/nixpkgs/nixos-24.11"
+
+# Extra args forwarded verbatim to `nixos-rebuild` on apply.
+# rebuild_extra_args = ["--option", "eval-cache", "false"]
+
+# Freedesktop icon names per tray state (override if your icon theme lacks the defaults).
+# [icons]
+# idle = "nix-snowflake"
+# checking = "emblem-synchronizing"
+# updates_available = "software-update-available"
+# error = "dialog-error"

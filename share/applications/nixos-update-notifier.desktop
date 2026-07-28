@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NixOS Update Notifier
+Comment=Tray notifier for flake-based NixOS updates
+Exec=nixos-update-notifier run
+Icon=nix-snowflake
+Terminal=false
+Categories=System;Settings;
+X-KDE-autostart-phase=2
+# Only meaningful in a graphical session with a StatusNotifierHost (KDE Plasma provides one).
+OnlyShowIn=KDE;GNOME;XFCE;

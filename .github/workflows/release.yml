@@ -1,0 +1,129 @@
+name: Release
+
+# Modelled on stuckj/mkvdup's release flow (incl. the PR #200 improvements): the tag is
+# created by the `release` job via target_commitish, ONLY after every build has passed —
+# so a failed build never leaves a dangling tag pointing at a release that never happened.
+# Canary builds are marked as GitHub pre-releases.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version without v prefix (e.g. 1.2.3, or 1.2.3-canary.1 for a canary)'
+        required: true
+      commit:
+        description: 'Commit SHA to release (optional; defaults to the latest commit on the branch)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      is_canary: ${{ steps.resolve.outputs.is_canary }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Resolve version and commit
+        id: resolve
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+
+          # Validate: bare semver-ish, no leading 'v'.
+          if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+)*([.-][0-9A-Za-z]+)*$ ]]; then
+            echo "::error::Invalid version '${VERSION}'. Expected e.g. '1.2.3' or '1.2.3-canary.1'."
+            exit 1
+          fi
+
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          # Canary = version contains "-canary." → published as a GitHub pre-release.
+          IS_CANARY=false
+          if [[ "$VERSION" == *-canary.* ]]; then
+            IS_CANARY=true
+          fi
+          echo "is_canary=${IS_CANARY}" >> "$GITHUB_OUTPUT"
+
+          # Check the REMOTE for an existing tag (checkout is shallow; a local rev-parse
+          # can miss tags that exist upstream).
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists on origin"
+            exit 1
+          fi
+
+          # Resolve the commit to release.
+          if [[ -n "${{ github.event.inputs.commit }}" ]]; then
+            COMMIT="${{ github.event.inputs.commit }}"
+          else
+            COMMIT=$(git rev-parse "origin/${{ github.ref_name }}")
+          fi
+          FULL_SHA=$(git rev-parse "${COMMIT}")
+          echo "commit=${FULL_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Will release ${TAG} at ${FULL_SHA} (canary=${IS_CANARY})"
+
+      # NOTE: the tag is deliberately NOT created here — see the release job.
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build package
+        run: nix build -L
+
+      - name: Assemble release tarball
+        id: pkg
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          NAME="nixos-update-notifier_${VERSION}_x86_64-linux"
+          mkdir -p "staging/${NAME}"
+          cp -rL result/bin "staging/${NAME}/bin"
+          cp -rL result/share "staging/${NAME}/share" 2>/dev/null || true
+          cp README.md LICENSE "staging/${NAME}/"
+          tar -C staging -czf "${NAME}.tar.gz" "${NAME}"
+          sha256sum "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            *.tar.gz
+            *.sha256
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      # Creates the tag (via target_commitish) as well as the release, so the tag only
+      # comes into existence after the build has succeeded. Canary → pre-release.
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ needs.prepare.outputs.commit }}
+          name: ${{ needs.prepare.outputs.tag }}
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ needs.prepare.outputs.is_canary == 'true' }}

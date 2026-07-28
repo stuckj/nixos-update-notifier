@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Tier 1: fast pure-logic tests + lint. The core and daemon crates link NO system
+  # libraries (ksni 0.3 / zbus / tokio are pure Rust), so this runs on a bare runner with
+  # no apt packages. The GTK crate is intentionally excluded here — it is exercised by the
+  # `nix` job below.
+  lint-test:
+    name: lint + unit tests (no system deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy (core + daemon)
+        run: cargo clippy -p nun-core -p nixos-update-notifier --all-targets -- -D warnings
+      - name: unit tests (core + daemon)
+        run: cargo test -p nun-core -p nixos-update-notifier
+
+  # Tier 2: build the whole flake (package incl. the GTK client + both Nix modules) and run
+  # the in-sandbox test suite. This is what proves the GUI compiles and the flake is sound.
+  nix:
+    name: nix flake check + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: flake check
+        run: nix flake check -L
+      - name: build package
+        run: nix build -L
+
+  # Tier 3: integration tests that drive the REAL `nix` invocations against tiny committed
+  # fixture flakes — input listing and the `nix store diff-closures` output format. These
+  # guard the parser against Nix-version output drift. They are `#[ignore]`d so they only
+  # run where `nix` is available (here, inside the devShell).
+  integration:
+    name: fixture-flake integration (real nix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: run ignored integration tests
+        run: nix develop -c cargo test -p nun-core --test integration -- --ignored --test-threads=1
