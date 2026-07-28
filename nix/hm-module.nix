@@ -72,7 +72,11 @@ in
     };
 
     interval = lib.mkOption {
-      type = lib.types.ints.positive;
+      # Enforce the daemon's own minimum here so an invalid value fails at evaluation
+      # rather than at runtime.
+      type = lib.types.addCheck lib.types.int (x: x >= 60) // {
+        description = "integer of at least 60 (seconds)";
+      };
       default = 21600;
       description = "Background check cadence, in seconds (minimum 60).";
     };

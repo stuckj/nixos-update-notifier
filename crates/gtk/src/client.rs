@@ -35,7 +35,9 @@ impl Client {
 
     pub fn updates(&self) -> Result<Vec<PackageChange>> {
         let json = self.proxy.get_updates().context("GetUpdates")?;
-        Ok(serde_json::from_str(&json).unwrap_or_default())
+        // Surface a parse failure (malformed data / a future protocol change) rather than
+        // silently showing an empty list — the updates window renders this error.
+        serde_json::from_str(&json).context("parsing updates JSON from the daemon")
     }
 
     pub fn status(&self) -> Result<(String, u32)> {

@@ -32,8 +32,9 @@ sed -i -E '/^\[workspace\.package\]/,/^\[/ s/^version = ".*"/version = "'"$VERSI
 sed -i -E 's/^  version = "[^"]*";/  version = "'"$VERSION"'";/' "$package_nix"
 
 # 3) Keep Cargo.lock's workspace-member entries in sync so an offline `nix build` doesn't
-#    trip over a version mismatch. Only workspace members are relocked; registry deps are
-#    left exactly as pinned.
+#    trip over a version mismatch. `--workspace` relocks only the workspace members; a
+#    version-only bump like this does not upgrade registry dependencies (verified: it
+#    reports "Locking N packages" for the members and leaves the rest unchanged).
 if command -v cargo >/dev/null 2>&1; then
   (cd "$root" && cargo update --workspace >/dev/null 2>&1) || true
 fi

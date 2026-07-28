@@ -5,15 +5,17 @@
 // standard `org.freedesktop.policykit.exec` action (the user gets an admin auth prompt).
 // Install this only if you want passwordless apply for a trusted local user.
 //
-// The NixOS module (services.nixos-update-notifier, option `polkit.passwordlessUser`)
+// The NixOS module (services.nixos-update-notifier, option `polkit.passwordlessUsers`)
 // generates the authoritative version of this file with the exact store path baked in.
-// The rule below matches on the program name for documentation purposes.
+// The rule below is illustrative; it anchors on the notifier's own binary at the END of a
+// `bin/` path (the daemon re-execs its makeBinaryWrapper-wrapped `.…-wrapped` sibling), so
+// an unrelated executable whose path merely *contains* the name is not authorized.
 
 polkit.addRule(function (action, subject) {
+  var program = action.lookup("program") || "";
   if (
     action.id === "org.freedesktop.policykit.exec" &&
-    action.lookup("program") &&
-    action.lookup("program").indexOf("nixos-update-notifier") !== -1 &&
+    /\/bin\/\.?nixos-update-notifier(-wrapped)?$/.test(program) &&
     subject.user === "youruser"
   ) {
     return polkit.Result.YES;

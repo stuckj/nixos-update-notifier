@@ -23,7 +23,8 @@ use tokio::process::Command;
 pub struct RebootNeeded(pub bool);
 
 fn timestamp() -> String {
-    // YYYYmmdd-HHMMSS in local-ish terms without pulling in chrono.
+    // Seconds since the Unix epoch — enough to make each backup name unique, without
+    // pulling in chrono for calendar formatting.
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -52,7 +53,9 @@ pub async fn apply_privileged(
         candidate_lock.display()
     );
 
-    // Snapshot the booted-vs-current kernel/initrd BEFORE switching.
+    // Snapshot the current system's kernel/initrd BEFORE switching (for the debug log
+    // below). The actual reboot decision compares booted vs current after activation, in
+    // `current_vs_booted_differs()`.
     let before = boot_signature().await;
 
     // 1. Back up the current lock.

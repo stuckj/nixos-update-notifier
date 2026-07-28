@@ -46,23 +46,51 @@ impl CheckOutcome {
     }
 }
 
-fn workdir() -> Result<PathBuf> {
+fn candidate_base() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("org", "nixos", "nixos-update-notifier")
         .context("could not determine XDG cache directory")?;
     Ok(dirs.cache_dir().join("candidate"))
+}
+
+/// Per-process working directory. Keying on the PID means overlapping checks in different
+/// processes (e.g. a manual `check` while the daemon is checking) never delete each other's
+/// working copy mid-flight. Checks within one process are serialized, so reuse is safe.
+fn workdir() -> Result<PathBuf> {
+    Ok(candidate_base()?.join(std::process::id().to_string()))
+}
+
+/// Best-effort removal of working dirs left behind by processes that are no longer running
+/// (Linux: judged by `/proc/<pid>`). Keeps the cache from accumulating after crashes.
+async fn cleanup_stale_workdirs(base: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(base).await else {
+        return;
+    };
+    let me = std::process::id();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            if pid != me && !Path::new(&format!("/proc/{pid}")).exists() {
+                let _ = tokio::fs::remove_dir_all(entry.path()).await;
+            }
+        }
+    }
 }
 
 /// Copy the flake repo into a fresh working directory, excluding `.git` (nix treats the
 /// copy as a plain path flake and uses the working tree directly).
 async fn refresh_working_copy(src: &Path) -> Result<PathBuf> {
     let dst = workdir()?;
+    if let Some(parent) = dst.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+        cleanup_stale_workdirs(parent).await;
+    }
     if dst.exists() {
         tokio::fs::remove_dir_all(&dst)
             .await
             .with_context(|| format!("clearing stale working copy {}", dst.display()))?;
-    }
-    if let Some(parent) = dst.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
     }
 
     // `cp -a` preserves symlinks/perms; we then drop `.git` to avoid dirty-tree noise and
