@@ -11,6 +11,7 @@ pub mod config;
 pub mod diff;
 pub mod lock;
 pub mod nix;
+pub mod pkgs;
 
 /// D-Bus well-known name, object path, and interface the daemon exposes and the GTK
 /// client talks to. Kept here so both sides share one definition.

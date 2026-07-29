@@ -279,7 +279,6 @@ fn update_row(change: &PackageChange) -> gtk::Box {
         ChangeKind::Added => ("＋", "success"),
         ChangeKind::Removed => ("－", "error"),
         ChangeKind::Changed => ("↑", "accent"),
-        ChangeKind::Superseded => ("≡", "dim-label"),
     };
     let kind_label = gtk::Label::new(Some(glyph));
     kind_label.add_css_class(css);

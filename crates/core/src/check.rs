@@ -19,6 +19,7 @@ use crate::changelog;
 use crate::config::Config;
 use crate::diff::{self, PackageChange};
 use crate::nix;
+use crate::pkgs;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
@@ -116,39 +117,26 @@ async fn refresh_working_copy(src: &Path) -> Result<PathBuf> {
     Ok(dst)
 }
 
-/// Mark which changes actually affect installed software, and correct "removed" entries
-/// that are really supersessions.
+/// Mark which changes affect software actually installed on the running system.
 ///
-/// Two distinct confusions this clears up, both reported from real use:
+/// Diffing *derivation* closures is what keeps a check download-free, but it necessarily
+/// includes BUILD-TIME dependencies: `go` appeared as a new package on a machine with no
+/// Go installed, because something in the config is built with it. Comparing against the
+/// running system's realised closure separates the two, and costs one local store query.
 ///
-///   * A derivation-closure diff includes BUILD-TIME dependencies. `go` showed up as a new
-///     package on a system that has no Go installed — it is a build input of something,
-///     never a runtime component. Comparing against the running system's realised closure
-///     tells the two apart, and costs one local store query (no download).
-///
-///   * `diff-closures` reports a disappearing version without mentioning that another
-///     version of the same name survives. `zfs-user: 2.4.2 -> ∅` read as "ZFS is being
-///     removed" on a ZFS-root machine, when in fact 2.4.2 and 2.4.3 were both installed
-///     and only the redundant older one goes away. If the name is still in the candidate
-///     closure, it is superseded, not removed.
-async fn annotate_runtime(changes: &mut [PackageChange], candidate_drv: &str) {
-    let installed = nix::closure_package_names("/run/current-system").await;
+/// (Supersession needs no special handling: comparing version *sets* per package makes
+/// `zfs-user 2.4.2, 2.4.3 -> 2.4.3` read correctly on its own.)
+async fn annotate_runtime(changes: &mut [PackageChange]) {
+    let installed = nix::closure_names("/run/current-system").await;
     if installed.is_empty() {
         // Could not read the running system (unusual). Leave everything as-is rather than
         // mislabel every entry as build-time.
         tracing::warn!("could not read the running system's closure; skipping annotation");
         return;
     }
-    let candidate = nix::closure_package_names(candidate_drv).await;
 
     for c in changes.iter_mut() {
-        c.runtime = installed.contains(&c.name);
-
-        // A "removal" whose name still exists in the candidate is a supersession: another
-        // version of the same package remains. Present it as a change, not a removal.
-        if matches!(c.kind, diff::ChangeKind::Removed) && candidate.contains(&c.name) {
-            c.kind = diff::ChangeKind::Superseded;
-        }
+        c.runtime = installed.contains_package(&c.name);
     }
 
     let build_only = changes.iter().filter(|c| !c.runtime).count();
@@ -229,12 +217,13 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         });
     }
 
-    // Offline closure diff over the two .drv paths.
-    let mut changes = diff::diff_closures(&current_drv, &candidate_drv)
+    // Offline diff over the two derivation closures, using nix's own pname/version
+    // metadata rather than parsing `diff-closures`' rendered output (see `pkgs`).
+    let mut changes = pkgs::diff(&current_drv, &candidate_drv)
         .await
         .context("diffing derivation closures")?;
 
-    annotate_runtime(&mut changes, &candidate_drv).await;
+    annotate_runtime(&mut changes).await;
 
     // Best-effort changelog enrichment.
     changelog::enrich(cfg, &mut changes).await;

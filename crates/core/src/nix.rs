@@ -117,51 +117,60 @@ pub async fn flake_update_inputs(
     Ok(failures)
 }
 
-/// Package name of a store path, with the hash prefix and any trailing version stripped.
-///
-/// `/nix/store/<hash>-zfs-user-2.4.3` -> `zfs-user`, `…-go-1.24.13` -> `go`. Returns
-/// `None` for paths that don't have the expected shape.
-pub fn package_name_of(store_path: &str) -> Option<String> {
+/// A store path's basename with the `<hash>-` prefix removed, e.g. `ffmpeg-8.1.1-lib`.
+pub fn strip_hash(store_path: &str) -> Option<String> {
     let base = store_path.rsplit('/').next()?;
-    // Drop the `<hash>-` prefix.
     let rest = base.split_once('-')?.1;
-    let mut parts: Vec<&str> = rest.split('-').collect();
-    // Peel trailing version-ish components ("2.4.3", "1.24.13", "7.0.14").
-    while parts.len() > 1 {
-        let last = parts[parts.len() - 1];
-        if last.starts_with(|c: char| c.is_ascii_digit()) {
-            parts.pop();
-        } else {
-            break;
-        }
-    }
-    let name = parts.join("-");
-    (!name.is_empty()).then_some(name)
+    (!rest.is_empty()).then(|| rest.to_string())
 }
 
-/// Package names present in the closure of a store path.
+/// The set of entries in a store path's closure, for asking "is this package here?".
 ///
-/// Used to tell apart changes that affect software actually installed on the running
-/// system from build-time-only churn, and to spot a "removed" package that is really just
-/// superseded by another version of the same name. Reads an already-realised or
-/// already-instantiated path, so it downloads nothing.
-pub async fn closure_package_names(path: &str) -> std::collections::HashSet<String> {
+/// Reads an already-realised or already-instantiated path, so it downloads nothing.
+#[derive(Debug, Default, Clone)]
+pub struct ClosureNames(Vec<String>);
+
+impl ClosureNames {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether a package of this name is in the closure.
+    ///
+    /// Matching is by prefix rather than by reconstructing the package name, because
+    /// deriving a name from a store path is unreliable: multi-output packages put the
+    /// output AFTER the version (`ffmpeg-8.1.1-lib`, `ffmpeg-8.1.1-data`), so peeling
+    /// trailing version components leaves `ffmpeg-8.1.1-lib` and never matches `ffmpeg`.
+    /// That silently misclassified every multi-output package as build-time-only.
+    ///
+    /// The trailing `-` matters: it keeps `curl` from matching `curlftpfs-0.9`, and `go`
+    /// from matching `gobject-introspection-1.2`.
+    pub fn contains_package(&self, name: &str) -> bool {
+        let prefix = format!("{name}-");
+        self.0.iter().any(|e| e == name || e.starts_with(&prefix))
+    }
+}
+
+/// Read the closure of a store path.
+pub async fn closure_names(path: &str) -> ClosureNames {
     let out = Command::new("nix-store")
         .args(["-q", "--requisites", path])
         .output()
         .await;
     let Ok(out) = out else {
         tracing::warn!("could not query closure of {path}");
-        return Default::default();
+        return ClosureNames::default();
     };
     if !out.status.success() {
         tracing::warn!("nix-store -q --requisites {path} failed");
-        return Default::default();
+        return ClosureNames::default();
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(package_name_of)
-        .collect()
+    ClosureNames(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(strip_hash)
+            .collect(),
+    )
 }
 
 /// Evaluate the `.drvPath` of a host's `system.build.toplevel` for a given flake ref.
@@ -247,41 +256,56 @@ pub async fn meta_changelogs(nixpkgs_ref: &str, pnames: &[String]) -> HashMap<St
 
 #[cfg(test)]
 mod tests {
-    use super::package_name_of;
+    use super::{strip_hash, ClosureNames};
 
-    #[test]
-    fn strips_hash_and_version() {
-        // Real shapes seen in a NixOS system closure.
-        assert_eq!(
-            package_name_of("/nix/store/abc123-zfs-user-2.4.3").as_deref(),
-            Some("zfs-user")
-        );
-        assert_eq!(
-            package_name_of("/nix/store/abc123-go-1.24.13").as_deref(),
-            Some("go")
-        );
-        assert_eq!(
-            package_name_of("/nix/store/abc123-zfs-kernel-2.4.3-7.0.14").as_deref(),
-            Some("zfs-kernel")
-        );
+    fn closure(entries: &[&str]) -> ClosureNames {
+        ClosureNames(entries.iter().map(|s| s.to_string()).collect())
     }
 
     #[test]
-    fn keeps_names_that_merely_contain_digits() {
-        // The trailing component must *start* with a digit to count as a version.
+    fn strips_the_hash_prefix() {
         assert_eq!(
-            package_name_of("/nix/store/abc123-python3").as_deref(),
-            Some("python3")
+            strip_hash("/nix/store/abc123-ffmpeg-8.1.1-lib").as_deref(),
+            Some("ffmpeg-8.1.1-lib")
         );
-        assert_eq!(
-            package_name_of("/nix/store/abc123-nixos-system-nixos-x1").as_deref(),
-            Some("nixos-system-nixos-x1")
-        );
+        assert_eq!(strip_hash("").as_deref(), None);
+        assert_eq!(strip_hash("/nix/store/nodashhere").as_deref(), None);
     }
 
     #[test]
-    fn handles_odd_input_without_panicking() {
-        assert_eq!(package_name_of("").as_deref(), None);
-        assert_eq!(package_name_of("/nix/store/nodashhere").as_deref(), None);
+    fn finds_multi_output_packages() {
+        // The real shapes from a NixOS closure: the OUTPUT comes after the version, which
+        // is what broke name-reconstruction and misreported ffmpeg as build-time only.
+        let c = closure(&[
+            "ffmpeg-8.1.1-lib",
+            "ffmpeg-8.1.1-data",
+            "ffmpeg-headless-8.1.1-lib",
+        ]);
+        assert!(c.contains_package("ffmpeg"));
+        assert!(c.contains_package("ffmpeg-headless"));
+    }
+
+    #[test]
+    fn finds_plain_versioned_packages() {
+        let c = closure(&["curl-8.20.0", "expat-2.8.1", "zfs-user-2.4.3"]);
+        assert!(c.contains_package("curl"));
+        assert!(c.contains_package("expat"));
+        assert!(c.contains_package("zfs-user"));
+    }
+
+    #[test]
+    fn does_not_match_a_longer_unrelated_name() {
+        // The trailing dash is what keeps these apart.
+        let c = closure(&["curlftpfs-0.9", "gobject-introspection-1.2"]);
+        assert!(!c.contains_package("curl"));
+        assert!(!c.contains_package("go"));
+    }
+
+    #[test]
+    fn reports_absent_packages() {
+        // go is a build input; a system without Go installed has no go-* runtime path.
+        let c = closure(&["brave-1.92.144", "mesa-26.1.5"]);
+        assert!(!c.contains_package("go"));
+        assert!(c.contains_package("brave"));
     }
 }

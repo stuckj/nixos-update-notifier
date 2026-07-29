@@ -30,11 +30,6 @@ pub enum ChangeKind {
     Removed,
     /// Version changed (upgrade or downgrade); `old`/`new` both non-empty.
     Changed,
-    /// This version disappears, but another version of the same package remains — the
-    /// system carried two and the redundant one is dropped. Set by `check`, which can see
-    /// the candidate closure; `diff-closures` alone reports it indistinguishably from a
-    /// real removal, which is alarming for something like `zfs-user` on a ZFS-root box.
-    Superseded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,7 +74,6 @@ impl PackageChange {
             ChangeKind::Added => format!("(new) -> {new}"),
             ChangeKind::Removed => format!("{old} -> (removed)"),
             ChangeKind::Changed => format!("{old} -> {new}"),
-            ChangeKind::Superseded => format!("{old} -> (superseded; another version stays)"),
         }
     }
 
@@ -97,9 +91,7 @@ impl PackageChange {
                     && self.new.iter().any(|v| looks_like_version(v))
             }
             ChangeKind::Added => self.new.iter().any(|v| looks_like_version(v)),
-            ChangeKind::Removed | ChangeKind::Superseded => {
-                self.old.iter().any(|v| looks_like_version(v))
-            }
+            ChangeKind::Removed => self.old.iter().any(|v| looks_like_version(v)),
         }
     }
 }
