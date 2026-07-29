@@ -167,6 +167,14 @@ $ systemctl --user kill -s SIGUSR1 nixos-update-notifier.service
 `nixos-rebuild switch` behind a polkit prompt. Your previous lock is backed up first and
 restored automatically if the rebuild fails or you cancel the prompt.
 
+Those backups are written next to your lock as `flake.lock.bak.<epoch>`, and only the
+newest three are kept. They are working files, not history — git already records your
+previous locks — so add this to your config repo's `.gitignore`:
+
+```gitignore
+flake.lock.bak.*
+```
+
 If you want to see what a rebuild would do before trusting it:
 
 ```console
