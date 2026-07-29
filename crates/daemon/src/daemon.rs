@@ -145,6 +145,11 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         }
     }
 
+    // Leave nothing behind on a clean exit. Stale artifacts are also collected by the next
+    // run, but a service that is stopped and not restarted shouldn't leave cache sitting
+    // around until something happens to notice.
+    check::cleanup_own_artifacts().await;
+
     Ok(())
 }
 

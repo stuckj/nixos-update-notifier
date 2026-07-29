@@ -30,6 +30,42 @@ use tokio::process::Command;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebootNeeded(pub bool);
 
+/// How many `flake.lock.bak.<epoch>` files to keep in the repo.
+///
+/// Every apply writes one. Without a bound they accumulate in the user's config repo
+/// forever — small individually, but unbounded and untracked clutter in a git working
+/// tree. A few is enough to recover from a bad update; older ones are what git is for.
+const KEEP_BACKUPS: usize = 3;
+
+/// Delete all but the newest `keep` lock backups. Best-effort: never fails an apply.
+async fn prune_old_backups(repo: &Path, keep: usize) {
+    let Ok(mut entries) = tokio::fs::read_dir(repo).await else {
+        return;
+    };
+    let mut backups: Vec<(u64, PathBuf)> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // `flake.lock.bak.<epoch>` — sort by the epoch in the name rather than by mtime,
+        // which a checkout or a copy can rewrite.
+        if let Some(stamp) = name.strip_prefix("flake.lock.bak.") {
+            if let Ok(epoch) = stamp.parse::<u64>() {
+                backups.push((epoch, entry.path()));
+            }
+        }
+    }
+    if backups.len() <= keep {
+        return;
+    }
+    backups.sort_by_key(|(epoch, _)| std::cmp::Reverse(*epoch));
+    for (_, path) in backups.into_iter().skip(keep) {
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => tracing::info!("pruned old lock backup {}", path.display()),
+            Err(e) => tracing::warn!("could not prune {}: {e}", path.display()),
+        }
+    }
+}
+
 fn timestamp() -> String {
     // Seconds since the Unix epoch — enough to make each backup name unique, without
     // pulling in chrono for calendar formatting.
@@ -63,6 +99,8 @@ pub async fn install_candidate_lock(repo: &Path, candidate_lock: &Path) -> Resul
         .await
         .with_context(|| format!("backing up {} -> {}", real_lock.display(), backup.display()))?;
     tracing::info!("backed up flake.lock to {}", backup.display());
+
+    prune_old_backups(repo, KEEP_BACKUPS).await;
 
     tokio::fs::copy(candidate_lock, &real_lock)
         .await

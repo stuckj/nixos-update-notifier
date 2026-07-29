@@ -64,6 +64,34 @@ fn workdir() -> Result<PathBuf> {
     Ok(candidate_base()?.join(std::process::id().to_string()))
 }
 
+/// Where this process's candidate `flake.lock` is kept once the working copy is discarded.
+fn candidate_lock_path() -> Result<PathBuf> {
+    Ok(candidate_base()?.join(format!("{}.flake.lock", std::process::id())))
+}
+
+/// Copy the candidate lock out of the working copy so the copy itself can be deleted.
+async fn save_candidate_lock(work: &Path) -> Result<PathBuf> {
+    let dst = candidate_lock_path()?;
+    if let Some(parent) = dst.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    tokio::fs::copy(work.join("flake.lock"), &dst)
+        .await
+        .with_context(|| format!("saving candidate lock to {}", dst.display()))?;
+    Ok(dst)
+}
+
+/// Remove this process's leftovers. Called on daemon shutdown so a clean exit leaves
+/// nothing behind, rather than waiting for some later run to notice the PID is gone.
+pub async fn cleanup_own_artifacts() {
+    if let Ok(dir) = workdir() {
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+    if let Ok(lock) = candidate_lock_path() {
+        let _ = tokio::fs::remove_file(&lock).await;
+    }
+}
+
 /// Best-effort removal of working dirs left behind by processes that are no longer running
 /// (Linux: judged by `/proc/<pid>`). Keeps the cache from accumulating after crashes.
 async fn cleanup_stale_workdirs(base: &Path) {
@@ -72,15 +100,21 @@ async fn cleanup_stale_workdirs(base: &Path) {
     };
     let me = std::process::id();
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<u32>().ok())
-        {
-            if pid != me && !Path::new(&format!("/proc/{pid}")).exists() {
-                let _ = tokio::fs::remove_dir_all(entry.path()).await;
-            }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Both shapes are keyed by PID: `<pid>` working copies and `<pid>.flake.lock`
+        // saved candidates. A crashed run leaves one of each behind.
+        let pid = name.split('.').next().and_then(|s| s.parse::<u32>().ok());
+        let Some(pid) = pid else { continue };
+        if pid == me || Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
         }
+        let path = entry.path();
+        let _ = if path.is_dir() {
+            tokio::fs::remove_dir_all(&path).await
+        } else {
+            tokio::fs::remove_file(&path).await
+        };
     }
 }
 
@@ -197,7 +231,15 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         .await
         .context("evaluating candidate toplevel drvPath")?;
 
-    let candidate_lock = work.join("flake.lock");
+    // Keep the candidate lock — a few KB — and throw the working copy away. The copy is a
+    // whole second checkout of the user's flake repo (hundreds of MB for a real config),
+    // and the daemon is a long-lived service, so retaining it meant that much disk sitting
+    // there for as long as the tray icon was running. Nothing downstream needs the tree:
+    // the candidate derivation already lives in the store, and Apply only installs the lock.
+    let candidate_lock = save_candidate_lock(&work).await?;
+    if let Err(e) = tokio::fs::remove_dir_all(&work).await {
+        tracing::warn!("could not remove working copy {}: {e}", work.display());
+    }
 
     tracing::debug!(
         current = %current_drv,
