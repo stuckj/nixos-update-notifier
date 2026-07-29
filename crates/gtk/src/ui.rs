@@ -555,3 +555,189 @@ impl SettingsEntries {
         })
     }
 }
+
+const APP_ID_PROGRESS: &str = "org.nixos.UpdateNotifier.Progress";
+
+/// Live view of a running apply: a one-line status, an expandable details pane tailing the
+/// rebuild's output, and a Cancel button.
+///
+/// Before this, a privileged rebuild ran for many minutes with no indication of what was
+/// happening and no way to stop it — the output went to the daemon's journal, so when an
+/// apply failed the reason was a single line the user never saw. (The first real failure
+/// was `curl: (22) … error 525` from a vendor download server, buried at line 6881.)
+pub fn run_progress_window() -> Result<()> {
+    let app = Application::builder()
+        .application_id(APP_ID_PROGRESS)
+        .build();
+
+    app.connect_activate(|app| {
+        if let Some(existing) = app.active_window() {
+            existing.present();
+            return;
+        }
+        build_progress_window(app);
+    });
+    app.run_with_args::<&str>(&[]);
+    Ok(())
+}
+
+fn build_progress_window(app: &Application) {
+    let client: Option<Rc<Client>> = Client::connect().ok().map(Rc::new);
+
+    let heading = gtk::Label::new(Some("Applying updates…"));
+    heading.set_halign(Align::Start);
+    heading.set_margin_start(12);
+    heading.set_margin_top(12);
+    heading.add_css_class("title-4");
+
+    let subtitle = gtk::Label::new(Some("Running nixos-rebuild switch."));
+    subtitle.set_halign(Align::Start);
+    subtitle.set_margin_start(12);
+    subtitle.set_margin_bottom(4);
+    subtitle.add_css_class("dim-label");
+
+    // Indeterminate: nixos-rebuild gives no machine-readable overall progress, and inventing
+    // a percentage would be a lie. It pulses only while the apply is actually running.
+    let bar = gtk::ProgressBar::new();
+    bar.set_margin_start(12);
+    bar.set_margin_end(12);
+
+    // The rebuild's output, collapsed by default — the same shape as the Ubuntu updater's
+    // details pane.
+    let buffer = gtk::TextBuffer::new(None);
+    let view = gtk::TextView::with_buffer(&buffer);
+    view.set_editable(false);
+    view.set_cursor_visible(false);
+    view.set_monospace(true);
+    view.set_wrap_mode(gtk::WrapMode::WordChar);
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .min_content_height(260)
+        .child(&view)
+        .build();
+
+    let expander = gtk::Expander::new(Some("Details"));
+    expander.set_margin_start(12);
+    expander.set_margin_end(12);
+    expander.set_child(Some(&scroller));
+    expander.set_vexpand(true);
+
+    let cancel = gtk::Button::with_label("Cancel");
+    let close = gtk::Button::with_label("Close");
+    let buttons = gtk::Box::new(Orientation::Horizontal, 8);
+    buttons.set_halign(Align::End);
+    buttons.set_margin_end(12);
+    buttons.set_margin_bottom(12);
+    buttons.set_margin_top(4);
+    buttons.append(&cancel);
+    buttons.append(&close);
+
+    {
+        let client = client.clone();
+        let cancel_btn = cancel.clone();
+        let subtitle = subtitle.clone();
+        cancel.connect_clicked(move |_| {
+            if let Some(c) = &client {
+                let _ = c.cancel_apply();
+            }
+            // Cancellation is cooperative and may be declined during activation, so say
+            // "requested" rather than claiming it stopped.
+            cancel_btn.set_sensitive(false);
+            subtitle.set_text(
+                "Cancellation requested. Building stops promptly; if activation has already \
+                 started it will finish, since stopping midway can leave services mixed.",
+            );
+        });
+    }
+
+    let vbox = gtk::Box::new(Orientation::Vertical, 6);
+    vbox.append(&heading);
+    vbox.append(&subtitle);
+    vbox.append(&bar);
+    vbox.append(&expander);
+    vbox.append(&buttons);
+
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("NixOS — Applying updates")
+        .default_width(720)
+        .default_height(200)
+        .child(&vbox)
+        .build();
+
+    {
+        let window = window.clone();
+        close.connect_clicked(move |_| window.close());
+    }
+
+    // Tail the log and follow the daemon's status. Reading from a byte offset means the
+    // window can be opened, closed and reopened during a long apply without replaying or
+    // losing output.
+    let log_path = client.as_ref().and_then(|c| c.apply_log().ok());
+    let offset = Rc::new(RefCell::new(0u64));
+
+    {
+        let client = client.clone();
+        let buffer = buffer.clone();
+        let scroller = scroller.clone();
+        let heading = heading.clone();
+        let subtitle = subtitle.clone();
+        let bar = bar.clone();
+        let cancel = cancel.clone();
+        let offset = offset.clone();
+
+        glib::timeout_add_local(Duration::from_millis(700), move || {
+            if let Some(path) = &log_path {
+                if let Some(new_text) = read_new(path, &mut offset.borrow_mut()) {
+                    if !new_text.is_empty() {
+                        buffer.insert(&mut buffer.end_iter(), &new_text);
+                        // Follow the tail, as a terminal would.
+                        let adj = scroller.vadjustment();
+                        adj.set_value(adj.upper() - adj.page_size());
+                    }
+                }
+            }
+
+            let applying = client
+                .as_ref()
+                .and_then(|c| c.status().ok())
+                .map(|(s, _)| s == "applying")
+                .unwrap_or(false);
+
+            if applying {
+                bar.pulse();
+            } else {
+                bar.set_fraction(1.0);
+                heading.set_text("Apply finished");
+                subtitle.set_text("Expand Details for the full output.");
+                cancel.set_sensitive(false);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    window.present();
+}
+
+/// Read whatever has been appended to `path` since `offset`, advancing it.
+///
+/// A truncated file (a new apply reusing the same path) resets the offset rather than
+/// producing garbage.
+fn read_new(path: &std::path::Path, offset: &mut u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len < *offset {
+        *offset = 0;
+    }
+    if len == *offset {
+        return Some(String::new());
+    }
+    f.seek(SeekFrom::Start(*offset)).ok()?;
+    let mut buf = Vec::with_capacity((len - *offset) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    *offset = len;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}

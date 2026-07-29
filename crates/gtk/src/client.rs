@@ -17,6 +17,8 @@ trait Updater {
     fn dismiss(&self) -> zbus::Result<()>;
     fn get_updates(&self) -> zbus::Result<String>;
     fn get_status(&self) -> zbus::Result<(String, u32)>;
+    fn cancel_apply(&self) -> zbus::Result<()>;
+    fn get_apply_log(&self) -> zbus::Result<String>;
     fn get_warnings(&self) -> zbus::Result<String>;
 }
 
@@ -57,5 +59,16 @@ impl Client {
 
     pub fn apply(&self) -> Result<()> {
         self.proxy.apply().context("Apply")
+    }
+
+    pub fn cancel_apply(&self) -> Result<()> {
+        self.proxy.cancel_apply().context("CancelApply")
+    }
+
+    /// Path of the log the apply writes to, for live progress.
+    pub fn apply_log(&self) -> Result<std::path::PathBuf> {
+        Ok(std::path::PathBuf::from(
+            self.proxy.get_apply_log().context("GetApplyLog")?,
+        ))
     }
 }

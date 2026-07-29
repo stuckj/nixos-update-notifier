@@ -65,6 +65,9 @@ pub struct Config {
 pub struct Icons {
     pub idle: String,
     pub checking: String,
+    /// A privileged rebuild is running — distinct from `checking`, which is the
+    /// read-only look for updates.
+    pub applying: String,
     /// System derivation changed but no package versions did — a deliberately low-key
     /// state, so it uses a quieter icon than `updates_available`.
     pub system_changes: String,
@@ -87,6 +90,7 @@ impl Default for Icons {
         Self {
             idle: "update-none".into(),
             checking: "view-refresh".into(),
+            applying: "system-software-update".into(),
             system_changes: "update-low".into(),
             updates_available: "update-medium".into(),
             error: "dialog-error".into(),

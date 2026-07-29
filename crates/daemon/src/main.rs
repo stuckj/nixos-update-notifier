@@ -55,6 +55,9 @@ enum Cmd {
         repo: PathBuf,
         #[arg(long)]
         host: String,
+        /// Path polled to allow the user to cancel; only ever read, never written.
+        #[arg(long)]
+        cancel_flag: Option<PathBuf>,
     },
 }
 
@@ -78,8 +81,12 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Cmd::Run) {
         Cmd::Run => rt.block_on(daemon::run(config_path)),
         Cmd::Check { json, exact } => rt.block_on(run_check_cli(&config_path, json, exact)),
-        Cmd::ApplyPrivileged { repo, host } => rt.block_on(async move {
-            let reboot = apply::rebuild_privileged(&repo, &host).await?;
+        Cmd::ApplyPrivileged {
+            repo,
+            host,
+            cancel_flag,
+        } => rt.block_on(async move {
+            let reboot = apply::rebuild_privileged(&repo, &host, cancel_flag.as_deref()).await?;
             if reboot.0 {
                 println!("REBOOT_RECOMMENDED");
             }

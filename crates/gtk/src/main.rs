@@ -22,6 +22,8 @@ struct Cli {
 enum Cmd {
     /// Show the pending-updates window (default).
     Updates,
+    /// Show live progress of a running apply.
+    Progress,
     /// Show the settings editor.
     Settings {
         #[arg(long)]
@@ -33,6 +35,7 @@ fn main() -> Result<()> {
     // GTK owns the main OS thread; no tokio here.
     match Cli::parse().command.unwrap_or(Cmd::Updates) {
         Cmd::Updates => ui::run_updates_window(),
+        Cmd::Progress => ui::run_progress_window(),
         Cmd::Settings { config } => {
             let path = Config::resolve_path(config)?;
             ui::run_settings_window(path)

@@ -106,6 +106,25 @@ impl Updater {
         Ok(())
     }
 
+    /// Ask an in-flight privileged rebuild to stop. Restricted, like Apply.
+    ///
+    /// Honoured cooperatively by the root-side rebuild: building and downloading stop
+    /// cleanly, while a rebuild that has already reached activation declines and finishes,
+    /// since interrupting a half-applied switch is worse than waiting for it.
+    async fn cancel_apply(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] hdr: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        if !self.caller_allowed(conn, &hdr).await {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "CancelApply may only be called by the nixos-update-notifier client".into(),
+            ));
+        }
+        let _ = self.tx.send(Command::CancelApply);
+        Ok(())
+    }
+
     /// Suppress re-notification for the current pending set until it changes. Restricted,
     /// so another app cannot quietly keep you unaware of pending updates.
     async fn dismiss(
@@ -133,6 +152,11 @@ impl Updater {
     async fn get_status(&self) -> (String, u32) {
         let s = self.shared.lock().await;
         (s.status.as_str().to_string(), s.status.count())
+    }
+
+    /// Path of the log the current/last apply writes to, so the client can show progress.
+    async fn get_apply_log(&self) -> String {
+        nun_core::apply::apply_log_path().display().to_string()
     }
 
     /// Inputs skipped on the last check, as a JSON array of `[name, reason]` pairs.

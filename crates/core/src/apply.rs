@@ -30,6 +30,29 @@ use tokio::process::Command;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebootNeeded(pub bool);
 
+/// Where the rebuild's output is written so the GUI can show it live.
+///
+/// A plain file rather than a pipe: the writer is a root process and the reader is an
+/// unprivileged GTK client that may be opened, closed and reopened while the rebuild runs.
+pub fn apply_log_path() -> PathBuf {
+    runtime_dir().join("apply.log")
+}
+
+/// Touched by the daemon to ask the privileged rebuild to stop; polled by that rebuild.
+///
+/// The unprivileged daemon cannot signal a process that pkexec has turned into root, so
+/// cancellation is cooperative. The privileged side only ever tests for existence — it
+/// never writes or deletes — so this cannot become a destructive action performed as root.
+pub fn cancel_flag_path() -> PathBuf {
+    runtime_dir().join("cancel-apply")
+}
+
+fn runtime_dir() -> PathBuf {
+    directories::ProjectDirs::from("org", "nixos", "nixos-update-notifier")
+        .map(|d| d.cache_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// How many `flake.lock.bak.<epoch>` files to keep in the repo.
 ///
 /// Every apply writes one. Without a bound they accumulate in the user's config repo
@@ -127,19 +150,59 @@ pub async fn restore_lock(repo: &Path, backup: &Path) {
 ///
 /// It takes no file paths to write and no pass-through arguments — only the flake ref to
 /// activate. Streams rebuild output to stdout so the caller can surface progress.
-pub async fn rebuild_privileged(repo: &Path, host: &str) -> Result<RebootNeeded> {
+pub async fn rebuild_privileged(
+    repo: &Path,
+    host: &str,
+    cancel_flag: Option<&Path>,
+) -> Result<RebootNeeded> {
     let flake_target = format!("{}#{}", repo.display(), host);
     println!("running: nixos-rebuild switch --flake {flake_target}");
 
-    let status = Command::new("nixos-rebuild")
+    let mut child = Command::new("nixos-rebuild")
         .arg("switch")
         .arg("--flake")
         .arg(&flake_target)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()
-        .await
+        .spawn()
         .context("spawning nixos-rebuild")?;
+
+    // Cancellation has to be cooperative. pkexec fully becomes root, so the unprivileged
+    // daemon cannot signal this process; instead it drops a flag file and we stop our own
+    // child. We only ever READ that path — never write or delete it — so a caller-supplied
+    // path cannot become a destructive action performed as root.
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status.context("waiting for nixos-rebuild")?,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                if !cancel_flag.map(|p| p.exists()).unwrap_or(false) {
+                    continue;
+                }
+                // Cancellation is always honoured — refusing would be worse than the risk.
+                // What differs is the consequence, so report which phase we stopped in.
+                //
+                // Building and downloading are pure and interrupt cleanly. Setting the
+                // system profile is an atomic symlink swap. But activation
+                // (switch-to-configuration) is a SEQUENCE of imperative steps — bootloader
+                // install, activation scripts, unit restarts — so stopping partway can
+                // leave services stopped whose replacements never started. Recoverable by
+                // re-running the switch or rebooting into the previous generation, which is
+                // untouched, but worth saying out loud rather than pretending otherwise.
+                let during_activation = activation_started();
+                println!("cancel requested; stopping nixos-rebuild");
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                if during_activation {
+                    anyhow::bail!(
+                        "apply cancelled DURING activation. Some services may be stopped \
+                         mid-switch; re-run the update or reboot (the previous generation is \
+                         still in the boot menu) to get back to a consistent state."
+                    );
+                }
+                anyhow::bail!("apply cancelled before activation; the system was not changed");
+            }
+        }
+    };
 
     anyhow::ensure!(
         status.success(),
@@ -147,6 +210,18 @@ pub async fn rebuild_privileged(repo: &Path, host: &str) -> Result<RebootNeeded>
     );
 
     Ok(RebootNeeded(current_vs_booted_differs().await))
+}
+
+/// Whether the switch has reached activation, after which interrupting is unsafe.
+///
+/// The system profile is repointed as part of activation, so a profile that no longer
+/// matches the running system means activation has at least begun.
+fn activation_started() -> bool {
+    std::fs::read_link("/nix/var/nix/profiles/system")
+        .ok()
+        .zip(std::fs::read_link("/run/current-system").ok())
+        .map(|(profile, current)| profile != current)
+        .unwrap_or(false)
 }
 
 /// A stable signature of the security-relevant boot artefacts of a system profile.

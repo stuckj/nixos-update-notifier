@@ -71,6 +71,9 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // then all fired at once when the check finally finished.
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<Result<check::CheckOutcome>>();
     let mut checking = false;
+    // Applies run in their own task for the same reason, so Cancel stays reachable.
+    let (apply_done_tx, mut apply_done_rx) = mpsc::unbounded_channel::<()>();
+    let mut applying = false;
 
     // Kick off an initial check shortly after startup.
     let _ = tx.send(Command::CheckNow);
@@ -95,6 +98,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             Some(result) = done_rx.recv() => {
                 checking = false;
                 handle_check_result(result, &cfg, &shared, &tray_handle).await;
+                continue;
+            }
+            Some(()) = apply_done_rx.recv() => {
+                applying = false;
+                // Re-check so the tray reflects the new baseline.
+                let _ = tx.send(Command::CheckNow);
                 continue;
             }
             maybe = rx.recv() => match maybe {
@@ -149,11 +158,36 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             }
 
             Command::Apply => {
+                if applying {
+                    tracing::debug!("an apply is already running; ignoring request");
+                    continue;
+                }
                 let lock = shared.lock().await.candidate_lock.clone();
                 if let Some(lock) = lock {
-                    apply_flow(&cfg, &lock, &shared, &tray_handle).await;
-                    // Re-check after applying so the tray reflects the new baseline.
-                    let _ = tx.send(Command::CheckNow);
+                    // Spawned, not awaited: a rebuild takes many minutes, and awaiting it
+                    // here would block this loop exactly as awaiting a check once did —
+                    // which would make Cancel unreachable for the entire time it is the
+                    // one thing the user might want.
+                    applying = true;
+                    let cfg2 = cfg.clone();
+                    let shared2 = shared.clone();
+                    let handle2 = tray_handle.clone();
+                    let done = apply_done_tx.clone();
+                    tokio::spawn(async move {
+                        apply_flow(&cfg2, &lock, &shared2, &handle2).await;
+                        let _ = done.send(());
+                    });
+                }
+            }
+
+            Command::CancelApply => {
+                // The daemon cannot signal a root process, so drop the flag the
+                // privileged side polls. It stops itself, or declines if activation has
+                // already begun.
+                let flag = nun_core::apply::cancel_flag_path();
+                match std::fs::write(&flag, b"") {
+                    Ok(()) => tracing::info!("cancellation requested"),
+                    Err(e) => tracing::warn!("could not request cancellation: {e}"),
                 }
             }
 
@@ -348,7 +382,7 @@ async fn apply_flow(
     shared: &SharedState,
     handle: &ksni::Handle<NixTray>,
 ) {
-    set_status(shared, handle, Status::Checking).await;
+    set_status(shared, handle, Status::Applying).await;
 
     let exe = match self_exe() {
         Ok(p) => p,
@@ -393,15 +427,48 @@ async fn apply_flow(
             }
         };
 
-    // pkexec <self> apply-privileged --repo <path> --host <host>
-    // No lock path and no pass-through rebuild args cross the privilege boundary.
+    // Capture the rebuild's output to a file the GTK client tails, so the user can watch
+    // what is happening. Previously it went to the daemon's journal, which meant a long
+    // privileged operation ran with no visible indication of progress at all.
+    let log_path = nun_core::apply::apply_log_path();
+    let log = match std::fs::File::create(&log_path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!("could not open apply log {}: {e}", log_path.display());
+            None
+        }
+    };
+
+    // A fresh cancel flag: any stale one from a previous run must not abort this apply.
+    let cancel_flag = nun_core::apply::cancel_flag_path();
+    let _ = std::fs::remove_file(&cancel_flag);
+
+    // Show the progress window straight away, before the polkit prompt, so the user can
+    // see the operation and reach Cancel.
+    if let Err(e) = spawn_gtk(&["progress"]) {
+        tracing::warn!("could not open the progress window: {e:#}");
+    }
+
+    // pkexec <self> apply-privileged --repo <path> --host <host> --cancel-flag <path>
+    // No lock path and no pass-through rebuild args cross the privilege boundary; the
+    // cancel flag is only ever READ by the privileged side.
     let mut cmd = tokio::process::Command::new("pkexec");
     cmd.arg(&exe)
         .arg("apply-privileged")
         .arg("--repo")
         .arg(&cfg.flake_path)
         .arg("--host")
-        .arg(&cfg.host_attr);
+        .arg(&cfg.host_attr)
+        .arg("--cancel-flag")
+        .arg(&cancel_flag);
+    if let Some(f) = log {
+        let err = match f.try_clone() {
+            Ok(c) => c,
+            Err(_) => std::fs::File::create("/dev/null").expect("open /dev/null"),
+        };
+        cmd.stdout(std::process::Stdio::from(f))
+            .stderr(std::process::Stdio::from(err));
+    }
 
     if cfg.notify {
         let _ = notify::notify(

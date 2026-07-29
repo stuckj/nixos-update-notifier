@@ -21,6 +21,8 @@ pub enum Status {
     Checking,
     /// The system derivation differs but no package version changed.
     SystemChangesOnly,
+    /// A privileged rebuild is in progress.
+    Applying,
     /// At least one package version changed; `usize` is how many.
     UpdatesAvailable(usize),
     Error,
@@ -32,6 +34,7 @@ impl Status {
             Status::Idle => &icons.idle,
             Status::Checking => &icons.checking,
             Status::SystemChangesOnly => &icons.system_changes,
+            Status::Applying => &icons.applying,
             Status::UpdatesAvailable(_) => &icons.updates_available,
             Status::Error => &icons.error,
         }
@@ -44,6 +47,7 @@ impl Status {
             Status::SystemChangesOnly => {
                 "NixOS: system configuration changes available (no package updates)".to_string()
             }
+            Status::Applying => "NixOS: applying updates…".to_string(),
             Status::UpdatesAvailable(n) => format!("NixOS: {n} package update(s) available"),
             Status::Error => "NixOS update check failed".to_string(),
         }
@@ -55,6 +59,7 @@ impl Status {
             Status::Idle => "idle",
             Status::Checking => "checking",
             Status::SystemChangesOnly => "system-changes",
+            Status::Applying => "applying",
             Status::UpdatesAvailable(_) => "updates",
             Status::Error => "error",
         }
@@ -89,6 +94,8 @@ pub enum Command {
     /// Open the "View updates…" window (tray only — spawns the GTK client).
     ViewUpdates,
     Apply,
+    /// Ask an in-flight privileged rebuild to stop.
+    CancelApply,
     Dismiss,
     /// Open the settings window (tray only — spawns the GTK client).
     Settings,
