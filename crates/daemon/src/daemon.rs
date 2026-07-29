@@ -162,8 +162,13 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     tracing::debug!("an apply is already running; ignoring request");
                     continue;
                 }
-                let lock = shared.lock().await.candidate_lock.clone();
-                if let Some(lock) = lock {
+                let (lock, incomplete) = {
+                    let s = shared.lock().await;
+                    (s.candidate_lock.clone(), s.apply_incomplete)
+                };
+                // With no candidate but an unfinished switch, this is a retry: rebuild the
+                // repo's existing lock, which already describes the running system.
+                if lock.is_some() || incomplete {
                     // Spawned, not awaited: a rebuild takes many minutes, and awaiting it
                     // here would block this loop exactly as awaiting a check once did —
                     // which would make Cancel unreachable for the entire time it is the
@@ -174,7 +179,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     let handle2 = tray_handle.clone();
                     let done = apply_done_tx.clone();
                     tokio::spawn(async move {
-                        apply_flow(&cfg2, &lock, &shared2, &handle2).await;
+                        apply_flow(&cfg2, lock.as_deref(), &shared2, &handle2).await;
                         let _ = done.send(());
                     });
                 }
@@ -323,6 +328,18 @@ async fn set_status(shared: &SharedState, handle: &ksni::Handle<NixTray>, status
     handle.update(move |t| t.status = status).await;
 }
 
+/// Record whether a switch is left unfinished, and mirror it into the tray menu.
+async fn set_apply_incomplete(
+    shared: &SharedState,
+    handle: &ksni::Handle<NixTray>,
+    incomplete: bool,
+) {
+    shared.lock().await.apply_incomplete = incomplete;
+    handle
+        .update(move |t| t.apply_incomplete = incomplete)
+        .await;
+}
+
 /// Short multi-line summary for a notification body (first few changes).
 fn summarize(changes: &[PackageChange]) -> String {
     const MAX: usize = 6;
@@ -386,9 +403,12 @@ fn spawn_gtk(args: &[&str]) -> Result<()> {
 
 /// Run the privileged apply via pkexec, then notify the outcome and prompt for reboot if
 /// warranted.
+/// `candidate_lock` is `None` for a RETRY of an unfinished switch: the repo's lock is
+/// already the one that produced the running system, so there is nothing to install and
+/// nothing to roll back — only the rebuild needs re-running.
 async fn apply_flow(
     cfg: &Config,
-    candidate_lock: &Path,
+    candidate_lock: Option<&Path>,
     shared: &SharedState,
     handle: &ksni::Handle<NixTray>,
 ) {
@@ -402,20 +422,40 @@ async fn apply_flow(
         }
     };
 
-    // Last-chance safety net before anything is written: verify this candidate does not
-    // advance a pinned input. check.rs already restricts `nix flake update` to the
-    // configured set, so this only fires if that logic is wrong — which is exactly when you
-    // want it, since silently advancing e.g. a rev-pinned kernel input can leave the
-    // machine unbootable.
-    if let Err(e) = verify_pins(cfg, candidate_lock).await {
-        tracing::error!("apply aborted: {e:#}");
-        if cfg.notify {
-            let _ = notify::notify("NixOS update blocked", &e.to_string(), &cfg.icons.error).await;
+    let backup = if let Some(candidate_lock) = candidate_lock {
+        // Last-chance safety net before anything is written: verify this candidate does not
+        // advance a pinned input. check.rs already restricts `nix flake update` to the
+        // configured set, so this only fires if that logic is wrong — which is exactly when
+        // you want it, since silently advancing e.g. a rev-pinned kernel input can leave
+        // the machine unbootable.
+        if let Err(e) = verify_pins(cfg, candidate_lock).await {
+            tracing::error!("apply aborted: {e:#}");
+            if cfg.notify {
+                let _ =
+                    notify::notify("NixOS update blocked", &e.to_string(), &cfg.icons.error).await;
+            }
+            set_status(shared, handle, Status::Error).await;
+            return;
         }
-        set_status(shared, handle, Status::Error).await;
-        return;
-    }
+        match install_lock_or_bail(cfg, candidate_lock, shared, handle).await {
+            Some(b) => Some(b),
+            None => return,
+        }
+    } else {
+        tracing::info!("retrying an unfinished switch against the repo's current lock");
+        None
+    };
 
+    apply_rebuild(cfg, &exe, backup, shared, handle).await;
+}
+
+/// Install the candidate lock, or report the failure and stop. `None` means stop.
+async fn install_lock_or_bail(
+    cfg: &Config,
+    candidate_lock: &Path,
+    shared: &SharedState,
+    handle: &ksni::Handle<NixTray>,
+) -> Option<PathBuf> {
     // Install the candidate lock ourselves, UNPRIVILEGED — it's the user's own file, and
     // keeping root away from user-writable paths is a deliberate security property (see
     // nun_core::apply docs). Root only ever activates the result.
@@ -433,10 +473,21 @@ async fn apply_flow(
                     .await;
                 }
                 set_status(shared, handle, Status::Error).await;
-                return;
+                return None;
             }
         };
+    Some(backup)
+}
 
+/// Run the privileged rebuild and report the outcome. `backup` is `None` on a retry, where
+/// there is no staged lock to roll back to.
+async fn apply_rebuild(
+    cfg: &Config,
+    exe: &Path,
+    backup: Option<PathBuf>,
+    shared: &SharedState,
+    handle: &ksni::Handle<NixTray>,
+) {
     // Capture the rebuild's output to a file the GTK client tails, so the user can watch
     // what is happening. Previously it went to the daemon's journal, which meant a long
     // privileged operation ran with no visible indication of progress at all.
@@ -463,7 +514,7 @@ async fn apply_flow(
     // No lock path and no pass-through rebuild args cross the privilege boundary; the
     // cancel flag is only ever READ by the privileged side.
     let mut cmd = tokio::process::Command::new("pkexec");
-    cmd.arg(&exe)
+    cmd.arg(exe)
         .arg("apply-privileged")
         .arg("--repo")
         .arg(&cfg.flake_path)
@@ -495,6 +546,9 @@ async fn apply_flow(
 
     match cmd.status().await {
         Ok(status) if status.success() => {
+            // A complete switch clears any unfinished-apply state, including one left by an
+            // earlier attempt this retry has just put right.
+            set_apply_incomplete(shared, handle, false).await;
             let reboot = nun_core::apply::current_vs_booted_differs().await;
             let (summary, body) = if reboot {
                 (
@@ -532,20 +586,27 @@ async fn apply_flow(
                     "rebuild reported failure but the new system is already active; \
                      keeping the new flake.lock so the repo matches the running system"
                 );
+                // The switch still needs finishing, but there are no pending updates left
+                // to re-apply, so nothing would re-enable Apply. Remember it, and the tray
+                // offers "Retry unfinished apply" until a switch completes.
+                set_apply_incomplete(shared, handle, true).await;
                 if cfg.notify {
                     let _ = notify::notify(
                         "NixOS update partly applied",
-                        "The new system is active, but part of the switch failed. The new \
-                         flake.lock was kept so your repo matches. Check the apply log, fix \
-                         the cause, and re-run the update.",
+                        "The new system is active, but part of the switch failed. Fix the \
+                         cause (see the apply log), then choose 'Retry unfinished apply' \
+                         from the tray.",
                         &cfg.icons.error,
                     )
                     .await;
                 }
             } else {
                 // Covers a failed build and a cancelled/denied polkit prompt alike: put the
-                // previous lock back so the repo is left exactly as it was.
-                nun_core::apply::restore_lock(&cfg.flake_path, &backup).await;
+                // previous lock back so the repo is left exactly as it was. A retry staged
+                // no lock, so there is nothing to restore and the flag stands.
+                if let Some(backup) = &backup {
+                    nun_core::apply::restore_lock(&cfg.flake_path, backup).await;
+                }
                 if cfg.notify {
                     let _ = notify::notify(
                         "NixOS update failed",
@@ -560,7 +621,9 @@ async fn apply_flow(
         }
         Err(e) => {
             tracing::error!("could not launch pkexec: {e:#}");
-            nun_core::apply::restore_lock(&cfg.flake_path, &backup).await;
+            if let Some(backup) = &backup {
+                nun_core::apply::restore_lock(&cfg.flake_path, backup).await;
+            }
             if cfg.notify {
                 let _ = notify::notify(
                     "NixOS update failed",

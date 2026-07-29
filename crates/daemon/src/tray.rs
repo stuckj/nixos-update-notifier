@@ -13,6 +13,9 @@ pub struct NixTray {
     pub status: Status,
     pub icons: Icons,
     pub tx: CommandTx,
+    /// A switch activated but did not finish. Keeps the apply action reachable even with
+    /// nothing pending, which is exactly the state that leaves it needing a re-run.
+    pub apply_incomplete: bool,
 }
 
 impl NixTray {
@@ -21,6 +24,7 @@ impl NixTray {
             status: Status::Idle,
             icons,
             tx,
+            apply_incomplete: false,
         }
     }
 
@@ -29,6 +33,19 @@ impl NixTray {
     /// light up the tray.
     fn has_updates(&self) -> bool {
         self.status.is_applicable()
+    }
+
+    /// Label and enabled state for the apply item.
+    ///
+    /// An unfinished switch has no pending updates left — the system is already running the
+    /// new configuration — so gating purely on "are there updates" would strand the user
+    /// with no way to finish it from the tray.
+    fn apply_item(&self) -> (String, bool) {
+        if self.apply_incomplete {
+            ("Retry unfinished apply".to_string(), true)
+        } else {
+            ("Apply updates".to_string(), self.has_updates())
+        }
     }
 
     fn send(&self, cmd: Command) {
@@ -102,9 +119,9 @@ impl ksni::Tray for NixTray {
             }
             .into(),
             StandardItem {
-                label: "Apply updates".into(),
+                label: self.apply_item().0,
                 icon_name: "system-software-update".into(),
-                enabled: updates,
+                enabled: self.apply_item().1,
                 activate: Box::new(|t: &mut Self| t.send(Command::Apply)),
                 ..Default::default()
             }
@@ -133,5 +150,43 @@ impl ksni::Tray for NixTray {
             }
             .into(),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn tray(status: Status, apply_incomplete: bool) -> NixTray {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        NixTray {
+            status,
+            icons: Icons::default(),
+            tx,
+            apply_incomplete,
+        }
+    }
+
+    #[test]
+    fn apply_is_offered_only_when_there_is_something_to_apply() {
+        assert_eq!(
+            tray(Status::UpdatesAvailable(3), false).apply_item(),
+            ("Apply updates".to_string(), true)
+        );
+        assert_eq!(
+            tray(Status::Idle, false).apply_item(),
+            ("Apply updates".to_string(), false)
+        );
+    }
+
+    /// The case that stranded a real user: a switch activated but failed partway, leaving
+    /// the system on the new configuration with NO pending updates. Gating on updates alone
+    /// would grey out the one action that finishes the job.
+    #[test]
+    fn an_unfinished_switch_keeps_the_apply_action_reachable() {
+        let (label, enabled) = tray(Status::Idle, true).apply_item();
+        assert!(enabled, "an unfinished switch must stay retryable");
+        assert_eq!(label, "Retry unfinished apply");
     }
 }

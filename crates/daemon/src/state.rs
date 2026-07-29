@@ -124,6 +124,12 @@ pub struct Shared {
     /// finishes, which is what lets the window say "no check has run yet" instead of
     /// claiming the system is up to date on the strength of never having looked.
     pub last_check_epoch: Option<u64>,
+    /// Set when an apply activated the new system but the switch did not finish — a late
+    /// activation step failing, say. The system is running the new configuration, so there
+    /// are no pending updates left to re-apply, yet the switch still needs re-running.
+    /// Without this the tool would offer no way back to a consistent state; cleared by the
+    /// next successful apply.
+    pub apply_incomplete: bool,
 }
 
 pub type SharedState = Arc<Mutex<Shared>>;
