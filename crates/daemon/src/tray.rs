@@ -90,9 +90,13 @@ impl ksni::Tray for NixTray {
             }
             .into(),
             StandardItem {
+                // Always available, even with nothing pending. It is the only window that
+                // says what the daemon is doing — when it last checked, whether a check is
+                // running, which inputs it had to skip — and that is exactly what you want
+                // to look at BEFORE a check has found anything.
                 label: "View updates…".into(),
                 icon_name: "dialog-information".into(),
-                enabled: updates,
+                enabled: true,
                 activate: Box::new(|t: &mut Self| t.send(Command::ViewUpdates)),
                 ..Default::default()
             }

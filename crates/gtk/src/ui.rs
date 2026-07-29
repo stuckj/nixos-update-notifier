@@ -59,7 +59,12 @@ fn build_updates_window(app: &Application) {
     // returns early when nothing has changed — rebuilding the rows resets the scroll
     // position, which made a long update list impossible to read: scroll down, and a
     // few seconds later you are back at the top.
-    type Rendered = (String, Vec<PackageChange>, Vec<(String, String)>);
+    type Rendered = (
+        String,
+        Vec<PackageChange>,
+        Vec<(String, String)>,
+        Option<u64>,
+    );
     let rendered: Rc<RefCell<Option<Rendered>>> = Rc::new(RefCell::new(None));
 
     // Rebuild the list from the daemon's current state. Cloneable so we can hand it to
@@ -76,6 +81,7 @@ fn build_updates_window(app: &Application) {
                     c.status().map(|(s, _)| s).unwrap_or_default(),
                     c.updates().unwrap_or_default(),
                     c.warnings().unwrap_or_default(),
+                    c.last_check(),
                 );
                 if rendered.borrow().as_ref() == Some(&now) {
                     return;
@@ -149,6 +155,17 @@ fn build_updates_window(app: &Application) {
                                 "Last check failed".to_string(),
                                 Some("See the daemon log; press Check now to retry."),
                             ),
+                            // "Up to date" is a claim about a check that happened. Before the
+                            // first one completes there is nothing to base it on, and the
+                            // window is reachable from the tray at any time — including
+                            // seconds after login.
+                            (_, true) if c.last_check().is_none() => (
+                                "No check has run yet".to_string(),
+                                Some(
+                                    "Nothing has been checked since the daemon started.\n\
+                                     Press Check now to look for updates.",
+                                ),
+                            ),
                             (_, true) => (
                                 "System is up to date".to_string(),
                                 Some("No pending updates."),
@@ -182,6 +199,22 @@ fn build_updates_window(app: &Application) {
                         ordered.sort_by_key(|c| (!c.runtime, c.name.clone()));
                         for change in ordered {
                             list.append(&update_row(change));
+                        }
+
+                        // Dates what is on screen. Without it, "System is up to date" gives
+                        // no way to tell a check from a minute ago from one that last ran
+                        // before the machine was suspended for a week.
+                        if let Some(secs) = c.last_check() {
+                            let foot = gtk::Label::new(Some(&format!(
+                                "Last checked {}",
+                                relative_time(secs)
+                            )));
+                            foot.set_xalign(0.0);
+                            foot.set_margin_start(8);
+                            foot.set_margin_top(12);
+                            foot.set_margin_bottom(6);
+                            foot.add_css_class("dim-label");
+                            list.append(&foot);
                         }
                     }
                     Err(e) => {
@@ -266,6 +299,34 @@ fn build_updates_window(app: &Application) {
         .child(&vbox)
         .build();
     window.present();
+}
+
+/// Render an epoch timestamp as a coarse "how long ago", e.g. "3 hours ago".
+///
+/// Coarse on purpose: the point is to tell a check from minutes ago apart from one that
+/// last ran before a week of suspend, not to report seconds. A clock that went backwards
+/// (NTP correction, timezone-less epoch skew) says "just now" rather than a negative age.
+fn relative_time(epoch_secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age = now.saturating_sub(epoch_secs);
+    match age {
+        0..=59 => "just now".to_string(),
+        60..=3599 => {
+            let m = age / 60;
+            format!("{m} minute{} ago", if m == 1 { "" } else { "s" })
+        }
+        3600..=86_399 => {
+            let h = age / 3600;
+            format!("{h} hour{} ago", if h == 1 { "" } else { "s" })
+        }
+        _ => {
+            let d = age / 86_400;
+            format!("{d} day{} ago", if d == 1 { "" } else { "s" })
+        }
+    }
 }
 
 fn update_row(change: &PackageChange) -> gtk::Box {
@@ -740,4 +801,39 @@ fn read_new(path: &std::path::Path, offset: &mut u64) -> Option<String> {
     f.read_to_end(&mut buf).ok()?;
     *offset = len;
     Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_time;
+
+    fn ago(secs: u64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        relative_time(now - secs)
+    }
+
+    #[test]
+    fn ages_are_described_in_the_largest_sensible_unit() {
+        assert_eq!(ago(5), "just now");
+        assert_eq!(ago(60), "1 minute ago");
+        assert_eq!(ago(3 * 60), "3 minutes ago");
+        assert_eq!(ago(3600), "1 hour ago");
+        assert_eq!(ago(5 * 3600), "5 hours ago");
+        assert_eq!(ago(86_400), "1 day ago");
+        assert_eq!(ago(9 * 86_400), "9 days ago");
+    }
+
+    /// A timestamp in the future (clock stepped backwards by NTP) must not underflow into
+    /// a nonsensical age — saturating_sub keeps it at "just now".
+    #[test]
+    fn a_future_timestamp_reads_as_just_now() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(relative_time(now + 10_000), "just now");
+    }
 }

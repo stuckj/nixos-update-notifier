@@ -120,6 +120,10 @@ pub struct Shared {
     /// the client so a silently-skipped input (a moved local fork, an unreachable remote)
     /// is visible rather than quietly narrowing what "up to date" means.
     pub failed_inputs: Vec<(String, String)>,
+    /// When the last check completed, as seconds since the Unix epoch. `None` until one
+    /// finishes, which is what lets the window say "no check has run yet" instead of
+    /// claiming the system is up to date on the strength of never having looked.
+    pub last_check_epoch: Option<u64>,
 }
 
 pub type SharedState = Arc<Mutex<Shared>>;

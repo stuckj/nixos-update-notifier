@@ -154,6 +154,13 @@ impl Updater {
         (s.status.as_str().to_string(), s.status.count())
     }
 
+    /// When the last check finished, in seconds since the Unix epoch; 0 if none has run
+    /// yet. Lets the window distinguish "up to date" from "never looked".
+    async fn get_last_check(&self) -> u64 {
+        let s = self.shared.lock().await;
+        s.last_check_epoch.unwrap_or(0)
+    }
+
     /// Path of the log the current/last apply writes to, so the client can show progress.
     async fn get_apply_log(&self) -> String {
         nun_core::apply::apply_log_path().display().to_string()

@@ -216,6 +216,16 @@ async fn handle_check_result(
     shared: &SharedState,
     tray_handle: &ksni::Handle<NixTray>,
 ) {
+    // Stamped for every outcome, including a failed check: "we looked and it went wrong"
+    // is still information the window should be able to show.
+    {
+        let mut s = shared.lock().await;
+        s.last_check_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+    }
+
     match result {
         Ok(outcome) if outcome.updates_available => {
             let count = outcome.count();

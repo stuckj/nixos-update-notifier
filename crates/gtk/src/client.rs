@@ -19,6 +19,7 @@ trait Updater {
     fn get_status(&self) -> zbus::Result<(String, u32)>;
     fn cancel_apply(&self) -> zbus::Result<()>;
     fn get_apply_log(&self) -> zbus::Result<String>;
+    fn get_last_check(&self) -> zbus::Result<u64>;
     fn get_warnings(&self) -> zbus::Result<String>;
 }
 
@@ -63,6 +64,14 @@ impl Client {
 
     pub fn cancel_apply(&self) -> Result<()> {
         self.proxy.cancel_apply().context("CancelApply")
+    }
+
+    /// Seconds since the Unix epoch when the last check finished; `None` if none has.
+    pub fn last_check(&self) -> Option<u64> {
+        match self.proxy.get_last_check() {
+            Ok(0) | Err(_) => None,
+            Ok(secs) => Some(secs),
+        }
     }
 
     /// Path of the log the apply writes to, for live progress.
