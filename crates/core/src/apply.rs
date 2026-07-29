@@ -257,11 +257,27 @@ async fn terminate_group(pgid: i32, child: &mut tokio::process::Child) {
 }
 
 fn activation_started() -> bool {
-    std::fs::read_link("/nix/var/nix/profiles/system")
-        .ok()
-        .zip(std::fs::read_link("/run/current-system").ok())
-        .map(|(profile, current)| profile != current)
-        .unwrap_or(false)
+    generations_differ(
+        Path::new("/nix/var/nix/profiles/system"),
+        Path::new("/run/current-system"),
+    )
+}
+
+/// Whether two system symlinks point at different generations.
+///
+/// Must CANONICALISE, not `read_link`. The two links are written in different styles:
+/// the profile is relative (`system-134-link`) while `/run/current-system` is an absolute
+/// store path. Comparing the raw link targets therefore always reported a difference, so
+/// every cancellation claimed to have happened "during activation" and told the user their
+/// services might be half-switched when nothing had been activated at all.
+///
+/// Unresolvable links mean we cannot tell, and the safe answer to "is it too late" is no —
+/// an unnecessary scary warning is its own harm.
+fn generations_differ(profile: &Path, current: &Path) -> bool {
+    match (std::fs::canonicalize(profile), std::fs::canonicalize(current)) {
+        (Ok(p), Ok(c)) => p != c,
+        _ => false,
+    }
 }
 
 /// A stable signature of the security-relevant boot artefacts of a system profile.
@@ -289,6 +305,54 @@ pub async fn current_vs_booted_differs() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scratch dir + the two system symlinks, mimicking how NixOS writes them:
+    /// the profile link RELATIVE, `/run/current-system` ABSOLUTE.
+    fn generation_links(tag: &str, profile_gen: &str, current_gen: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("nun-gen-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(root.join(profile_gen)).expect("gen dir");
+        std::fs::create_dir_all(root.join(current_gen)).expect("gen dir");
+
+        let profile = root.join("system");
+        let current = root.join("current-system");
+        // Relative target, exactly like /nix/var/nix/profiles/system.
+        std::os::unix::fs::symlink(profile_gen, &profile).expect("profile link");
+        // Absolute target, exactly like /run/current-system.
+        std::os::unix::fs::symlink(root.join(current_gen), &current).expect("current link");
+        (root, profile, current)
+    }
+
+    /// Regression test for a false "cancelled DURING activation" warning.
+    ///
+    /// Both links point at the SAME generation — nothing has been activated — but one is
+    /// written relative and the other absolute. Comparing raw link targets makes them look
+    /// different, which is what made every cancellation report a half-switched system.
+    #[test]
+    fn same_generation_is_not_activation_even_when_link_styles_differ() {
+        let (root, profile, current) = generation_links("same", "gen-1", "gen-1");
+        assert!(
+            !generations_differ(&profile, &current),
+            "identical generations must not be reported as activation in progress"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The real signal: the profile has been swapped to a new generation but
+    /// `/run/current-system` has not caught up, i.e. activation is genuinely under way.
+    #[test]
+    fn a_swapped_profile_means_activation_started() {
+        let (root, profile, current) = generation_links("diff", "gen-2", "gen-1");
+        assert!(
+            generations_differ(&profile, &current),
+            "a profile pointing at a newer generation means activation has begun"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// A cancelled rebuild must take its whole build tree down with it.
     ///
