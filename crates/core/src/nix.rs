@@ -117,6 +117,53 @@ pub async fn flake_update_inputs(
     Ok(failures)
 }
 
+/// Package name of a store path, with the hash prefix and any trailing version stripped.
+///
+/// `/nix/store/<hash>-zfs-user-2.4.3` -> `zfs-user`, `…-go-1.24.13` -> `go`. Returns
+/// `None` for paths that don't have the expected shape.
+pub fn package_name_of(store_path: &str) -> Option<String> {
+    let base = store_path.rsplit('/').next()?;
+    // Drop the `<hash>-` prefix.
+    let rest = base.split_once('-')?.1;
+    let mut parts: Vec<&str> = rest.split('-').collect();
+    // Peel trailing version-ish components ("2.4.3", "1.24.13", "7.0.14").
+    while parts.len() > 1 {
+        let last = parts[parts.len() - 1];
+        if last.starts_with(|c: char| c.is_ascii_digit()) {
+            parts.pop();
+        } else {
+            break;
+        }
+    }
+    let name = parts.join("-");
+    (!name.is_empty()).then_some(name)
+}
+
+/// Package names present in the closure of a store path.
+///
+/// Used to tell apart changes that affect software actually installed on the running
+/// system from build-time-only churn, and to spot a "removed" package that is really just
+/// superseded by another version of the same name. Reads an already-realised or
+/// already-instantiated path, so it downloads nothing.
+pub async fn closure_package_names(path: &str) -> std::collections::HashSet<String> {
+    let out = Command::new("nix-store")
+        .args(["-q", "--requisites", path])
+        .output()
+        .await;
+    let Ok(out) = out else {
+        tracing::warn!("could not query closure of {path}");
+        return Default::default();
+    };
+    if !out.status.success() {
+        tracing::warn!("nix-store -q --requisites {path} failed");
+        return Default::default();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(package_name_of)
+        .collect()
+}
+
 /// Evaluate the `.drvPath` of a host's `system.build.toplevel` for a given flake ref.
 ///
 /// Evaluating `drvPath` *instantiates* the derivation (writes the `.drv` to the store)
@@ -196,4 +243,45 @@ pub async fn meta_changelogs(nixpkgs_ref: &str, pnames: &[String]) -> HashMap<St
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::package_name_of;
+
+    #[test]
+    fn strips_hash_and_version() {
+        // Real shapes seen in a NixOS system closure.
+        assert_eq!(
+            package_name_of("/nix/store/abc123-zfs-user-2.4.3").as_deref(),
+            Some("zfs-user")
+        );
+        assert_eq!(
+            package_name_of("/nix/store/abc123-go-1.24.13").as_deref(),
+            Some("go")
+        );
+        assert_eq!(
+            package_name_of("/nix/store/abc123-zfs-kernel-2.4.3-7.0.14").as_deref(),
+            Some("zfs-kernel")
+        );
+    }
+
+    #[test]
+    fn keeps_names_that_merely_contain_digits() {
+        // The trailing component must *start* with a digit to count as a version.
+        assert_eq!(
+            package_name_of("/nix/store/abc123-python3").as_deref(),
+            Some("python3")
+        );
+        assert_eq!(
+            package_name_of("/nix/store/abc123-nixos-system-nixos-x1").as_deref(),
+            Some("nixos-system-nixos-x1")
+        );
+    }
+
+    #[test]
+    fn handles_odd_input_without_panicking() {
+        assert_eq!(package_name_of("").as_deref(), None);
+        assert_eq!(package_name_of("/nix/store/nodashhere").as_deref(), None);
+    }
 }

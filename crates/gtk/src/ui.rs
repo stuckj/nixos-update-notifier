@@ -153,7 +153,19 @@ fn build_updates_window(app: &Application) {
                                 "System is up to date".to_string(),
                                 Some("No pending updates."),
                             ),
-                            (_, false) => (format!("{} package change(s)", changes.len()), None),
+                            (_, false) => {
+                                let build_only = changes.iter().filter(|c| !c.runtime).count();
+                                let installed = changes.len() - build_only;
+                                let h = if build_only > 0 {
+                                    format!(
+                                        "{installed} update(s) to installed software \
+                                         · {build_only} build-time only"
+                                    )
+                                } else {
+                                    format!("{} package change(s)", changes.len())
+                                };
+                                (h, None)
+                            }
                         };
                         header.set_text(&heading);
 
@@ -164,7 +176,11 @@ fn build_updates_window(app: &Application) {
                             row.set_justify(gtk::Justification::Center);
                             list.append(&row);
                         }
-                        for change in &changes {
+                        // Updates to installed software first — that is what the user came
+                        // to read; build-time churn is context, not the headline.
+                        let mut ordered: Vec<&PackageChange> = changes.iter().collect();
+                        ordered.sort_by_key(|c| (!c.runtime, c.name.clone()));
+                        for change in ordered {
                             list.append(&update_row(change));
                         }
                     }
@@ -263,16 +279,31 @@ fn update_row(change: &PackageChange) -> gtk::Box {
         ChangeKind::Added => ("＋", "success"),
         ChangeKind::Removed => ("－", "error"),
         ChangeKind::Changed => ("↑", "accent"),
+        ChangeKind::Superseded => ("≡", "dim-label"),
     };
     let kind_label = gtk::Label::new(Some(glyph));
     kind_label.add_css_class(css);
     kind_label.set_width_chars(2);
 
+    // Build-time-only entries are dimmed and labelled: they are dependencies used to build
+    // something on the system, not software that gets installed, and showing them exactly
+    // like real upgrades makes it look like e.g. Go is about to appear on your machine.
     let name = gtk::Label::new(None);
-    name.set_markup(&format!(
-        "<b>{}</b>",
-        glib::markup_escape_text(&change.name)
-    ));
+    if change.runtime {
+        name.set_markup(&format!(
+            "<b>{}</b>",
+            glib::markup_escape_text(&change.name)
+        ));
+    } else {
+        name.set_markup(&format!(
+            "{} <small>· build-time only</small>",
+            glib::markup_escape_text(&change.name)
+        ));
+        name.add_css_class("dim-label");
+        row.set_tooltip_text(Some(
+            "Used to build part of your system; not installed on it.",
+        ));
+    }
     name.set_halign(Align::Start);
     name.set_hexpand(true);
     name.set_xalign(0.0);

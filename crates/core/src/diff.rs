@@ -30,6 +30,11 @@ pub enum ChangeKind {
     Removed,
     /// Version changed (upgrade or downgrade); `old`/`new` both non-empty.
     Changed,
+    /// This version disappears, but another version of the same package remains — the
+    /// system carried two and the redundant one is dropped. Set by `check`, which can see
+    /// the candidate closure; `diff-closures` alone reports it indistinguishably from a
+    /// real removal, which is alarming for something like `zfs-user` on a ZFS-root box.
+    Superseded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +49,20 @@ pub struct PackageChange {
     pub size_delta: Option<String>,
     /// Filled in later by the changelog resolver; `None` until then / if unavailable.
     pub changelog: Option<String>,
+    /// Whether a package of this name is present in the RUNNING system's realised
+    /// (runtime) closure.
+    ///
+    /// A derivation-closure diff necessarily includes build-time dependencies — `go`,
+    /// `cargo`, compilers — that build something on your system but are never installed
+    /// on it. Listing those identically to real upgrades makes it look like they are
+    /// about to be installed. Defaults to `true` so anything unclassified is shown
+    /// normally rather than being wrongly de-emphasised.
+    #[serde(default = "default_true")]
+    pub runtime: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl PackageChange {
@@ -60,6 +79,7 @@ impl PackageChange {
             ChangeKind::Added => format!("(new) -> {new}"),
             ChangeKind::Removed => format!("{old} -> (removed)"),
             ChangeKind::Changed => format!("{old} -> {new}"),
+            ChangeKind::Superseded => format!("{old} -> (superseded; another version stays)"),
         }
     }
 
@@ -77,7 +97,9 @@ impl PackageChange {
                     && self.new.iter().any(|v| looks_like_version(v))
             }
             ChangeKind::Added => self.new.iter().any(|v| looks_like_version(v)),
-            ChangeKind::Removed => self.old.iter().any(|v| looks_like_version(v)),
+            ChangeKind::Removed | ChangeKind::Superseded => {
+                self.old.iter().any(|v| looks_like_version(v))
+            }
         }
     }
 }
@@ -204,6 +226,8 @@ pub fn parse_diff_closures(text: &str) -> Vec<PackageChange> {
             kind,
             size_delta,
             changelog: None,
+            // Annotated later by `check`, which knows the closures.
+            runtime: true,
         });
     }
 
