@@ -578,8 +578,8 @@ async fn apply_rebuild(
             // Restoring the lock then would be actively harmful: the repo would describe
             // the OLD system while the NEW one is running, and the user's next rebuild
             // would silently revert them. Only roll back if nothing was activated.
-            let activated = system_before.is_some()
-                && nun_core::apply::current_system() != system_before;
+            let activated =
+                system_before.is_some() && nun_core::apply::current_system() != system_before;
 
             if activated {
                 tracing::warn!(

@@ -8,12 +8,25 @@ Architecture, internals, and development workflow. For installing and using the 
 ## Development setup
 
 ```console
-$ nix develop                        # rust toolchain + gtk4 + pkg-config + nvd
+$ nix develop                        # rust toolchain + gtk4 + pkg-config + nvd + shellcheck
 $ cargo test -p nun-core             # pure-logic unit tests (no system deps)
 $ cargo clippy --workspace --all-targets -- -D warnings
 $ cargo fmt --all
 $ cargo run -p nixos-update-notifier -- check   # exercise the no-download check
 $ nix build                          # build both binaries via the flake
+```
+
+### Before pushing
+
+Run everything the `lint + unit tests` CI job runs, in its order. `cargo fmt` is the easy
+one to skip, and it fails the job before clippy or the tests get a chance to run — so a
+formatting slip hides whatever else might be broken:
+
+```console
+$ cargo fmt --all -- --check \
+    && cargo clippy -p nun-core -p nixos-update-notifier --all-targets -- -D warnings \
+    && cargo test -p nun-core -p nixos-update-notifier \
+    && shellcheck scripts/*.sh
 ```
 
 `Cargo.lock` must be committed: the package builds with `rustPlatform.buildRustPackage`

@@ -38,9 +38,12 @@
             pkgs.gsettings-desktop-schemas
           ];
 
-          # Handy for validating the no-download closure diff by hand.
           packages = [
+            # Handy for validating the no-download closure diff by hand.
             pkgs.nvd
+            # CI lints scripts/*.sh with this; without it in the shell the check can only
+            # fail after a push, which is how a formatting-class failure gets noticed late.
+            pkgs.shellcheck
           ];
 
           RUST_LOG = "nixos_update_notifier=debug";

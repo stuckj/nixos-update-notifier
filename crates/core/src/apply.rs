@@ -285,7 +285,10 @@ fn activation_started() -> bool {
 /// Unresolvable links mean we cannot tell, and the safe answer to "is it too late" is no —
 /// an unnecessary scary warning is its own harm.
 fn generations_differ(profile: &Path, current: &Path) -> bool {
-    match (std::fs::canonicalize(profile), std::fs::canonicalize(current)) {
+    match (
+        std::fs::canonicalize(profile),
+        std::fs::canonicalize(current),
+    ) {
         (Ok(p), Ok(c)) => p != c,
         _ => false,
     }
@@ -319,13 +322,18 @@ mod tests {
 
     /// Scratch dir + the two system symlinks, mimicking how NixOS writes them:
     /// the profile link RELATIVE, `/run/current-system` ABSOLUTE.
-    fn generation_links(tag: &str, profile_gen: &str, current_gen: &str) -> (PathBuf, PathBuf, PathBuf) {
+    fn generation_links(
+        tag: &str,
+        profile_gen: &str,
+        current_gen: &str,
+    ) -> (PathBuf, PathBuf, PathBuf) {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let root = std::env::temp_dir().join(format!("nun-gen-{tag}-{}-{nanos}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("nun-gen-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(root.join(profile_gen)).expect("gen dir");
         std::fs::create_dir_all(root.join(current_gen)).expect("gen dir");
 
