@@ -307,9 +307,41 @@ fn update_row(change: &PackageChange) -> gtk::Box {
     name.set_hexpand(true);
     name.set_xalign(0.0);
 
-    let versions = gtk::Label::new(Some(&change.render_line_versions()));
+    // A package with many distinct versions must not be able to squeeze the name column to
+    // nothing (zoom managed a 148-character line), so long values are truncated — but a
+    // truncated value you cannot read is its own problem. Clicking the row expands it, the
+    // way the Ubuntu updater does.
+    let full_versions = change.render_line_versions();
+    let versions = gtk::Label::new(Some(&full_versions));
     versions.set_halign(Align::End);
     versions.add_css_class("dim-label");
+    versions.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    versions.set_max_width_chars(48);
+
+    // Only advertise the interaction when there is actually something hidden.
+    let is_truncated = full_versions.chars().count() > 48;
+    if is_truncated {
+        row.set_tooltip_text(Some("Click to show all versions"));
+
+        let click = gtk::GestureClick::new();
+        {
+            let versions = versions.clone();
+            let full = full_versions.clone();
+            click.connect_released(move |_, _, _, _| {
+                let expanded = versions.ellipsize() == gtk::pango::EllipsizeMode::None;
+                if expanded {
+                    versions.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+                    versions.set_wrap(false);
+                    versions.set_tooltip_text(Some("Click to show all versions"));
+                } else {
+                    versions.set_ellipsize(gtk::pango::EllipsizeMode::None);
+                    versions.set_wrap(true);
+                    versions.set_tooltip_text(Some(&full));
+                }
+            });
+        }
+        row.add_controller(click);
+    }
 
     row.append(&kind_label);
     row.append(&name);
@@ -402,6 +434,10 @@ fn build_settings_window(app: &Application, config_path: &std::path::Path) {
 
     let buttons = gtk::Box::new(Orientation::Horizontal, 8);
     buttons.set_halign(Align::End);
+    // Match the form's own 16px margins; without these the button sits flush against the
+    // window edge while everything above it is inset.
+    buttons.set_margin_end(16);
+    buttons.set_margin_bottom(16);
     buttons.append(&save);
 
     let vbox = gtk::Box::new(Orientation::Vertical, 12);

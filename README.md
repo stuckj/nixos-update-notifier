@@ -9,11 +9,20 @@ and applies updates on request through an authenticated `nixos-rebuild`.
 
 Built for **KDE Plasma 6 on Wayland** (native StatusNotifierItem tray).
 
-![tray icon states](docs/screenshot-tray.png)
-*Placeholder: tray icon showing idle / checking / updates-available states.*
+![The tray menu](docs/screenshot-tray-menu.png)
 
-![view updates window](docs/screenshot-updates.png)
-*Placeholder: the "View updates" window listing package changes with changelog links.*
+Everything is driven from the tray menu.
+
+![The pending updates window](docs/screenshot-updates.png)
+
+The update list separates **updates to software you actually have installed** from
+**build-time-only** dependencies — compilers and build inputs that a derivation-closure
+diff necessarily includes but which are never installed on your system. Changelog links
+appear where nixpkgs provides `meta.changelog`.
+
+![The settings window](docs/screenshot-settings.png)
+
+Settings are editable from the tray, or in `config.toml` directly.
 
 ---
 

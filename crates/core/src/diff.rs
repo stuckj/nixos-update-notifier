@@ -97,11 +97,34 @@ impl PackageChange {
 }
 
 fn join_versions(v: &[String]) -> String {
-    if v.is_empty() {
+    let collapsed = collapse_variants(v);
+    if collapsed.is_empty() {
         "∅".to_string()
     } else {
-        v.join(", ")
+        collapsed.join(", ")
     }
+}
+
+/// Drop versions that are just another listed version plus a build-variant suffix.
+///
+/// A package can appear under one name at several "versions" that are really one upstream
+/// version built differently — zoom ships as `7.0.0.1666`, `7.0.0.1666-bwrap`,
+/// `7.0.0.1666-fhsenv-profile` and `7.0.0.1666-init`. Rendering all of them produced a
+/// 148-character line that blew the row layout apart and squeezed the package name to
+/// nothing, while saying nothing a reader wants: the version moved, once.
+///
+/// Only exact `<kept>-<suffix>` matches are dropped, so genuinely distinct versions are
+/// always preserved — `2.4.2, 2.4.3` and `1.1.1w, 3.6.1, 3.6.2` survive intact.
+fn collapse_variants(versions: &[String]) -> Vec<String> {
+    versions
+        .iter()
+        .filter(|v| {
+            !versions
+                .iter()
+                .any(|other| other.len() < v.len() && v.starts_with(&format!("{other}-")))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Run diff-closures over two store paths (`.drv` paths for the no-download path), parse,
@@ -435,6 +458,52 @@ brave: 1.91.180.drv \u{2192} 1.92.144.drv\n";
         c.retain(PackageChange::is_meaningful);
         let names: Vec<&str> = c.iter().map(|x| x.name.as_str()).collect();
         assert_eq!(names, vec!["brave"]);
+    }
+
+    #[test]
+    fn collapses_build_variants_of_one_version() {
+        // Observed on a real system: zoom is packaged four ways, and rendering all of them
+        // produced a 148-character line that broke the row layout.
+        let c = PackageChange {
+            name: "zoom".into(),
+            old: vec![
+                "7.0.0.1666".into(),
+                "7.0.0.1666-bwrap".into(),
+                "7.0.0.1666-fhsenv-profile".into(),
+                "7.0.0.1666-init".into(),
+            ],
+            new: vec!["7.0.5.3034".into(), "7.0.5.3034-bwrap".into()],
+            kind: ChangeKind::Changed,
+            size_delta: None,
+            changelog: None,
+            runtime: true,
+        };
+        assert_eq!(c.render_line_versions(), "7.0.0.1666 -> 7.0.5.3034");
+    }
+
+    #[test]
+    fn keeps_genuinely_distinct_versions() {
+        // The collapse must not swallow real multi-version cases.
+        let c = PackageChange {
+            name: "zfs".into(),
+            old: vec!["2.4.2".into(), "2.4.3".into()],
+            new: vec!["2.4.3".into()],
+            kind: ChangeKind::Changed,
+            size_delta: None,
+            changelog: None,
+            runtime: true,
+        };
+        assert_eq!(c.render_line_versions(), "2.4.2, 2.4.3 -> 2.4.3");
+
+        // ...including versions that merely share a numeric prefix (openssl 1.1.1w).
+        assert_eq!(
+            collapse_variants(&[
+                "1.1.1w".to_string(),
+                "3.6.1".to_string(),
+                "3.6.2".to_string()
+            ]),
+            vec!["1.1.1w", "3.6.1", "3.6.2"]
+        );
     }
 
     #[test]
