@@ -479,6 +479,10 @@ async fn apply_flow(
         .await;
     }
 
+    // Sampled before the switch so a failure afterwards can tell "nothing happened" from
+    // "the new system is already live but a later step failed".
+    let system_before = nun_core::apply::current_system();
+
     match cmd.status().await {
         Ok(status) if status.success() => {
             let reboot = nun_core::apply::current_vs_booted_differs().await;
@@ -500,18 +504,47 @@ async fn apply_flow(
             }
         }
         Ok(status) => {
-            // Covers a failed rebuild and a cancelled/denied polkit prompt alike: put the
-            // previous lock back so a failed apply leaves the repo exactly as it was.
             tracing::error!("apply failed: pkexec exited with {status}");
-            nun_core::apply::restore_lock(&cfg.flake_path, &backup).await;
-            if cfg.notify {
-                let _ = notify::notify(
-                    "NixOS update failed",
-                    "nixos-rebuild did not complete (or was not authorized). The previous \
-                     flake.lock was restored.",
-                    &cfg.icons.error,
-                )
-                .await;
+
+            // A non-zero exit does NOT mean nothing happened. `switch-to-configuration`
+            // updates /run/current-system partway through activation, so the new system can
+            // already be live when a later step fails — an activation snippet that needs
+            // the network, say, run just after the switch restarted NetworkManager.
+            //
+            // Restoring the lock then would be actively harmful: the repo would describe
+            // the OLD system while the NEW one is running, and the user's next rebuild
+            // would silently revert them. Only roll back if nothing was activated.
+            let activated = system_before.is_some()
+                && nun_core::apply::current_system() != system_before;
+
+            if activated {
+                tracing::warn!(
+                    "rebuild reported failure but the new system is already active; \
+                     keeping the new flake.lock so the repo matches the running system"
+                );
+                if cfg.notify {
+                    let _ = notify::notify(
+                        "NixOS update partly applied",
+                        "The new system is active, but part of the switch failed. The new \
+                         flake.lock was kept so your repo matches. Check the apply log, fix \
+                         the cause, and re-run the update.",
+                        &cfg.icons.error,
+                    )
+                    .await;
+                }
+            } else {
+                // Covers a failed build and a cancelled/denied polkit prompt alike: put the
+                // previous lock back so the repo is left exactly as it was.
+                nun_core::apply::restore_lock(&cfg.flake_path, &backup).await;
+                if cfg.notify {
+                    let _ = notify::notify(
+                        "NixOS update failed",
+                        "nixos-rebuild did not complete (or was not authorized). The previous \
+                         flake.lock was restored.",
+                        &cfg.icons.error,
+                    )
+                    .await;
+                }
             }
             set_status(shared, handle, Status::Error).await;
         }

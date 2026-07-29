@@ -25,6 +25,17 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 
+/// The generation `/run/current-system` currently points at, canonicalised.
+///
+/// Sampled either side of a rebuild to answer a question the exit status cannot: did the
+/// new configuration actually go live? `switch-to-configuration` updates this link partway
+/// through activation, so a rebuild can fail *after* the new system is running — a late
+/// activation snippet erroring out, for instance. Rolling the lock back in that case would
+/// leave the repo describing a system that is no longer the one booted.
+pub fn current_system() -> Option<PathBuf> {
+    std::fs::canonicalize("/run/current-system").ok()
+}
+
 /// Whether a reboot is warranted after a switch, judged by comparing the booted system
 /// to the newly-activated current system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
