@@ -23,7 +23,6 @@ use crate::pkgs;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
-use tokio::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct CheckOutcome {
@@ -118,9 +117,15 @@ async fn cleanup_stale_workdirs(base: &Path) {
     }
 }
 
-/// Copy the flake repo into a fresh working directory, excluding `.git` (nix treats the
-/// copy as a plain path flake and uses the working tree directly).
-async fn refresh_working_copy(src: &Path) -> Result<PathBuf> {
+/// Build a scratch flake containing ONLY `flake.nix` and `flake.lock`, for advancing
+/// inputs.
+///
+/// This used to copy the entire repo — hundreds of MB for a real config, rewritten on
+/// every check. It isn't needed: `nix flake update` only reads the flake's `inputs`
+/// section, so two files are enough, and the resulting lock can then be applied to the
+/// real repo at evaluation time via `--reference-lock-file`. That keeps the user's repo
+/// untouched while costing a few KB instead of a whole second checkout.
+async fn scratch_flake(src: &Path) -> Result<PathBuf> {
     let dst = workdir()?;
     if let Some(parent) = dst.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
@@ -129,24 +134,16 @@ async fn refresh_working_copy(src: &Path) -> Result<PathBuf> {
     if dst.exists() {
         tokio::fs::remove_dir_all(&dst)
             .await
-            .with_context(|| format!("clearing stale working copy {}", dst.display()))?;
+            .with_context(|| format!("clearing stale scratch dir {}", dst.display()))?;
     }
-
-    // `cp -a` preserves symlinks/perms; we then drop `.git` to avoid dirty-tree noise and
-    // to keep the copy a plain path flake.
-    let status = Command::new("cp")
-        .arg("-a")
-        .arg("--reflink=auto")
-        .arg(src)
-        .arg(&dst)
-        .status()
+    tokio::fs::create_dir_all(&dst)
         .await
-        .context("spawning cp to make working copy")?;
-    anyhow::ensure!(status.success(), "cp of flake repo failed");
+        .with_context(|| format!("creating scratch dir {}", dst.display()))?;
 
-    let git_dir = dst.join(".git");
-    if git_dir.exists() {
-        tokio::fs::remove_dir_all(&git_dir).await.ok();
+    for f in ["flake.nix", "flake.lock"] {
+        tokio::fs::copy(src.join(f), dst.join(f))
+            .await
+            .with_context(|| format!("copying {f} into the scratch flake"))?;
     }
     Ok(dst)
 }
@@ -202,20 +199,23 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         cfg.exclude_inputs
     );
 
-    let work = refresh_working_copy(&cfg.flake_path).await?;
-    let work_ref = work.display().to_string();
+    let repo_ref = cfg.flake_path.display().to_string();
+    let scratch = scratch_flake(&cfg.flake_path).await?;
 
-    // Baseline: current lock, from the copy.
-    let current_drv = nix::toplevel_drv_path(&work_ref, &cfg.host_attr)
+    // Baseline: the real repo, evaluated with its own lock. Both sides evaluate the same
+    // tree, so the comparison isolates the effect of advancing inputs even if the repo has
+    // uncommitted edits.
+    let current_drv = nix::toplevel_drv_path(&repo_ref, &cfg.host_attr, None)
         .await
         .context("evaluating current toplevel drvPath")?;
 
-    // Advance only the configured inputs. A failure here is per-input and non-fatal: we
-    // report which ones could not move and continue with the rest, so one broken input
-    // cannot hide pending updates from all the others.
-    let failed_inputs = nix::flake_update_inputs(&work, &inputs)
+    // Advance only the configured inputs, in the scratch flake — the user's repo is never
+    // written to. A failure here is per-input and non-fatal: we report which ones could not
+    // move and continue with the rest, so one broken input cannot hide pending updates
+    // from all the others.
+    let failed_inputs = nix::flake_update_inputs(&scratch, &inputs)
         .await
-        .context("running nix flake update in working copy")?;
+        .context("running nix flake update in the scratch flake")?;
     anyhow::ensure!(
         failed_inputs.len() < inputs.len(),
         "no inputs could be advanced: {}",
@@ -226,19 +226,17 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
             .join("; ")
     );
 
-    // Candidate: updated lock, from the same copy.
-    let candidate_drv = nix::toplevel_drv_path(&work_ref, &cfg.host_attr)
+    // Candidate: the REAL repo again, but evaluated against the scratch flake's updated
+    // lock. Same tree, different inputs — which is exactly the question being asked.
+    let scratch_lock = scratch.join("flake.lock");
+    let candidate_drv = nix::toplevel_drv_path(&repo_ref, &cfg.host_attr, Some(&scratch_lock))
         .await
         .context("evaluating candidate toplevel drvPath")?;
 
-    // Keep the candidate lock — a few KB — and throw the working copy away. The copy is a
-    // whole second checkout of the user's flake repo (hundreds of MB for a real config),
-    // and the daemon is a long-lived service, so retaining it meant that much disk sitting
-    // there for as long as the tray icon was running. Nothing downstream needs the tree:
-    // the candidate derivation already lives in the store, and Apply only installs the lock.
-    let candidate_lock = save_candidate_lock(&work).await?;
-    if let Err(e) = tokio::fs::remove_dir_all(&work).await {
-        tracing::warn!("could not remove working copy {}: {e}", work.display());
+    // Keep the candidate lock (a few KB) and drop the scratch dir.
+    let candidate_lock = save_candidate_lock(&scratch).await?;
+    if let Err(e) = tokio::fs::remove_dir_all(&scratch).await {
+        tracing::warn!("could not remove scratch dir {}: {e}", scratch.display());
     }
 
     tracing::debug!(

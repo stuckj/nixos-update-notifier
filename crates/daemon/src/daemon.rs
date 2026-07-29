@@ -13,6 +13,7 @@ use nun_core::config::Config;
 use nun_core::diff::PackageChange;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, Mutex};
 
 /// Run the daemon until "Quit". `config_path` is retained so we can hot-reload settings
@@ -49,9 +50,17 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         .await
         .context("building D-Bus connection")?;
 
-    // Periodic check timer + SIGUSR1 (external "check now" trigger, e.g. a systemd timer).
-    let mut ticker = tokio::time::interval(cfg.interval());
+    // Scheduling is a wall-clock THRESHOLD, polled once a minute — not a monotonic
+    // interval. Tokio's timer is driven by a monotonic clock, which on Linux does not
+    // advance while the machine is suspended, so on a laptop a 24h interval silently
+    // becomes "24h of uptime": sleep 8h a night and checks drift a day later each cycle,
+    // eventually never landing while you are awake. Comparing wall-clock time against the
+    // last check means a suspended machine simply finds the threshold already passed and
+    // checks shortly after it wakes.
+    const POLL: Duration = Duration::from_secs(60);
+    let mut ticker = tokio::time::interval(POLL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_check: Option<SystemTime> = None;
     let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
         .context("installing SIGUSR1 handler")?;
 
@@ -68,7 +77,18 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
 
     loop {
         let cmd = tokio::select! {
-            _ = ticker.tick() => Command::CheckNow,
+            _ = ticker.tick() => {
+                // Due only when enough WALL-CLOCK time has passed since the last check.
+                let due = last_check.map_or(true, |t| {
+                    // A clock that went backwards yields Err; treat that as "due" rather
+                    // than never checking again.
+                    t.elapsed().map(|e| e >= cfg.interval()).unwrap_or(true)
+                });
+                if !due {
+                    continue;
+                }
+                Command::CheckNow
+            }
             _ = sigusr1.recv() => Command::CheckNow,
             // A finished check is handled here rather than as a Command, so it can never
             // block command processing.
@@ -107,6 +127,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 }
 
                 checking = true;
+                last_check = Some(SystemTime::now());
                 let cfg_for_check = cfg.clone();
                 let done_tx = done_tx.clone();
                 tokio::spawn(async move {

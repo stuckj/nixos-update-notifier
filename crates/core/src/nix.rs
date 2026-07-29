@@ -178,11 +178,21 @@ pub async fn closure_names(path: &str) -> ClosureNames {
 /// Evaluating `drvPath` *instantiates* the derivation (writes the `.drv` to the store)
 /// but does NOT realise it — no outputs are built or substituted, so nothing is
 /// downloaded. This is the offline signal we compare to decide "updates available".
-pub async fn toplevel_drv_path(flake_ref: &str, host_attr: &str) -> Result<String> {
+/// With `reference_lock`, the flake is evaluated against THAT lock file instead of its own.
+/// That is what lets the candidate be evaluated straight from the user's real repo — no
+/// copy of the tree required — while the repo itself stays untouched.
+pub async fn toplevel_drv_path(
+    flake_ref: &str,
+    host_attr: &str,
+    reference_lock: Option<&Path>,
+) -> Result<String> {
     let attr =
         format!("{flake_ref}#nixosConfigurations.{host_attr}.config.system.build.toplevel.drvPath");
     let mut c = nix_base();
     c.args(["eval", "--raw", &attr]);
+    if let Some(lock) = reference_lock {
+        c.arg("--reference-lock-file").arg(lock);
+    }
     let out = run_capture(&mut c).await?;
     let path = out.trim().to_string();
     if path.is_empty() {
