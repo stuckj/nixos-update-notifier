@@ -158,14 +158,19 @@ pub async fn rebuild_privileged(
     let flake_target = format!("{}#{}", repo.display(), host);
     println!("running: nixos-rebuild switch --flake {flake_target}");
 
+    // Lead its own process group, so cancelling can take down the whole build tree.
+    // `nixos-rebuild` is a thin wrapper: the actual work happens in the `nix build` it
+    // spawns. Signalling only the wrapper leaves that child orphaned and still downloading.
     let mut child = Command::new("nixos-rebuild")
         .arg("switch")
         .arg("--flake")
         .arg(&flake_target)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        .process_group(0)
         .spawn()
         .context("spawning nixos-rebuild")?;
+    let pgid = child.id().context("nixos-rebuild has no pid")? as i32;
 
     // Cancellation has to be cooperative. pkexec fully becomes root, so the unprivileged
     // daemon cannot signal this process; instead it drops a flag file and we stop our own
@@ -190,8 +195,7 @@ pub async fn rebuild_privileged(
                 // untouched, but worth saying out loud rather than pretending otherwise.
                 let during_activation = activation_started();
                 println!("cancel requested; stopping nixos-rebuild");
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                terminate_group(pgid, &mut child).await;
                 if during_activation {
                     anyhow::bail!(
                         "apply cancelled DURING activation. Some services may be stopped \
@@ -216,6 +220,42 @@ pub async fn rebuild_privileged(
 ///
 /// The system profile is repointed as part of activation, so a profile that no longer
 /// matches the running system means activation has at least begun.
+/// Stop a cancelled rebuild and everything it spawned.
+///
+/// `nixos-rebuild` is a wrapper around `nix build`, so signalling only the direct child
+/// leaves the build orphaned — still downloading, still writing to the log, still holding
+/// the store lock — long after the UI has said "cancelled". Signalling the whole process
+/// group is what actually stops the work.
+///
+/// SIGTERM first, deliberately: nix handles it, releasing its store lock and removing the
+/// partial `.tmp-*` build directories it created. Going straight to SIGKILL would leave
+/// that debris behind for the user to clean up. SIGKILL is only the fallback for a build
+/// that ignores SIGTERM, so a cancel can never hang.
+async fn terminate_group(pgid: i32, child: &mut tokio::process::Child) {
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    // SAFETY: killpg(2) on a group we created via process_group(0). A negative or zero
+    // pgid would broadcast far more widely, so refuse anything that is not a real group.
+    if pgid > 1 {
+        unsafe { libc::killpg(pgid, libc::SIGTERM) };
+    } else {
+        let _ = child.start_kill();
+    }
+
+    if tokio::time::timeout(GRACE, child.wait()).await.is_ok() {
+        return;
+    }
+
+    tracing::warn!("rebuild did not exit within {GRACE:?} of SIGTERM; sending SIGKILL");
+    println!("build did not stop within 10s; forcing it down");
+    if pgid > 1 {
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    } else {
+        let _ = child.start_kill();
+    }
+    let _ = child.wait().await;
+}
+
 fn activation_started() -> bool {
     std::fs::read_link("/nix/var/nix/profiles/system")
         .ok()
@@ -244,4 +284,67 @@ pub async fn current_vs_booted_differs() -> bool {
     let current = signature_of(Path::new("/run/current-system")).await;
     let booted = signature_of(Path::new("/run/booted-system")).await;
     current != booted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cancelled rebuild must take its whole build tree down with it.
+    ///
+    /// This is a regression test for a bug that was invisible in manual testing: cancel
+    /// killed `nixos-rebuild` in ~350ms and the UI said "cancelled", but the `nix build`
+    /// it had spawned was merely orphaned and kept downloading for another 32 seconds.
+    ///
+    /// `sh` here stands in for `nixos-rebuild` and the `sleep` for the `nix build` it
+    /// wraps: kill only the parent and the sleep survives. Needs nothing but a shell.
+    #[tokio::test]
+    async fn cancelling_kills_the_whole_process_group() {
+        // Parent exits immediately after reporting the grandchild's pid, so a test that
+        // only reaped the direct child would pass while the grandchild lived on.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300 & echo $!; wait")
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawning sh");
+
+        let pgid = child.id().expect("pid") as i32;
+
+        let mut out = String::new();
+        {
+            use tokio::io::AsyncReadExt;
+            let mut stdout = child.stdout.take().expect("piped stdout");
+            // Read just the pid line; the pipe stays open until the group dies.
+            let mut buf = [0u8; 32];
+            let n = stdout.read(&mut buf).await.expect("reading grandchild pid");
+            out.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        let grandchild: i32 = out.trim().parse().expect("grandchild pid");
+
+        // Precondition: signal 0 tests existence without delivering anything.
+        assert_eq!(
+            unsafe { libc::kill(grandchild, 0) },
+            0,
+            "grandchild should be running before cancel"
+        );
+
+        terminate_group(pgid, &mut child).await;
+
+        // The grandchild is not our child, so it is never reaped by us and cannot be
+        // mistaken for a zombie that still answers to signal 0.
+        let mut gone = false;
+        for _ in 0..50 {
+            if unsafe { libc::kill(grandchild, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            gone,
+            "grandchild {grandchild} survived cancellation — the build would keep running"
+        );
+    }
 }

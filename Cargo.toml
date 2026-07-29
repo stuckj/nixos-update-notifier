@@ -21,6 +21,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 directories = "5"
+# Only for killpg(2) when cancelling a rebuild: killing nixos-rebuild alone orphans the
+# `nix build` it spawned, which keeps downloading. Already in the tree via tokio.
+libc = "0.2"
 
 [profile.release]
 lto = "thin"

@@ -21,6 +21,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 directories = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 # For the `#[tokio::test]` integration tests (tests/integration.rs).
