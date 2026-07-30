@@ -1,0 +1,839 @@
+//! GTK4 windows for "View updates…" and "Settings".
+//!
+//! This is a separate binary (`nixos-update-notifier-gtk`). The updates window is a live
+//! client of the daemon over D-Bus; the settings window edits the TOML config directly.
+//! GTK owns its own main thread here, entirely decoupled from the daemon's tokio loop.
+
+use crate::client::Client;
+use anyhow::{Context, Result};
+use gtk::prelude::*;
+use gtk::{glib, Align, Application, ApplicationWindow, Orientation};
+use nun_core::config::Config;
+use nun_core::diff::{ChangeKind, PackageChange};
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::Duration;
+
+const APP_ID_UPDATES: &str = "org.nixos.UpdateNotifier.Updates";
+const APP_ID_SETTINGS: &str = "org.nixos.UpdateNotifier.Settings";
+
+/// Show the update list, live from the daemon over D-Bus. Blocks until the window closes.
+///
+/// Single-instance: the tray spawns a fresh process on every click, so without this a
+/// second click stacks another identical window on top of the first. Registering under a
+/// unique application id makes GTK hand the activation to the already-running instance,
+/// which presents its existing window and the new process exits.
+pub fn run_updates_window() -> Result<()> {
+    let app = Application::builder()
+        .application_id(APP_ID_UPDATES)
+        .build();
+
+    app.connect_activate(|app| {
+        if let Some(existing) = app.active_window() {
+            existing.present();
+            return;
+        }
+        build_updates_window(app);
+    });
+    // Don't let GTK parse our process args (clap already did).
+    app.run_with_args::<&str>(&[]);
+    Ok(())
+}
+
+fn build_updates_window(app: &Application) {
+    // Connect to the daemon; `None` means it isn't running (handled gracefully below).
+    let client: Option<Rc<Client>> = Client::connect().ok().map(Rc::new);
+
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("boxed-list");
+
+    let header = gtk::Label::new(None);
+    header.set_halign(Align::Start);
+    header.set_margin_start(8);
+    header.set_margin_top(8);
+    header.set_margin_bottom(4);
+
+    // What the list currently displays. The periodic poll compares against this and
+    // returns early when nothing has changed — rebuilding the rows resets the scroll
+    // position, which made a long update list impossible to read: scroll down, and a
+    // few seconds later you are back at the top.
+    type Rendered = (
+        String,
+        Vec<PackageChange>,
+        Vec<(String, String)>,
+        Option<u64>,
+    );
+    let rendered: Rc<RefCell<Option<Rendered>>> = Rc::new(RefCell::new(None));
+
+    // Rebuild the list from the daemon's current state. Cloneable so we can hand it to
+    // several button handlers and a periodic poll.
+    let refresh = {
+        let list = list.clone();
+        let header = header.clone();
+        let client = client.clone();
+        let rendered = rendered.clone();
+        move || {
+            // Cheap poll: fetch first, and only touch the widgets if something moved.
+            if let Some(c) = &client {
+                let now: Rendered = (
+                    c.status().map(|(s, _)| s).unwrap_or_default(),
+                    c.updates().unwrap_or_default(),
+                    c.warnings().unwrap_or_default(),
+                    c.last_check(),
+                );
+                if rendered.borrow().as_ref() == Some(&now) {
+                    return;
+                }
+                *rendered.borrow_mut() = Some(now);
+            }
+
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            match &client {
+                None => {
+                    header.set_text("Daemon not running");
+                    let row = gtk::Label::new(Some(
+                        "Start the nixos-update-notifier service, then Refresh.",
+                    ));
+                    row.set_margin_top(16);
+                    row.set_margin_bottom(16);
+                    list.append(&row);
+                }
+                Some(c) => match c.updates() {
+                    Ok(changes) => {
+                        let status = c.status().map(|(s, _)| s).unwrap_or_default();
+
+                        // Surface skipped inputs prominently: "no updates" (or any count)
+                        // means something different if an input could not be advanced at
+                        // all, and the user is the only one who can fix a moved local fork.
+                        for (name, reason) in c.warnings().unwrap_or_default() {
+                            let w = gtk::Label::new(None);
+                            w.set_markup(&format!(
+                                "<b>⚠ input '{}' was skipped</b>\n<small>{}</small>",
+                                glib::markup_escape_text(&name),
+                                glib::markup_escape_text(&reason)
+                            ));
+                            w.set_wrap(true);
+                            w.set_xalign(0.0);
+                            w.set_margin_start(8);
+                            w.set_margin_end(8);
+                            w.set_margin_top(8);
+                            w.set_margin_bottom(8);
+                            w.add_css_class("warning");
+                            list.append(&w);
+                        }
+
+                        // An empty list is ambiguous on its own, so let the daemon's status
+                        // disambiguate. Advancing an input can change the system derivation
+                        // without changing any package version (a flake rev bump with no
+                        // rebuilt packages) — there IS something to apply, and saying "no
+                        // pending updates" here would flatly contradict the tray icon.
+                        let (heading, empty_note) = match (status.as_str(), changes.is_empty()) {
+                            ("system-changes", _) => (
+                                "Configuration changes — no package updates".to_string(),
+                                Some(
+                                    "Your flake inputs moved, but no package changed version.\n\
+                                     This is usually a module regenerating its configuration.\n\
+                                     Applying is safe but not urgent.",
+                                ),
+                            ),
+                            ("updates", true) => (
+                                "System update available — no package version changes".to_string(),
+                                Some(
+                                    "Input revisions advanced, but no package versions changed.\n\
+                                     Applying will rebuild the system with the new inputs.",
+                                ),
+                            ),
+                            ("checking", true) => (
+                                "Checking for updates…".to_string(),
+                                Some("The daemon is evaluating your flake."),
+                            ),
+                            ("error", true) => (
+                                "Last check failed".to_string(),
+                                Some("See the daemon log; press Check now to retry."),
+                            ),
+                            // "Up to date" is a claim about a check that happened. Before the
+                            // first one completes there is nothing to base it on, and the
+                            // window is reachable from the tray at any time — including
+                            // seconds after login.
+                            (_, true) if c.last_check().is_none() => (
+                                "No check has run yet".to_string(),
+                                Some(
+                                    "Nothing has been checked since the daemon started.\n\
+                                     Press Check now to look for updates.",
+                                ),
+                            ),
+                            (_, true) => (
+                                "System is up to date".to_string(),
+                                Some("No pending updates."),
+                            ),
+                            (_, false) => {
+                                let build_only = changes.iter().filter(|c| !c.runtime).count();
+                                let installed = changes.len() - build_only;
+                                let h = if build_only > 0 {
+                                    format!(
+                                        "{installed} update(s) to installed software \
+                                         · {build_only} build-time only"
+                                    )
+                                } else {
+                                    format!("{} package change(s)", changes.len())
+                                };
+                                (h, None)
+                            }
+                        };
+                        header.set_text(&heading);
+
+                        if let Some(note) = empty_note {
+                            let row = gtk::Label::new(Some(note));
+                            row.set_margin_top(16);
+                            row.set_margin_bottom(16);
+                            row.set_justify(gtk::Justification::Center);
+                            list.append(&row);
+                        }
+                        // Updates to installed software first — that is what the user came
+                        // to read; build-time churn is context, not the headline.
+                        let mut ordered: Vec<&PackageChange> = changes.iter().collect();
+                        ordered.sort_by_key(|c| (!c.runtime, c.name.clone()));
+                        for change in ordered {
+                            list.append(&update_row(change));
+                        }
+
+                        // Dates what is on screen. Without it, "System is up to date" gives
+                        // no way to tell a check from a minute ago from one that last ran
+                        // before the machine was suspended for a week.
+                        if let Some(secs) = c.last_check() {
+                            let foot = gtk::Label::new(Some(&format!(
+                                "Last checked {}",
+                                relative_time(secs)
+                            )));
+                            foot.set_xalign(0.0);
+                            foot.set_margin_start(8);
+                            foot.set_margin_top(12);
+                            foot.set_margin_bottom(6);
+                            foot.add_css_class("dim-label");
+                            list.append(&foot);
+                        }
+                    }
+                    Err(e) => {
+                        header.set_text("Could not read updates from the daemon");
+                        let row = gtk::Label::new(Some(&e.to_string()));
+                        list.append(&row);
+                    }
+                },
+            }
+        }
+    };
+    refresh();
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&list)
+        .build();
+
+    // Buttons: Check now (trigger a daemon check), Apply, Refresh.
+    let check_btn = gtk::Button::with_label("Check now");
+    {
+        let client = client.clone();
+        let refresh = refresh.clone();
+        check_btn.connect_clicked(move |_| {
+            if let Some(c) = &client {
+                let _ = c.check_now();
+            }
+            // Give the daemon a moment to finish, then repaint.
+            glib::timeout_add_local_once(Duration::from_millis(1500), refresh.clone());
+        });
+    }
+
+    let apply_btn = gtk::Button::with_label("Apply updates");
+    apply_btn.add_css_class("suggested-action");
+    {
+        let client = client.clone();
+        apply_btn.connect_clicked(move |_| {
+            if let Some(c) = &client {
+                let _ = c.apply();
+            }
+        });
+    }
+
+    let refresh_btn = gtk::Button::with_label("Refresh");
+    {
+        let refresh = refresh.clone();
+        refresh_btn.connect_clicked(move |_| refresh());
+    }
+
+    // Keep the window in sync with daemon state via a light poll.
+    {
+        let refresh = refresh.clone();
+        glib::timeout_add_local(Duration::from_secs(3), move || {
+            refresh();
+            glib::ControlFlow::Continue
+        });
+    }
+
+    let buttons = gtk::Box::new(Orientation::Horizontal, 8);
+    buttons.set_margin_start(8);
+    buttons.set_margin_end(8);
+    buttons.set_margin_top(4);
+    buttons.set_margin_bottom(8);
+    buttons.append(&check_btn);
+    buttons.append(&apply_btn);
+    let spacer = gtk::Box::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    buttons.append(&spacer);
+    buttons.append(&refresh_btn);
+
+    let vbox = gtk::Box::new(Orientation::Vertical, 0);
+    vbox.append(&header);
+    vbox.append(&scroller);
+    vbox.append(&buttons);
+
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("NixOS — Pending updates")
+        .default_width(600)
+        .default_height(540)
+        .child(&vbox)
+        .build();
+    window.present();
+}
+
+/// Render an epoch timestamp as a coarse "how long ago", e.g. "3 hours ago".
+///
+/// Coarse on purpose: the point is to tell a check from minutes ago apart from one that
+/// last ran before a week of suspend, not to report seconds. A clock that went backwards
+/// (NTP correction, timezone-less epoch skew) says "just now" rather than a negative age.
+fn relative_time(epoch_secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age = now.saturating_sub(epoch_secs);
+    match age {
+        0..=59 => "just now".to_string(),
+        60..=3599 => {
+            let m = age / 60;
+            format!("{m} minute{} ago", if m == 1 { "" } else { "s" })
+        }
+        3600..=86_399 => {
+            let h = age / 3600;
+            format!("{h} hour{} ago", if h == 1 { "" } else { "s" })
+        }
+        _ => {
+            let d = age / 86_400;
+            format!("{d} day{} ago", if d == 1 { "" } else { "s" })
+        }
+    }
+}
+
+fn update_row(change: &PackageChange) -> gtk::Box {
+    let row = gtk::Box::new(Orientation::Horizontal, 8);
+    row.set_margin_start(8);
+    row.set_margin_end(8);
+    row.set_margin_top(4);
+    row.set_margin_bottom(4);
+
+    let (glyph, css) = match change.kind {
+        ChangeKind::Added => ("＋", "success"),
+        ChangeKind::Removed => ("－", "error"),
+        ChangeKind::Changed => ("↑", "accent"),
+    };
+    let kind_label = gtk::Label::new(Some(glyph));
+    kind_label.add_css_class(css);
+    kind_label.set_width_chars(2);
+
+    // Build-time-only entries are dimmed and labelled: they are dependencies used to build
+    // something on the system, not software that gets installed, and showing them exactly
+    // like real upgrades makes it look like e.g. Go is about to appear on your machine.
+    let name = gtk::Label::new(None);
+    if change.runtime {
+        name.set_markup(&format!(
+            "<b>{}</b>",
+            glib::markup_escape_text(&change.name)
+        ));
+    } else {
+        name.set_markup(&format!(
+            "{} <small>· build-time only</small>",
+            glib::markup_escape_text(&change.name)
+        ));
+        name.add_css_class("dim-label");
+        row.set_tooltip_text(Some(
+            "Used to build part of your system; not installed on it.",
+        ));
+    }
+    name.set_halign(Align::Start);
+    name.set_hexpand(true);
+    name.set_xalign(0.0);
+
+    // A package with many distinct versions must not be able to squeeze the name column to
+    // nothing (zoom managed a 148-character line), so long values are truncated — but a
+    // truncated value you cannot read is its own problem. Clicking the row expands it, the
+    // way the Ubuntu updater does.
+    let full_versions = change.render_line_versions();
+    let versions = gtk::Label::new(Some(&full_versions));
+    versions.set_halign(Align::End);
+    versions.add_css_class("dim-label");
+    versions.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    versions.set_max_width_chars(48);
+
+    // Only advertise the interaction when there is actually something hidden.
+    let is_truncated = full_versions.chars().count() > 48;
+    if is_truncated {
+        row.set_tooltip_text(Some("Click to show all versions"));
+
+        let click = gtk::GestureClick::new();
+        {
+            let versions = versions.clone();
+            let full = full_versions.clone();
+            click.connect_released(move |_, _, _, _| {
+                let expanded = versions.ellipsize() == gtk::pango::EllipsizeMode::None;
+                if expanded {
+                    versions.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+                    versions.set_wrap(false);
+                    versions.set_tooltip_text(Some("Click to show all versions"));
+                } else {
+                    versions.set_ellipsize(gtk::pango::EllipsizeMode::None);
+                    versions.set_wrap(true);
+                    versions.set_tooltip_text(Some(&full));
+                }
+            });
+        }
+        row.add_controller(click);
+    }
+
+    row.append(&kind_label);
+    row.append(&name);
+    row.append(&versions);
+
+    if let Some(url) = &change.changelog {
+        let link = gtk::LinkButton::builder()
+            .uri(url)
+            .label("changelog")
+            .build();
+        row.append(&link);
+    }
+
+    row
+}
+
+/// Show the settings editor. Blocks until closed.
+///
+/// Single-instance for the same reason as the updates window — and more importantly here,
+/// since two editors open on the same file would let the second overwrite the first's save.
+pub fn run_settings_window(config_path: PathBuf) -> Result<()> {
+    let app = Application::builder()
+        .application_id(APP_ID_SETTINGS)
+        .build();
+
+    app.connect_activate(move |app| {
+        if let Some(existing) = app.active_window() {
+            existing.present();
+            return;
+        }
+        build_settings_window(app, &config_path);
+    });
+    app.run_with_args::<&str>(&[]);
+    Ok(())
+}
+
+fn build_settings_window(app: &Application, config_path: &std::path::Path) {
+    // Best-effort load; fall back to a blank template if the file doesn't parse yet.
+    let cfg = Config::load(config_path).ok();
+
+    let grid = gtk::Grid::builder()
+        .row_spacing(8)
+        .column_spacing(12)
+        .margin_top(16)
+        .margin_bottom(16)
+        .margin_start(16)
+        .margin_end(16)
+        .build();
+
+    let entries = SettingsEntries::new(cfg.as_ref());
+    for (r, (label, widget)) in entries.rows().into_iter().enumerate() {
+        let r = r as i32;
+        let l = gtk::Label::new(Some(label));
+        l.set_halign(Align::End);
+        grid.attach(&l, 0, r, 1, 1);
+        grid.attach(&widget, 1, r, 1, 1);
+    }
+
+    let status = gtk::Label::new(None);
+    status.set_halign(Align::Start);
+
+    let save = gtk::Button::with_label("Save");
+    save.add_css_class("suggested-action");
+
+    {
+        let entries = entries.clone();
+        let config_path = config_path.to_path_buf();
+        let status = status.clone();
+        save.connect_clicked(move |_| {
+            match entries.to_config().and_then(|c| {
+                let text = toml::to_string_pretty(&c).context("serializing config")?;
+                if let Some(parent) = config_path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                std::fs::write(&config_path, text)
+                    .with_context(|| format!("writing {}", config_path.display()))?;
+                Ok::<_, anyhow::Error>(())
+            }) {
+                Ok(()) => status.set_markup(
+                    "<span foreground='green'>Saved. Changes apply on the next check \
+                 (restart the service to change the interval).</span>",
+                ),
+                Err(e) => status.set_markup(&format!(
+                    "<span foreground='red'>{}</span>",
+                    glib::markup_escape_text(&e.to_string())
+                )),
+            }
+        });
+    }
+
+    let buttons = gtk::Box::new(Orientation::Horizontal, 8);
+    buttons.set_halign(Align::End);
+    // Match the form's own 16px margins; without these the button sits flush against the
+    // window edge while everything above it is inset.
+    buttons.set_margin_end(16);
+    buttons.set_margin_bottom(16);
+    buttons.append(&save);
+
+    let vbox = gtk::Box::new(Orientation::Vertical, 12);
+    vbox.append(&grid);
+    vbox.append(&status);
+    vbox.append(&buttons);
+    vbox.set_margin_start(4);
+    vbox.set_margin_end(4);
+
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("NixOS Update Notifier — Settings")
+        .default_width(520)
+        .child(&vbox)
+        .build();
+    window.present();
+}
+
+/// Editable widgets backing the settings form.
+#[derive(Clone)]
+struct SettingsEntries {
+    flake_path: gtk::Entry,
+    host_attr: gtk::Entry,
+    update_inputs: gtk::Entry,
+    exclude_inputs: gtk::Entry,
+    interval_secs: gtk::Entry,
+    notify: gtk::Switch,
+    nixpkgs_ref: gtk::Entry,
+    // Fields the form doesn't expose but must not clobber on Save.
+    preserved_icons: nun_core::config::Icons,
+}
+
+impl SettingsEntries {
+    fn new(cfg: Option<&Config>) -> Self {
+        let entry = |val: String| {
+            let e = gtk::Entry::new();
+            e.set_text(&val);
+            e.set_hexpand(true);
+            e
+        };
+        Self {
+            flake_path: entry(
+                cfg.map(|c| c.flake_path.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            host_attr: entry(cfg.map(|c| c.host_attr.clone()).unwrap_or_default()),
+            update_inputs: entry(cfg.map(|c| c.update_inputs.join(", ")).unwrap_or_default()),
+            exclude_inputs: entry(cfg.map(|c| c.exclude_inputs.join(", ")).unwrap_or_default()),
+            interval_secs: entry(
+                cfg.map(|c| c.interval_secs.to_string())
+                    .unwrap_or_else(|| "21600".into()),
+            ),
+            notify: {
+                let s = gtk::Switch::new();
+                s.set_active(cfg.map(|c| c.notify).unwrap_or(true));
+                s.set_halign(Align::Start);
+                s
+            },
+            nixpkgs_ref: entry(
+                cfg.and_then(|c| c.nixpkgs_ref_for_changelogs.clone())
+                    .unwrap_or_default(),
+            ),
+            preserved_icons: cfg.map(|c| c.icons.clone()).unwrap_or_default(),
+        }
+    }
+
+    fn rows(&self) -> Vec<(&'static str, gtk::Widget)> {
+        vec![
+            ("Flake path", self.flake_path.clone().upcast()),
+            ("Host attribute", self.host_attr.clone().upcast()),
+            (
+                "Update inputs (comma-sep)",
+                self.update_inputs.clone().upcast(),
+            ),
+            (
+                "Exclude inputs (comma-sep)",
+                self.exclude_inputs.clone().upcast(),
+            ),
+            ("Interval (seconds)", self.interval_secs.clone().upcast()),
+            ("Notifications", self.notify.clone().upcast()),
+            (
+                "nixpkgs ref for changelogs",
+                self.nixpkgs_ref.clone().upcast(),
+            ),
+        ]
+    }
+
+    fn to_config(&self) -> Result<Config> {
+        let split = |e: &gtk::Entry| -> Vec<String> {
+            e.text()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let nixpkgs = self.nixpkgs_ref.text().trim().to_string();
+        Ok(Config {
+            flake_path: PathBuf::from(self.flake_path.text().trim()),
+            host_attr: self.host_attr.text().trim().to_string(),
+            update_inputs: split(&self.update_inputs),
+            exclude_inputs: split(&self.exclude_inputs),
+            interval_secs: self
+                .interval_secs
+                .text()
+                .trim()
+                .parse()
+                .context("interval must be a whole number of seconds")?,
+            notify: self.notify.is_active(),
+            nixpkgs_ref_for_changelogs: if nixpkgs.is_empty() {
+                None
+            } else {
+                Some(nixpkgs)
+            },
+            icons: self.preserved_icons.clone(),
+        })
+    }
+}
+
+const APP_ID_PROGRESS: &str = "org.nixos.UpdateNotifier.Progress";
+
+/// Live view of a running apply: a one-line status, an expandable details pane tailing the
+/// rebuild's output, and a Cancel button.
+///
+/// Before this, a privileged rebuild ran for many minutes with no indication of what was
+/// happening and no way to stop it — the output went to the daemon's journal, so when an
+/// apply failed the reason was a single line the user never saw. (The first real failure
+/// was `curl: (22) … error 525` from a vendor download server, buried at line 6881.)
+pub fn run_progress_window() -> Result<()> {
+    let app = Application::builder()
+        .application_id(APP_ID_PROGRESS)
+        .build();
+
+    app.connect_activate(|app| {
+        if let Some(existing) = app.active_window() {
+            existing.present();
+            return;
+        }
+        build_progress_window(app);
+    });
+    app.run_with_args::<&str>(&[]);
+    Ok(())
+}
+
+fn build_progress_window(app: &Application) {
+    let client: Option<Rc<Client>> = Client::connect().ok().map(Rc::new);
+
+    let heading = gtk::Label::new(Some("Applying updates…"));
+    heading.set_halign(Align::Start);
+    heading.set_margin_start(12);
+    heading.set_margin_top(12);
+    heading.add_css_class("title-4");
+
+    let subtitle = gtk::Label::new(Some("Running nixos-rebuild switch."));
+    subtitle.set_halign(Align::Start);
+    subtitle.set_margin_start(12);
+    subtitle.set_margin_bottom(4);
+    subtitle.add_css_class("dim-label");
+
+    // Indeterminate: nixos-rebuild gives no machine-readable overall progress, and inventing
+    // a percentage would be a lie. It pulses only while the apply is actually running.
+    let bar = gtk::ProgressBar::new();
+    bar.set_margin_start(12);
+    bar.set_margin_end(12);
+
+    // The rebuild's output, collapsed by default — the same shape as the Ubuntu updater's
+    // details pane.
+    let buffer = gtk::TextBuffer::new(None);
+    let view = gtk::TextView::with_buffer(&buffer);
+    view.set_editable(false);
+    view.set_cursor_visible(false);
+    view.set_monospace(true);
+    view.set_wrap_mode(gtk::WrapMode::WordChar);
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .min_content_height(260)
+        .child(&view)
+        .build();
+
+    let expander = gtk::Expander::new(Some("Details"));
+    expander.set_margin_start(12);
+    expander.set_margin_end(12);
+    expander.set_child(Some(&scroller));
+    expander.set_vexpand(true);
+
+    let cancel = gtk::Button::with_label("Cancel");
+    let close = gtk::Button::with_label("Close");
+    let buttons = gtk::Box::new(Orientation::Horizontal, 8);
+    buttons.set_halign(Align::End);
+    buttons.set_margin_end(12);
+    buttons.set_margin_bottom(12);
+    buttons.set_margin_top(4);
+    buttons.append(&cancel);
+    buttons.append(&close);
+
+    {
+        let client = client.clone();
+        let cancel_btn = cancel.clone();
+        let subtitle = subtitle.clone();
+        cancel.connect_clicked(move |_| {
+            if let Some(c) = &client {
+                let _ = c.cancel_apply();
+            }
+            // Cancellation is cooperative and may be declined during activation, so say
+            // "requested" rather than claiming it stopped.
+            cancel_btn.set_sensitive(false);
+            subtitle.set_text(
+                "Cancellation requested. Building stops promptly; if activation has already \
+                 started it will finish, since stopping midway can leave services mixed.",
+            );
+        });
+    }
+
+    let vbox = gtk::Box::new(Orientation::Vertical, 6);
+    vbox.append(&heading);
+    vbox.append(&subtitle);
+    vbox.append(&bar);
+    vbox.append(&expander);
+    vbox.append(&buttons);
+
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("NixOS — Applying updates")
+        .default_width(720)
+        .default_height(200)
+        .child(&vbox)
+        .build();
+
+    {
+        let window = window.clone();
+        close.connect_clicked(move |_| window.close());
+    }
+
+    // Tail the log and follow the daemon's status. Reading from a byte offset means the
+    // window can be opened, closed and reopened during a long apply without replaying or
+    // losing output.
+    let log_path = client.as_ref().and_then(|c| c.apply_log().ok());
+    let offset = Rc::new(RefCell::new(0u64));
+
+    {
+        let client = client.clone();
+        let buffer = buffer.clone();
+        let scroller = scroller.clone();
+        let heading = heading.clone();
+        let subtitle = subtitle.clone();
+        let bar = bar.clone();
+        let cancel = cancel.clone();
+        let offset = offset.clone();
+
+        glib::timeout_add_local(Duration::from_millis(700), move || {
+            if let Some(path) = &log_path {
+                if let Some(new_text) = read_new(path, &mut offset.borrow_mut()) {
+                    if !new_text.is_empty() {
+                        buffer.insert(&mut buffer.end_iter(), &new_text);
+                        // Follow the tail, as a terminal would.
+                        let adj = scroller.vadjustment();
+                        adj.set_value(adj.upper() - adj.page_size());
+                    }
+                }
+            }
+
+            let applying = client
+                .as_ref()
+                .and_then(|c| c.status().ok())
+                .map(|(s, _)| s == "applying")
+                .unwrap_or(false);
+
+            if applying {
+                bar.pulse();
+            } else {
+                bar.set_fraction(1.0);
+                heading.set_text("Apply finished");
+                subtitle.set_text("Expand Details for the full output.");
+                cancel.set_sensitive(false);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    window.present();
+}
+
+/// Read whatever has been appended to `path` since `offset`, advancing it.
+///
+/// A truncated file (a new apply reusing the same path) resets the offset rather than
+/// producing garbage.
+fn read_new(path: &std::path::Path, offset: &mut u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len < *offset {
+        *offset = 0;
+    }
+    if len == *offset {
+        return Some(String::new());
+    }
+    f.seek(SeekFrom::Start(*offset)).ok()?;
+    let mut buf = Vec::with_capacity((len - *offset) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    *offset = len;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_time;
+
+    fn ago(secs: u64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        relative_time(now - secs)
+    }
+
+    #[test]
+    fn ages_are_described_in_the_largest_sensible_unit() {
+        assert_eq!(ago(5), "just now");
+        assert_eq!(ago(60), "1 minute ago");
+        assert_eq!(ago(3 * 60), "3 minutes ago");
+        assert_eq!(ago(3600), "1 hour ago");
+        assert_eq!(ago(5 * 3600), "5 hours ago");
+        assert_eq!(ago(86_400), "1 day ago");
+        assert_eq!(ago(9 * 86_400), "9 days ago");
+    }
+
+    /// A timestamp in the future (clock stepped backwards by NTP) must not underflow into
+    /// a nonsensical age — saturating_sub keeps it at "just now".
+    #[test]
+    fn a_future_timestamp_reads_as_just_now() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(relative_time(now + 10_000), "just now");
+    }
+}

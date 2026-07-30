@@ -1,0 +1,28 @@
+[package]
+name = "nun-core"
+description = "Core logic for nixos-update-notifier: config, nix orchestration, offline diff, apply"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "nun_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Pure Rust only — NO GTK, NO ksni. This is what CI can test on bare Ubuntu with no
+# system libraries. `nix`/`nixos-rebuild`/`pkexec` are invoked at runtime, not linked.
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+directories = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+# For the `#[tokio::test]` integration tests (tests/integration.rs).
+tokio = { workspace = true }

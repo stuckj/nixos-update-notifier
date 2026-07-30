@@ -1,0 +1,23 @@
+// Example polkit rule (JavaScript) allowing a specific user to run the notifier's
+// privileged apply via pkexec WITHOUT re-authenticating each time.
+//
+// This is OPTIONAL and OFF by default. `pkexec` already works out of the box using the
+// standard `org.freedesktop.policykit.exec` action (the user gets an admin auth prompt).
+// Install this only if you want passwordless apply for a trusted local user.
+//
+// The NixOS module (services.nixos-update-notifier, option `polkit.passwordlessUsers`)
+// generates the authoritative version of this file with the exact store path baked in.
+// The rule below is illustrative; it anchors on the notifier's own binary at the END of a
+// `bin/` path (the daemon re-execs its makeBinaryWrapper-wrapped `.…-wrapped` sibling), so
+// an unrelated executable whose path merely *contains* the name is not authorized.
+
+polkit.addRule(function (action, subject) {
+  var program = action.lookup("program") || "";
+  if (
+    action.id === "org.freedesktop.policykit.exec" &&
+    /\/bin\/\.?nixos-update-notifier(-wrapped)?$/.test(program) &&
+    subject.user === "youruser"
+  ) {
+    return polkit.Result.YES;
+  }
+});
