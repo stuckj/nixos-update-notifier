@@ -97,6 +97,17 @@ jobs:
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
+          # This job pushes the version bump to the released branch. With a ruleset
+          # requiring pull requests on that branch, the default GITHUB_TOKEN cannot: it
+          # authenticates as github-actions[bot], and role-based bypasses (Maintain, Write)
+          # match USERS holding those roles — a bot account holds none, so it is refused
+          # with GH013 no matter which roles are on the bypass list. GitHub does not offer
+          # github-actions[bot] itself as a bypass actor on personal repositories.
+          #
+          # RELEASE_PAT is a token belonging to a human with a bypassing role, so the push
+          # is evaluated as that person. Falls back to github.token, which is fine on a
+          # repo whose branch is unprotected.
+          token: ${{ secrets.RELEASE_PAT || github.token }}
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Write version onto the released ref
@@ -129,7 +140,21 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -m "Release ${TAG} [skip ci]"
-          git push origin "HEAD:${BRANCH}"
+          if ! git push origin "HEAD:${BRANCH}"; then
+            # Overwhelmingly the cause is a branch ruleset refusing the bot. Say so, rather
+            # than leaving a bare GH013 to be decoded again.
+            #
+            # Accumulated rather than written as one long literal: a workflow annotation is
+            # single-line (::error:: takes no newlines), and backslash continuations inside
+            # an indented `run:` block would fold the YAML indentation into the message.
+            msg="Could not push the version bump to ${BRANCH}."
+            msg="${msg} If a repository rule refused it (GH013), set the RELEASE_PAT secret"
+            msg="${msg} to a token owned by a user whose role is on the ruleset's bypass"
+            msg="${msg} list. The default GITHUB_TOKEN authenticates as github-actions[bot],"
+            msg="${msg} which no role-based bypass matches."
+            echo "::error::${msg}"
+            exit 1
+          fi
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
