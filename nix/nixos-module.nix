@@ -1,7 +1,6 @@
 # NixOS module. Optional — the primary install path is the home-manager module (the tray
 # is a per-user thing). This module is a thin wrapper that can install the package
 # system-wide and, optionally, grant a trusted user passwordless "apply" via polkit.
-self:
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.nixos-update-notifier;
@@ -13,8 +12,13 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-      defaultText = lib.literalExpression "nixos-update-notifier.packages.\${system}.default";
+      # Built from YOUR nixpkgs, not this flake's. Defaulting to
+      # `self.packages.<system>.default` would drag our nixpkgs pin into your closure as a
+      # second nixpkgs tree — duplicating glibc, GTK4 and everything under them — purely
+      # because we happen to track a different channel. callPackage keeps the build on your
+      # channel; the overlay is there if you would rather have `pkgs.nixos-update-notifier`.
+      default = pkgs.callPackage ./package.nix { };
+      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { }";
       description = "The nixos-update-notifier package to install.";
     };
 

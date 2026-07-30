@@ -71,6 +71,21 @@ module**, and a devShell.
 }
 ```
 
+The `follows` line is worth keeping. This flake tracks `nixos-unstable` for its own dev
+shell and CI; `follows` points its nixpkgs at yours so you don't evaluate a second nixpkgs
+tree — a duplicate glibc, GTK4 and everything beneath them — just to install one tool.
+
+Both modules already build the package from *your* `pkgs`, so the module path is unaffected
+either way; `follows` matters when you reference `packages.<system>.default` directly. Any
+channel works — the package is tested against stable `nixos-26.05` as well as unstable.
+
+If you'd rather have it as an ordinary package attribute, apply the overlay:
+
+```nix
+nixpkgs.overlays = [ inputs.nixos-update-notifier.overlays.default ];
+# then: pkgs.nixos-update-notifier
+```
+
 To run from a local clone instead:
 
 ```nix

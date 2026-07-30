@@ -1,6 +1,7 @@
-# Home-manager module. Import via the flake's `homeManagerModules.default`, which passes
-# `self` so the default package resolves to this flake's build.
-self:
+# Home-manager module. Import via the flake's `homeManagerModules.default`.
+#
+# A plain module taking no flake argument: the package is built from the importer's own
+# `pkgs`, so using this module never pulls our nixpkgs into your closure.
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.nixos-update-notifier;
@@ -37,8 +38,9 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-      defaultText = lib.literalExpression "nixos-update-notifier.packages.\${system}.default";
+      # Built from YOUR nixpkgs — see the note in nixos-module.nix.
+      default = pkgs.callPackage ./package.nix { };
+      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { }";
       description = "The nixos-update-notifier package to use.";
     };
 
