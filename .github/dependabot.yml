@@ -1,0 +1,48 @@
+# Dependabot configuration.
+#
+# Scope note: automatic PRs for *security alerts* do not come from this file — they are the
+# repository's "Dependabot security updates" setting, which is already enabled and works
+# without any config. What this file adds is scheduled *version* updates: routine bumps that
+# arrive before a CVE does, so a security PR lands on a dependency tree that is already close
+# to current instead of years behind it.
+#
+# Nix inputs are deliberately absent: Dependabot has no flake ecosystem. `flake.lock` is
+# advanced by this project's own update checker, which is the thing being built here.
+version: 2
+
+updates:
+  # Rust dependencies. One entry covers every crate: `crates/*` all take their versions from
+  # [workspace.dependencies] in the root Cargo.toml, so that is the only manifest to watch.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Batch the routine bumps into one PR. The lockfile is committed and every bump faces
+      # the same CI either way, so grouping costs no coverage and keeps the queue readable.
+      # Majors are left ungrouped on purpose — those are the ones worth reading one at a time.
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: deps
+
+  # The workflows' own actions. Easy to forget precisely because nothing in the code
+  # references them, and a stale action is how a release pipeline quietly rots.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: ci
