@@ -202,7 +202,7 @@ jobs:
       # release — so the tag exists only after the build succeeded and carries its version.
       # Canary → pre-release.
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ needs.sync-version.outputs.commit }}
