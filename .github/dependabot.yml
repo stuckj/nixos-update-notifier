@@ -6,6 +6,10 @@
 # arrive before a CVE does, so a security PR lands on a dependency tree that is already close
 # to current instead of years behind it.
 #
+# The groups below deliberately do not carry `applies-to: security-updates`, so a security
+# fix still arrives as its own PR. That one you want to read and merge on its own, not
+# bundled behind an unrelated major bump.
+#
 # Nix inputs are deliberately absent: Dependabot has no flake ecosystem. `flake.lock` is
 # advanced by this project's own update checker, which is the thing being built here.
 version: 2
@@ -19,15 +23,16 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      # Batch the routine bumps into one PR. The lockfile is committed and every bump faces
-      # the same CI either way, so grouping costs no coverage and keeps the queue readable.
-      # Majors are left ungrouped on purpose — those are the ones worth reading one at a time.
-      minor-and-patch:
+      # Everything in one PR, majors included. Splitting majors out sounded right and was
+      # not: the first run opened seven PRs, six of them majors, which is the queue this is
+      # meant to avoid. The lockfile is committed and every bump faces the same CI either
+      # way, so grouping costs no coverage.
+      #
+      # The trade is real, though: one grouped PR is harder to bisect than six small ones,
+      # and a single failing bump blocks the rest of the group until it is excluded here.
+      cargo:
         patterns:
           - "*"
-        update-types:
-          - minor
-          - patch
     commit-message:
       prefix: deps
 
@@ -41,8 +46,5 @@ updates:
       actions:
         patterns:
           - "*"
-        update-types:
-          - minor
-          - patch
     commit-message:
       prefix: ci

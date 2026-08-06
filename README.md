@@ -150,7 +150,7 @@ The home-manager module generates the config for you. Running standalone, copy
 | `exclude_inputs` | Inputs to **never** advance, e.g. a pinned kernel. |
 | `interval` | Seconds between checks (minimum 60). |
 | `notify` | Whether to show desktop notifications. |
-| `nixpkgs_ref_for_changelogs` | Which nixpkgs to resolve changelog links against. |
+| `nixpkgs_ref_for_changelogs` | Which nixpkgs to resolve changelog links against. Defaults to the one in the candidate lock — the revision the pending update would install — so links match the version offered and nothing is downloaded to read them. Override only for a flake that names its nixpkgs something else, and pin what you set. |
 | `[icons]` | Icon name per state — see the example file before changing. |
 
 Settings can also be edited from the tray's **Settings** window.

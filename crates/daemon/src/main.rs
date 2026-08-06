@@ -103,7 +103,9 @@ async fn run_check_cli(config_path: &std::path::Path, json: bool, exact: bool) -
 
     if exact && outcome.updates_available {
         let mut exact_changes = diff::diff_exact(&outcome.candidate_drv).await?;
-        changelog::enrich(&cfg, &mut exact_changes).await;
+        // Same candidate lock the check just produced, so the exact diff resolves
+        // changelogs against the nixpkgs this update would install.
+        changelog::enrich(&cfg, &outcome.candidate_lock, &mut exact_changes).await;
         outcome.changes = exact_changes;
     }
 

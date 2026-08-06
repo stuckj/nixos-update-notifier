@@ -28,9 +28,16 @@ interval = 21600
 notify = true
 
 # Which nixpkgs to resolve meta.changelog against when rendering the update list.
-# Any flake ref works: "nixpkgs", "github:NixOS/nixpkgs/nixos-24.11", or a path.
-# If omitted, the registry alias "nixpkgs" is used.
-# nixpkgs_ref_for_changelogs = "github:NixOS/nixpkgs/nixos-24.11"
+# If omitted, the `nixpkgs` recorded in the candidate lock is used: the revision the
+# pending update would actually install, already fetched by the check, so reading it
+# downloads nothing. Set this only if your flake names its nixpkgs something else.
+#
+# Pin whatever you set to a revision. A branch or channel ref ("nixpkgs",
+# "github:NixOS/nixpkgs/nixos-unstable") downloads on every check and describes whatever
+# that ref points at today rather than the version being offered; you will be warned.
+# The ref also has to be nixpkgs-shaped — attributes are read from legacyPackages.<system>,
+# for the system this machine evaluates as.
+# nixpkgs_ref_for_changelogs = "github:NixOS/nixpkgs/04607e1165ac22c5fde6dcc54c9e0b3c0487c555"
 
 # NOTE: there is deliberately no `rebuild_extra_args` option. Arbitrary arguments
 # forwarded into root's `nixos-rebuild` would let anything that can write this file change
