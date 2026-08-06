@@ -88,3 +88,29 @@ async fn diff_closures_parses_real_nix_output() {
     assert_eq!(foo.new, vec!["2.0"]);
     assert!(matches!(foo.kind, nun_core::diff::ChangeKind::Changed));
 }
+
+/// The inventory diff — the path production actually uses — against real `nix` output.
+///
+/// The unit tests feed it hand-written JSON, which cannot catch the one thing this module
+/// exists to survive: nix changing what it emits. This exercises the real wrapper shape and
+/// key style, the subprocess wiring, and above all a `__structuredAttrs` derivation, whose
+/// metadata nix moved out of the environment — the drift that made an upgraded package
+/// report as removed.
+#[tokio::test]
+#[ignore = "requires the `nix` CLI; run in CI with --ignored"]
+async fn pkgs_diff_reads_structured_attrs_from_real_nix() {
+    let dir = copy_to_temp(&fixture("hostflake"), "pkgs");
+    let old = eval_drv(&dir, "structuredOld");
+    let new = eval_drv(&dir, "structuredNew");
+    assert_ne!(old, new, "the two candidate drvs should differ");
+
+    let changes = nun_core::pkgs::diff(&old, &new).await.expect("pkgs::diff");
+
+    let bar = changes
+        .iter()
+        .find(|c| c.name == "bar")
+        .unwrap_or_else(|| panic!("expected a `bar` change, got: {changes:?}"));
+    assert_eq!(bar.old, vec!["1.0"]);
+    assert_eq!(bar.new, vec!["2.0"]);
+    assert_eq!(bar.kind, nun_core::diff::ChangeKind::Changed);
+}
