@@ -25,7 +25,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 # For the `#[tokio::test]` integration tests (tests/integration.rs). `io-util` is used only
-# by the cancellation test, which reads a pid from a child's stdout; without it declared
-# here, `cargo test -p nun-core` fails to compile and only the whole-workspace `cargo test`
-# works — by borrowing the feature from another member through feature unification.
+# by `apply::tests::cancelling_kills_the_whole_process_group`, which reads a pid from a
+# child's stdout; without it declared here, `cargo test -p nun-core` fails to compile and
+# only a multi-crate `cargo test` works — by borrowing the feature from another member
+# through feature unification.
 tokio = { workspace = true, features = ["io-util"] }
