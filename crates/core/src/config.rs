@@ -42,8 +42,15 @@ pub struct Config {
     pub notify: bool,
 
     /// Which nixpkgs to resolve `meta.changelog` attributes against when rendering the
-    /// update list. Accepts any flake ref, e.g. `nixpkgs`, `github:NixOS/nixpkgs/nixos-24.11`,
-    /// or a path. If unset, defaults to the flake's own `nixpkgs` input via `<flake>#`.
+    /// update list. If unset, the `nixpkgs` from the candidate lock is used — the revision
+    /// the pending update would install, already fetched, so nothing is downloaded to read
+    /// it. Set this only if the flake names its nixpkgs something other than `nixpkgs`.
+    ///
+    /// Pin it to a revision: an unpinned ref (the registry alias `nixpkgs`, or a branch)
+    /// downloads on every check and reports whatever it points at today rather than the
+    /// version being offered. It must also be nixpkgs-shaped — attributes are read from
+    /// `legacyPackages.<system>`, for the system this machine evaluates as, which is not
+    /// necessarily the system a cross-built or remote host attribute targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nixpkgs_ref_for_changelogs: Option<String>,
 

@@ -265,8 +265,8 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
 
     annotate_runtime(&mut changes).await;
 
-    // Best-effort changelog enrichment.
-    changelog::enrich(cfg, &mut changes).await;
+    // Best-effort changelog enrichment, against the nixpkgs the candidate would install.
+    changelog::enrich(cfg, &candidate_lock, &mut changes).await;
 
     Ok(CheckOutcome {
         updates_available: true,

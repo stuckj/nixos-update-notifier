@@ -91,7 +91,9 @@ builds**:
 4. **Candidate drv.** Evaluate the toplevel `.drvPath` again. Same path → no updates.
 5. **Diff, offline.** `nix store diff-closures <baseline.drv> <candidate.drv>` over the two
    **derivation** paths. Diffing derivation closures never downloads substitutes.
-6. **Changelogs.** Best-effort `meta.changelog` lookups against a configurable nixpkgs ref.
+6. **Changelogs.** Best-effort `meta.changelog` lookups, in a single evaluation, against the
+   nixpkgs the candidate lock pins — the revision the update would install, already fetched,
+   so this stays within "downloads nothing" and the links describe the version being offered.
 
 ### "Downloads nothing" — precisely
 
