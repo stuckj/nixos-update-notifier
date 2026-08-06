@@ -32,6 +32,10 @@ struct Drv {
     env: Env,
     #[serde(default)]
     outputs: HashMap<String, Output>,
+    /// A `__structuredAttrs = true` derivation keeps its attributes HERE, not in `env` —
+    /// see `Attrs`.
+    #[serde(rename = "structuredAttrs")]
+    structured_attrs: Option<Attrs>,
 }
 
 #[derive(Deserialize, Default)]
@@ -39,6 +43,42 @@ struct Env {
     pname: Option<String>,
     version: Option<String>,
     name: Option<String>,
+    /// The same structured attributes, as an embedded JSON *string*. This is how the
+    /// `.drv` itself stores them, and what `nix derivation show` emitted before it grew
+    /// the top-level `structuredAttrs` field.
+    #[serde(rename = "__json")]
+    json: Option<String>,
+}
+
+/// The attributes of a `__structuredAttrs = true` derivation.
+///
+/// Such a derivation gets its attributes through a JSON file instead of the environment,
+/// so its `env` holds nothing but the output paths — no `pname`, no `version`, not even
+/// `name`. Reading only `env` therefore makes the package *disappear from the inventory*,
+/// and a package that is structured on one side of a diff and not the other reads as a
+/// removal: nixpkgs flipping `bind` to structured attrs reported `bind 9.20.23 -> (removed)`
+/// on a machine where it was being upgraded to 9.20.26. Packages structured on both sides
+/// (firefox, gh) were invisible instead — their upgrades were silently never reported.
+///
+/// nixpkgs is migrating packages to structured attrs steadily, so this is not a corner
+/// case: 215 of ~6,800 packages in one real system closure, and climbing.
+#[derive(Deserialize, Default, Clone)]
+struct Attrs {
+    // Unlike `env` (always string -> string), these come from arbitrary nix values, so they
+    // are read loosely and coerced. A derivation with, say, a numeric `version` must not
+    // fail the parse for the whole closure.
+    pname: Option<serde_json::Value>,
+    version: Option<serde_json::Value>,
+}
+
+impl Attrs {
+    fn pname(&self) -> Option<&str> {
+        self.pname.as_ref()?.as_str()
+    }
+
+    fn version(&self) -> Option<&str> {
+        self.version.as_ref()?.as_str()
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -54,13 +94,30 @@ impl Drv {
         self.outputs.values().any(|o| o.hash.is_some())
     }
 
+    /// The structured attributes, from whichever shape this nix reports them in.
+    fn structured(&self) -> Option<Attrs> {
+        match &self.structured_attrs {
+            Some(a) => Some(a.clone()),
+            // Older nix leaves them as embedded JSON. Unparseable means "not a package we
+            // can name", which is already the outcome for a derivation with no metadata.
+            None => serde_json::from_str(self.env.json.as_deref()?).ok(),
+        }
+    }
+
     /// `(pname, version)` for a derivation that builds a package, else `None`.
     ///
-    /// Prefers the explicit `pname`/`version` attributes. Packages declared the older way,
-    /// with just `name = "curl-8.20.0"`, carry neither — and silently dropping them would
-    /// hide real upgrades (this is exactly what happened to the installed curl). For those
-    /// we split `name` on nixpkgs' own convention: the first `-` followed by a digit
-    /// separates package from version.
+    /// Prefers the explicit `pname`/`version` attributes, from `env` or — for a
+    /// `__structuredAttrs` derivation, whose `env` has neither — from `Attrs`. Packages
+    /// declared the older way, with just `name = "curl-8.20.0"`, carry none of them, and
+    /// silently dropping them would hide real upgrades (this is exactly what happened to
+    /// the installed curl). For those we split `name` on nixpkgs' own convention: the first
+    /// `-` followed by a digit separates package from version.
+    ///
+    /// That `name` split is deliberately NOT applied to structured attributes. There, a
+    /// bare `name` is the mark of a trivial builder rather than a package — 7,103 of them
+    /// in one system closure, including vendored rust crates (`regex-automata-0.4.13`) and
+    /// the system toplevel itself, all of which would split into plausible-looking
+    /// "packages" and bury the real changes.
     fn package(&self) -> Option<(String, String)> {
         if self.is_fetch() {
             return None;
@@ -68,6 +125,13 @@ impl Drv {
         if let (Some(p), Some(v)) = (&self.env.pname, &self.env.version) {
             if !p.is_empty() && !v.is_empty() {
                 return Some((p.clone(), v.clone()));
+            }
+        }
+        if let Some(attrs) = self.structured() {
+            if let (Some(p), Some(v)) = (attrs.pname(), attrs.version()) {
+                if !p.is_empty() && !v.is_empty() {
+                    return Some((p.to_string(), v.to_string()));
+                }
             }
         }
         split_name(self.env.name.as_deref()?)
@@ -337,6 +401,86 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(d.package(), Some(("curl".into(), "8.20.0".into())));
+    }
+
+    fn drv(raw: &str) -> Drv {
+        serde_json::from_str::<ShowOutput>(raw)
+            .unwrap()
+            .into_map()
+            .into_values()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn reads_structured_attrs_derivations() {
+        // bind, after nixpkgs flipped it to `__structuredAttrs = true`: its env holds only
+        // output paths. Reading env alone dropped it from the inventory entirely, which is
+        // what made an upgrade look like a removal.
+        let d = drv(r#"{"derivations":{"/nix/store/a.drv":{
+            "name":"bind-9.20.26",
+            "env":{"out":"/nix/store/x","lib":"/nix/store/y"},
+            "outputs":{"out":{"path":"/nix/store/x"},"lib":{"path":"/nix/store/y"}},
+            "structuredAttrs":{"pname":"bind","version":"9.20.26","doCheck":true}
+        }}}"#);
+        assert_eq!(d.package(), Some(("bind".into(), "9.20.26".into())));
+    }
+
+    #[test]
+    fn reads_structured_attrs_from_the_older_embedded_json() {
+        // Before nix lifted them into a top-level field, the same attributes arrived as a
+        // JSON string in `env.__json` — the shape the .drv itself stores.
+        let d = drv(r#"{"derivations":{"/nix/store/a.drv":{
+            "env":{"out":"/nix/store/x",
+                   "__json":"{\"pname\":\"bind\",\"version\":\"9.20.26\"}"},
+            "outputs":{"out":{"path":"/nix/store/x"}}
+        }}}"#);
+        assert_eq!(d.package(), Some(("bind".into(), "9.20.26".into())));
+    }
+
+    #[test]
+    fn a_package_turning_structured_is_an_upgrade_not_a_removal() {
+        // The reported bug, end to end: same package, same closure, only the derivation
+        // style changed between the two nixpkgs revisions.
+        let before = inv(&[("bind", &["9.20.23"])]);
+        let after = inv(&[("bind", &["9.20.26"])]);
+        let d = diff_inventories(&before, &after);
+        assert_eq!(d[0].kind, ChangeKind::Changed);
+    }
+
+    #[test]
+    fn structured_trivial_builders_are_not_packages() {
+        // A structured derivation with only a `name` is a builder, not a package. Splitting
+        // it would admit thousands of vendored crates and the system toplevel itself.
+        for raw in [
+            r#"{"derivations":{"/nix/store/a.drv":{
+                "name":"regex-automata-0.4.13",
+                "env":{"out":"/nix/store/x"},
+                "outputs":{"out":{"path":"/nix/store/x"}},
+                "structuredAttrs":{"name":"regex-automata-0.4.13"}
+            }}}"#,
+            r#"{"derivations":{"/nix/store/b.drv":{
+                "name":"nixos-system-host-26.05",
+                "env":{"out":"/nix/store/y"},
+                "outputs":{"out":{"path":"/nix/store/y"}},
+                "structuredAttrs":{"name":"nixos-system-host-26.05","system":"x86_64-linux"}
+            }}}"#,
+        ] {
+            assert_eq!(drv(raw).package(), None);
+        }
+    }
+
+    #[test]
+    fn odd_structured_values_do_not_break_the_parse() {
+        // `structuredAttrs` holds arbitrary nix values, unlike env's string -> string. A
+        // non-string version must yield "not a package", never a failed parse of the whole
+        // closure.
+        let d = drv(r#"{"derivations":{"/nix/store/a.drv":{
+            "env":{"out":"/nix/store/x"},
+            "outputs":{"out":{"path":"/nix/store/x"}},
+            "structuredAttrs":{"pname":"weird","version":[1,2,3]}
+        }}}"#);
+        assert_eq!(d.package(), None);
     }
 
     #[test]
