@@ -40,7 +40,7 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       is_canary: ${{ steps.resolve.outputs.is_canary }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -93,7 +93,7 @@ jobs:
     outputs:
       commit: ${{ steps.sync.outputs.commit }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
@@ -161,7 +161,7 @@ jobs:
     needs: [prepare, sync-version]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.sync-version.outputs.commit }}
       - uses: DeterminateSystems/nix-installer-action@main

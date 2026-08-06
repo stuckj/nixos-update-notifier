@@ -21,7 +21,7 @@ jobs:
     name: lint + unit tests (no system deps)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -41,7 +41,7 @@ jobs:
     name: nix flake check + build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@main
       - name: flake check
         run: nix flake check -L
@@ -56,7 +56,7 @@ jobs:
     name: fixture-flake integration (real nix)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@main
       - name: run ignored integration tests
         run: nix develop -c cargo test -p nun-core --test integration -- --ignored --test-threads=1
