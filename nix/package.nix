@@ -14,7 +14,7 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "nixos-update-notifier";
-  version = "0.9.1";
+  version = "0.9.2";
 
   # Cargo workspace: builds both the `nixos-update-notifier` (daemon+CLI) and
   # `nixos-update-notifier-gtk` (GUI client) binaries. Only the GTK crate links GTK.

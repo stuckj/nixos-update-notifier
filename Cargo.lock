@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "nixos-update-notifier"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "nixos-update-notifier-gtk"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "nun-core"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "directories",
