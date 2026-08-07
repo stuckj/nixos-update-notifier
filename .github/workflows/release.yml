@@ -40,7 +40,7 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       is_canary: ${{ steps.resolve.outputs.is_canary }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -93,7 +93,7 @@ jobs:
     outputs:
       commit: ${{ steps.sync.outputs.commit }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
@@ -161,7 +161,7 @@ jobs:
     needs: [prepare, sync-version]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.sync-version.outputs.commit }}
       - uses: DeterminateSystems/nix-installer-action@main
@@ -180,7 +180,7 @@ jobs:
           tar -C staging -czf "${NAME}.tar.gz" "${NAME}"
           sha256sum "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-artifacts
           path: |
@@ -191,7 +191,7 @@ jobs:
     needs: [prepare, sync-version, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-artifacts
           path: dist
@@ -202,7 +202,7 @@ jobs:
       # release — so the tag exists only after the build succeeded and carries its version.
       # Canary → pre-release.
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ needs.sync-version.outputs.commit }}
