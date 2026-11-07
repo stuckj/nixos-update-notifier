@@ -61,8 +61,19 @@ fn candidate_base() -> Result<PathBuf> {
 }
 
 /// The scratch flakes a process uses: `check` for update checks, `upgrade` for release
-/// upgrade previews. Both can run at once, so each has its own directory.
-const SCRATCH_KINDS: [&str; 2] = ["check", "upgrade"];
+/// upgrade previews. Both can run at once, so each has its own directory. `accepted` holds
+/// the lock of the check result on display (see [`accept_candidate_lock`]).
+const SCRATCH_KINDS: [&str; 3] = ["check", "upgrade", "accepted"];
+
+/// Copy a check's candidate lock to where Apply reads it from. Every check rewrites its own
+/// candidate file as soon as it has locked, including one whose result is later discarded,
+/// so applying straight from it could install an update set other than the one shown.
+pub fn accept_candidate_lock(candidate: &Path) -> Result<PathBuf> {
+    let dst = candidate_path("accepted", "flake.lock")?;
+    std::fs::copy(candidate, &dst)
+        .with_context(|| format!("keeping the candidate lock at {}", dst.display()))?;
+    Ok(dst)
+}
 
 /// Per-process working directory. Keying on the PID means overlapping checks in different
 /// processes (e.g. a manual `check` while the daemon is checking) never delete each other's

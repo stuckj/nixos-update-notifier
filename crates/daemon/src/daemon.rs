@@ -326,6 +326,9 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 // might want.
                 applying = true;
                 check_stale = checking;
+                // The apply stages files in the repo even if it later rolls them back, so a
+                // preview evaluating meanwhile may have seen them.
+                repo_gen += 1;
                 // Empty the log before the new id is visible, so a progress window that
                 // switches to the new apply never reads the previous one's output as its own.
                 if let Err(e) = std::fs::File::create(nun_core::apply::apply_log_path()) {
@@ -531,7 +534,13 @@ async fn handle_check_result(
 
             let mut s = shared.lock().await;
             s.changes = outcome.changes.clone();
-            s.candidate_lock = Some(outcome.candidate_lock.clone());
+            s.candidate_lock = match check::accept_candidate_lock(&outcome.candidate_lock) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!("{e:#}");
+                    None
+                }
+            };
             s.candidate_drv = Some(outcome.candidate_drv.clone());
             s.failed_inputs = outcome.failed_inputs.clone();
             s.running_differs = outcome.running_differs;
