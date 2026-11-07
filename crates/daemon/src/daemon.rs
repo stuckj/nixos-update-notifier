@@ -292,8 +292,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 let cfg_for_check = cfg.clone();
                 let done_tx = done_tx.clone();
                 tokio::spawn(async move {
-                    let outcome = check::run(&cfg_for_check).await;
-                    let release = release::detect(&cfg_for_check).await;
+                    let (outcome, release) =
+                        tokio::join!(check::run(&cfg_for_check), release::detect(&cfg_for_check));
                     let _ = done_tx.send((outcome, release));
                 });
             }

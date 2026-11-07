@@ -260,7 +260,6 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         .await
         .context("evaluating current toplevel drvPath")?;
     let running_differs = repo_differs_from_running(&current_drv).await;
-    let revert_matches_running = running_differs && backup_matches_running(cfg).await;
 
     // Advance only the configured inputs, in the scratch flake — the user's repo is never
     // written to. A failure here is per-input and non-fatal: we report which ones could not
@@ -300,6 +299,9 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
     );
 
     if current_drv == candidate_drv {
+        // Revert is offered only in this state (nothing newer, system not applied), so the
+        // extra evaluation is spent only here.
+        let revert_matches_running = running_differs && backup_matches_running(cfg).await;
         return Ok(CheckOutcome {
             updates_available: false,
             changes: Vec::new(),
@@ -332,7 +334,7 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         candidate_drv,
         failed_inputs,
         running_differs,
-        revert_matches_running,
+        revert_matches_running: false,
         base_lock,
     })
 }

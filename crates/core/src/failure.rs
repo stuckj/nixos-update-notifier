@@ -63,16 +63,37 @@ impl Failure {
 /// Nix often prints a bare `error:` header followed by indented trace lines and the real
 /// message as a later, indented `error: …`, so the bare header is skipped. `Error: …` is
 /// how our own privileged helper reports (a cancelled rebuild, say), after nix is done.
+///
+/// A failed build always ends with nix reporting that the system derivation's
+/// dependencies failed. That names the system, not the cause, so such lines are passed
+/// over while anything else is available.
 pub fn last_error_line(text: &str) -> Option<String> {
-    text.lines()
-        .filter_map(|l| {
+    let lines: Vec<&str> = text.lines().collect();
+    let errors: Vec<(usize, &str)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
             let l = l.trim_start();
             l.strip_prefix("error:")
                 .or_else(|| l.strip_prefix("Error:"))
+                .map(|e| (i, e.trim()))
         })
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .map(str::to_string)
+        .filter(|(_, e)| !e.is_empty())
+        .collect();
+    let propagation = |i: usize, e: &str| {
+        e.contains("dependencies of derivation")
+            || (e.starts_with("Cannot build")
+                && lines[i + 1..]
+                    .iter()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty())
+                    .is_some_and(|l| l.starts_with("Reason:") && l.contains("dependenc")))
+    };
+    errors
+        .iter()
+        .rfind(|(i, e)| !propagation(*i, e))
+        .or(errors.last())
+        .map(|(_, e)| e.to_string())
 }
 
 /// The first quoted name on the line containing `marker`. Older nixpkgs quotes with `‘…’`,
@@ -208,6 +229,25 @@ error:
 
         let refused = "error: flake 'path:/r' requires lock file changes but they're not allowed due to '--no-update-lock-file'";
         assert!(hint_for(refused).unwrap().contains("nix flake lock"));
+    }
+
+    #[test]
+    fn a_failed_build_is_summarised_by_its_cause_not_the_system() {
+        let old = "error: unable to download 'https://vendor.example/x.tar.gz': HTTP error 525\n\
+                   error: 1 dependencies of derivation '/nix/store/a-nixos-system-x1.drv' failed to build";
+        assert_eq!(
+            last_error_line(old).unwrap(),
+            "unable to download 'https://vendor.example/x.tar.gz': HTTP error 525"
+        );
+        let new = "error: Cannot build '/nix/store/b-foo.drv'.\n       Reason: builder failed with exit code 2.\n\
+                   error: Cannot build '/nix/store/a-nixos-system-x1.drv'.\n       Reason: 1 dependency failed.";
+        assert_eq!(
+            last_error_line(new).unwrap(),
+            "Cannot build '/nix/store/b-foo.drv'."
+        );
+        // Nothing else to go on: the propagation line is better than nothing.
+        let only = "error: 1 dependencies of derivation '/nix/store/a.drv' failed to build";
+        assert!(last_error_line(only).unwrap().contains("dependencies"));
     }
 
     #[test]
