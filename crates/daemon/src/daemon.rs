@@ -88,11 +88,16 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         // Already running — typically the service, with the app also launched from the
         // menu. Behave like "open the notifier" rather than an error.
         Err(zbus::Error::NameTaken) => {
-            tracing::info!("another instance is running; asking it to show its window");
-            // Exit cleanly either way: a failure here would have systemd restart the
-            // service over and over while the other instance holds the name.
-            if let Err(e) = show_running_instance().await {
-                tracing::warn!("{e:#}");
+            // Exit cleanly either way: a failure would have systemd restart the service
+            // over and over while the other instance holds the name. Only a launch by the
+            // user (not the service manager) asks for the window.
+            if std::env::var_os("INVOCATION_ID").is_some() {
+                tracing::info!("another instance is running; exiting");
+            } else {
+                tracing::info!("another instance is running; asking it to show its window");
+                if let Err(e) = show_running_instance().await {
+                    tracing::warn!("{e:#}");
+                }
             }
             return Ok(());
         }
@@ -195,6 +200,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                         s.candidate_base_lock = None;
                         s.candidate_drv = None;
                         s.release = None;
+                        s.running_differs = false;
+                        s.can_revert_lock = false;
                         repo_gen += 1;
                     }
                 }

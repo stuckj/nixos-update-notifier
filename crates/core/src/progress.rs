@@ -125,6 +125,12 @@ impl Progress {
                     let t = self.totals.entry(a.kind).or_default();
                     t.done += a.done;
                     t.failed += a.failed;
+                    // What it announced was only a forecast; its children's own counts
+                    // are what remain.
+                    for (kind, n) in a.expected_by_type {
+                        let t = self.totals.entry(kind).or_default();
+                        t.expected = t.expected.saturating_sub(n);
+                    }
                 }
                 None
             }
@@ -411,6 +417,27 @@ mod tests {
             ],
         );
         assert_eq!(p.counts(act::BUILD).expected, 6);
+    }
+
+    /// A substitution that falls back to building delivers less than it announced; once
+    /// it stops, the announcement must not keep the total short of complete.
+    #[test]
+    fn a_stopped_announcement_no_longer_counts() {
+        let mut p = Progress::default();
+        feed(
+            &mut p,
+            &[
+                r#"@nix {"action":"start","id":1,"level":0,"parent":0,"text":"","type":102,"fields":[]}"#,
+                r#"@nix {"action":"result","id":1,"type":106,"fields":[101,1000]}"#,
+                r#"@nix {"action":"start","id":2,"level":4,"parent":1,"text":"downloading","type":101,"fields":[]}"#,
+                r#"@nix {"action":"result","id":2,"type":105,"fields":[600,600,0,0]}"#,
+                r#"@nix {"action":"stop","id":2}"#,
+            ],
+        );
+        assert_eq!(p.counts(act::FILE_TRANSFER).expected, 1000);
+        p.feed_line(r#"@nix {"action":"stop","id":1}"#);
+        let dl = p.counts(act::FILE_TRANSFER);
+        assert_eq!((dl.done, dl.expected), (600, 600));
     }
 
     #[test]
