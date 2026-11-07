@@ -182,6 +182,22 @@ error:
         );
     }
 
+    /// The tail of a failed apply log: nix's error, then the helper's own exit report.
+    #[test]
+    fn a_failed_rebuild_is_summarised_by_nix_not_by_the_exit_status() {
+        let failed =
+            crate::apply::RebuildFailed(std::os::unix::process::ExitStatusExt::from_raw(256));
+        let log = format!(
+            "error: Refusing to evaluate package 'electron-42.11.18' in /x.nix:50 because it is marked as insecure\n{failed}\n"
+        );
+        let f = Failure::from_output("applying", &log);
+        assert!(
+            f.summary.starts_with("Refusing to evaluate"),
+            "{}",
+            f.summary
+        );
+    }
+
     #[test]
     fn recognises_unfree_and_broken() {
         let unfree = "error: Package 'slack-4.0' in /nix/store/z.nix:1 has an unfree license ('unfree'), refusing to evaluate.";

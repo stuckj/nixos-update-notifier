@@ -320,9 +320,12 @@ pub struct UpgradePreview {
     /// The rewritten `flake.nix` and its lock, kept outside the repo until applied.
     pub candidate_flake_nix: PathBuf,
     pub candidate_lock: PathBuf,
-    /// The `flake.nix` the preview was made from. The upgrade refuses to overwrite a
-    /// `flake.nix` that has changed since, which would discard the user's edits.
+    /// The `flake.nix` and `flake.lock` the preview was made from. The upgrade refuses to
+    /// install over either if it has changed since: the candidate lock carries every other
+    /// input at its preview-time revision, so installing it over a newer lock would move
+    /// those inputs back, and a newer `flake.nix` would lose the user's edits.
     pub base_flake_nix: String,
+    pub base_flake_lock: String,
 }
 
 /// Retarget the release inputs to `target` in a scratch flake, relock them, evaluate the
@@ -408,18 +411,25 @@ pub async fn preview(cfg: &Config, target: Version) -> Result<UpgradePreview> {
         candidate_flake_nix,
         candidate_lock,
         base_flake_nix: flake_nix,
+        base_flake_lock: lock_json,
     })
 }
 
-/// Fail if `flake.nix` in the repo is no longer the one a preview was made from.
-pub async fn ensure_flake_nix_unchanged(repo: &Path, base: &str) -> Result<()> {
-    let now = tokio::fs::read_to_string(repo.join("flake.nix"))
-        .await
-        .context("reading flake.nix")?;
-    anyhow::ensure!(
-        now == base,
-        "flake.nix has changed since the upgrade was previewed; preview it again"
-    );
+/// Fail if `flake.nix` or `flake.lock` in the repo is no longer what `preview` was made
+/// from.
+pub async fn ensure_repo_unchanged(repo: &Path, preview: &UpgradePreview) -> Result<()> {
+    for (file, base) in [
+        ("flake.nix", &preview.base_flake_nix),
+        ("flake.lock", &preview.base_flake_lock),
+    ] {
+        let now = tokio::fs::read_to_string(repo.join(file))
+            .await
+            .with_context(|| format!("reading {file}"))?;
+        anyhow::ensure!(
+            &now == base,
+            "{file} has changed since the upgrade was previewed; preview it again"
+        );
+    }
     Ok(())
 }
 
@@ -595,6 +605,36 @@ g\trefs/heads/nixos-24.11
         ];
         let e = retarget(FLAKE, &all, &all[..1], v("26.11")).unwrap_err();
         assert!(e.to_string().contains("nixpkgs-kernel"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_refuses_a_repo_changed_since_its_preview() {
+        let dir = std::env::temp_dir().join(format!("nun-upgrade-base-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("flake.nix"), "nix-0").unwrap();
+        std::fs::write(dir.join("flake.lock"), "lock-0").unwrap();
+        let p = UpgradePreview {
+            target: v("26.11"),
+            changes: vec![],
+            retargeted: vec![],
+            candidate_flake_nix: PathBuf::new(),
+            candidate_lock: PathBuf::new(),
+            base_flake_nix: "nix-0".into(),
+            base_flake_lock: "lock-0".into(),
+        };
+        ensure_repo_unchanged(&dir, &p).await.unwrap();
+
+        // An update applied after the preview: installing the preview's lock now would
+        // move every other input back to its preview-time revision.
+        std::fs::write(dir.join("flake.lock"), "lock-1").unwrap();
+        let e = ensure_repo_unchanged(&dir, &p).await.unwrap_err();
+        assert!(e.to_string().contains("flake.lock"), "{e}");
+
+        std::fs::write(dir.join("flake.lock"), "lock-0").unwrap();
+        std::fs::write(dir.join("flake.nix"), "nix-1").unwrap();
+        let e = ensure_repo_unchanged(&dir, &p).await.unwrap_err();
+        assert!(e.to_string().contains("flake.nix"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

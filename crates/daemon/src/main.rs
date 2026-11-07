@@ -86,13 +86,29 @@ fn main() -> Result<()> {
             repo,
             host,
             cancel_flag,
-        } => rt.block_on(async move {
-            let reboot = apply::rebuild_privileged(&repo, &host, cancel_flag.as_deref()).await?;
-            if reboot.0 {
-                println!("REBOOT_RECOMMENDED");
+        } => {
+            let result = rt.block_on(apply::rebuild_privileged(
+                &repo,
+                &host,
+                cancel_flag.as_deref(),
+            ));
+            match result {
+                Ok(reboot) => {
+                    if reboot.0 {
+                        println!("REBOOT_RECOMMENDED");
+                    }
+                    Ok(())
+                }
+                Err(e) => match e.downcast_ref::<apply::RebuildFailed>() {
+                    Some(failed) => {
+                        // Not `Error: …`: the failure summary reads that as the cause.
+                        eprintln!("{failed}");
+                        std::process::exit(1);
+                    }
+                    None => Err(e),
+                },
             }
-            Ok(())
-        }),
+        }
     }
 }
 

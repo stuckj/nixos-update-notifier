@@ -47,7 +47,6 @@ impl ApplyPlan {
 struct ApplyOutcome {
     state: ApplyState,
     failure: Option<Failure>,
-    upgraded: bool,
 }
 
 /// Run the daemon until "Quit". `config_path` is retained so we can hot-reload settings
@@ -175,7 +174,9 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     let mut s = shared.lock().await;
                     s.apply.state = outcome.state;
                     s.apply.failure = outcome.failure;
-                    if outcome.upgraded {
+                    // Anything but a rolled-back failure changed the repo's lock, which makes
+                    // a preview stale (and an upgrade has been done).
+                    if outcome.state != ApplyState::Failed {
                         s.upgrade = UpgradeInfo::default();
                         s.upgrade_plan = None;
                     }
@@ -353,6 +354,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 match nun_core::apply::install_candidate_lock(&cfg.flake_path, &backup).await {
                     Ok(_) => tracing::info!("reverted flake.lock to {}", backup.display()),
                     Err(e) => tracing::error!("could not revert flake.lock: {e:#}"),
+                }
+                // The lock moved: a check in flight describes the old one, and a preview
+                // was made from it.
+                check_stale = checking;
+                {
+                    let mut s = shared.lock().await;
+                    s.upgrade = UpgradeInfo::default();
+                    s.upgrade_plan = None;
                 }
                 let _ = tx.send(Command::CheckNow);
             }
@@ -723,7 +732,6 @@ async fn abort_apply(
     ApplyOutcome {
         state: ApplyState::Failed,
         failure: Some(failure),
-        upgraded: false,
     }
 }
 
@@ -752,7 +760,6 @@ async fn apply_flow(
         }
     };
 
-    let upgrade = matches!(plan, ApplyPlan::Upgrade(_));
     let (lock, nix_backup) = match &plan {
         ApplyPlan::Rebuild => {
             tracing::info!("rebuilding from the repo's current lock");
@@ -760,11 +767,7 @@ async fn apply_flow(
         }
         ApplyPlan::Update(lock) => (Some(lock.clone()), None),
         ApplyPlan::Upgrade(p) => {
-            // The preview was made from a particular flake.nix; installing its rewrite over
-            // a since-edited file would silently discard those edits.
-            if let Err(e) =
-                release::ensure_flake_nix_unchanged(&cfg.flake_path, &p.base_flake_nix).await
-            {
+            if let Err(e) = release::ensure_repo_unchanged(&cfg.flake_path, p).await {
                 let f = Failure::from_error(&e);
                 return abort_apply(
                     cfg,
@@ -834,9 +837,7 @@ async fn apply_flow(
         None
     };
 
-    let mut outcome = apply_rebuild(cfg, &exe, lock_backup, nix_backup, shared, handle).await;
-    outcome.upgraded = upgrade && outcome.state != ApplyState::Failed;
-    outcome
+    apply_rebuild(cfg, &exe, lock_backup, nix_backup, shared, handle).await
 }
 
 /// What the apply log says went wrong: its text (with nix's JSON events folded back into
@@ -953,7 +954,6 @@ async fn apply_rebuild(
             ApplyOutcome {
                 state: ApplyState::Succeeded,
                 failure: None,
-                upgraded: false,
             }
         }
         Ok(status) => {
@@ -1013,7 +1013,6 @@ async fn apply_rebuild(
             ApplyOutcome {
                 state,
                 failure: Some(failure),
-                upgraded: false,
             }
         }
         Err(e) => {
@@ -1032,7 +1031,6 @@ async fn apply_rebuild(
             ApplyOutcome {
                 state: ApplyState::Failed,
                 failure: Some(Failure::from_error(&e)),
-                upgraded: false,
             }
         }
     }

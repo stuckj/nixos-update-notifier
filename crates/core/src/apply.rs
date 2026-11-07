@@ -151,11 +151,21 @@ pub async fn install_candidate_lock(repo: &Path, candidate_lock: &Path) -> Resul
 
     prune_old_backups(repo, "flake.lock", KEEP_BACKUPS).await;
 
-    tokio::fs::copy(candidate_lock, &real_lock)
-        .await
-        .with_context(|| format!("installing candidate lock into {}", real_lock.display()))?;
-
+    install_over(repo, "flake.lock", candidate_lock, &backup).await?;
     Ok(backup)
+}
+
+/// Copy `candidate` over `repo/file`. A copy can fail after truncating the destination, so
+/// on failure the backup is put back before the error is returned: the caller reports
+/// that nothing was changed.
+async fn install_over(repo: &Path, file: &str, candidate: &Path, backup: &Path) -> Result<()> {
+    let real = repo.join(file);
+    if let Err(e) = tokio::fs::copy(candidate, &real).await {
+        restore(repo, file, backup).await;
+        return Err(e)
+            .with_context(|| format!("installing the new {file} into {}", real.display()));
+    }
+    Ok(())
 }
 
 /// Back up the repo's `flake.nix` and install a release upgrade's rewritten one over it,
@@ -168,9 +178,7 @@ pub async fn install_candidate_flake_nix(repo: &Path, candidate: &Path) -> Resul
         .with_context(|| format!("backing up {} -> {}", real.display(), backup.display()))?;
     tracing::info!("backed up flake.nix to {}", backup.display());
     prune_old_backups(repo, "flake.nix", KEEP_BACKUPS).await;
-    tokio::fs::copy(candidate, &real)
-        .await
-        .with_context(|| format!("installing the upgraded flake.nix into {}", real.display()))?;
+    install_over(repo, "flake.nix", candidate, &backup).await?;
     Ok(backup)
 }
 
@@ -196,6 +204,20 @@ async fn restore(repo: &Path, file: &str, backup: &Path) {
         ),
     }
 }
+
+/// `nixos-rebuild` itself failed. Its own output (nix's `error:` lines) already says why,
+/// so the privileged helper reports this without an `Error:` line of its own, which would
+/// otherwise be the last word in the log and stand in for nix's message.
+#[derive(Debug)]
+pub struct RebuildFailed(pub std::process::ExitStatus);
+
+impl std::fmt::Display for RebuildFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "nixos-rebuild switch failed with {}", self.0)
+    }
+}
+
+impl std::error::Error for RebuildFailed {}
 
 /// Privileged entry point (runs as root via pkexec): the ONE operation that requires root.
 ///
@@ -265,10 +287,9 @@ pub async fn rebuild_privileged(
         }
     };
 
-    anyhow::ensure!(
-        status.success(),
-        "nixos-rebuild switch failed with {status}"
-    );
+    if !status.success() {
+        return Err(RebuildFailed(status).into());
+    }
 
     Ok(RebootNeeded(current_vs_booted_differs().await))
 }
@@ -415,6 +436,34 @@ mod tests {
         assert!(
             generations_differ(&profile, &current),
             "a profile pointing at a newer generation means activation has begun"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A failed install must leave the file as it was. `/proc/self/mem` is a regular file
+    /// whose read fails (nothing is mapped at offset 0), so the copy opens and truncates the
+    /// destination and then fails: a write failing partway.
+    #[tokio::test]
+    async fn a_failed_install_leaves_the_file_as_it_was() {
+        let root = std::env::temp_dir().join(format!("nun-install-{}", std::process::id()));
+        let repo = root.join("repo");
+        let not_a_file = PathBuf::from("/proc/self/mem");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("flake.lock"), "original lock").unwrap();
+        std::fs::write(repo.join("flake.nix"), "original nix").unwrap();
+
+        assert!(install_candidate_lock(&repo, &not_a_file).await.is_err());
+        assert!(install_candidate_flake_nix(&repo, &not_a_file)
+            .await
+            .is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("flake.lock")).unwrap(),
+            "original lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("flake.nix")).unwrap(),
+            "original nix"
         );
         let _ = std::fs::remove_dir_all(root);
     }
