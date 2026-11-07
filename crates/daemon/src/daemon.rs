@@ -357,6 +357,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 if let Err(e) = std::fs::File::create(nun_core::apply::apply_log_path()) {
                     tracing::debug!("could not reset the apply log: {e}");
                 }
+                // A stale flag from an earlier run must not abort this one.
+                let _ = std::fs::remove_file(nun_core::apply::cancel_flag_path());
                 {
                     let mut s = shared.lock().await;
                     // Vouched for against the lock this apply is about to replace.
@@ -571,6 +573,7 @@ async fn handle_check_result(
             s.failed_inputs = outcome.failed_inputs.clone();
             s.running_differs = outcome.running_differs;
             s.check_failure = None;
+            s.notified_failure = None;
             if notified {
                 s.last_notified_drv = Some(outcome.candidate_drv.clone());
             }
@@ -595,6 +598,7 @@ async fn handle_check_result(
             s.failed_inputs = up_to_date.failed_inputs.clone();
             s.running_differs = up_to_date.running_differs;
             s.check_failure = None;
+            s.notified_failure = None;
         }
         Err(e) => {
             tracing::error!("update check failed: {e:#}");
@@ -651,6 +655,17 @@ async fn handle_release(release: Result<Option<ReleaseOffer>>, cfg: &Config, sha
     };
     let mut s = shared.lock().await;
     s.release = offer.clone();
+    // A finished preview for a release no longer on offer (upgraded by hand, say) would
+    // only lead to an upgrade that is refused.
+    let offered = |t: &str| {
+        offer
+            .as_ref()
+            .is_some_and(|o| o.choices.iter().any(|c| c.version == t))
+    };
+    if s.upgrade.state != UpgradeState::Previewing && !offered(&s.upgrade.target) {
+        s.upgrade = UpgradeInfo::default();
+        s.upgrade_plan = None;
+    }
     let Some(offer) = offer else { return };
     let newest = offer.newest().to_string();
     if s.persisted.notified_release.as_deref() == Some(newest.as_str())
@@ -932,9 +947,19 @@ async fn apply_flow(
 /// messages), as a [`Failure`].
 fn apply_log_failure() -> Failure {
     const TAIL_LINES: usize = 200;
-    let text = std::fs::read(nun_core::apply::apply_log_path())
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
+    // nix logs every builder output line as an event, so a source build leaves megabytes;
+    // the cause is at the end.
+    const TAIL_BYTES: u64 = 1 << 20;
+    let text = (|| -> std::io::Result<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(nun_core::apply::apply_log_path())?;
+        let len = f.metadata()?.len();
+        f.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    })()
+    .unwrap_or_default();
     let mut progress = nun_core::progress::Progress::default();
     let lines: Vec<String> = text.lines().filter_map(|l| progress.feed_line(l)).collect();
     let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
@@ -964,9 +989,9 @@ async fn apply_rebuild(
         }
     };
 
-    // A fresh cancel flag: any stale one from a previous run must not abort this apply.
+    // Cleared when the apply was started, so a cancel clicked while files were being staged
+    // still stops the rebuild.
     let cancel_flag = nun_core::apply::cancel_flag_path();
-    let _ = std::fs::remove_file(&cancel_flag);
 
     // Show the progress window straight away, before the polkit prompt, so the user can
     // see the operation and reach Cancel.

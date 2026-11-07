@@ -128,7 +128,9 @@ pub fn hint_for(text: &str) -> Option<String> {
             None => "A package is marked broken in this nixpkgs.".into(),
         });
     }
-    if text.contains("--no-update-lock-file") {
+    // nix's own refusal, not the flag: nixos-rebuild echoes its failed command line, flags
+    // included, after every failed build.
+    if text.contains("requires lock file changes but they're not allowed") {
         return Some(
             "flake.lock does not cover every input flake.nix declares; run `nix flake lock` \
              in the repo, then apply again."
@@ -193,6 +195,19 @@ error:
             last_error_line("error:\n  … x\n  error: the real one\n").as_deref(),
             Some("the real one")
         );
+    }
+
+    /// nixos-rebuild-ng ends a failed build with the command it ran, which carries the
+    /// rebuild's own flags; that must not read as the lock-file refusal.
+    #[test]
+    fn the_echoed_command_line_is_not_a_cause() {
+        let log = "error: hash mismatch in fixed-output derivation '/nix/store/x-src.drv':\n\
+                   Command 'nix --extra-experimental-features 'nix-command flakes' build --print-out-paths /r#nixosConfigurations.h.config.system.build.toplevel --no-update-lock-file --log-format internal-json' returned non-zero exit status 1.";
+        let hint = hint_for(log).unwrap();
+        assert!(hint.contains("fixed-output hash"), "{hint}");
+
+        let refused = "error: flake 'path:/r' requires lock file changes but they're not allowed due to '--no-update-lock-file'";
+        assert!(hint_for(refused).unwrap().contains("nix flake lock"));
     }
 
     #[test]
