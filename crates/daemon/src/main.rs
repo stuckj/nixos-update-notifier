@@ -11,6 +11,7 @@
 mod daemon;
 mod dbus;
 mod notify;
+mod persist;
 mod state;
 mod tray;
 

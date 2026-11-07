@@ -39,6 +39,8 @@ pub struct CheckOutcome {
     /// been moved away). The check still reports whatever the remaining inputs produced,
     /// rather than failing outright.
     pub failed_inputs: Vec<(String, String)>,
+    /// The repo, with its own lock, describes a different system from the one running.
+    pub running_differs: bool,
 }
 
 impl CheckOutcome {
@@ -56,38 +58,68 @@ fn candidate_base() -> Result<PathBuf> {
     Ok(dirs.cache_dir().join("candidate"))
 }
 
+/// The scratch flakes a process uses: `check` for update checks, `upgrade` for release
+/// upgrade previews. Both can run at once, so each has its own directory.
+const SCRATCH_KINDS: [&str; 2] = ["check", "upgrade"];
+
 /// Per-process working directory. Keying on the PID means overlapping checks in different
 /// processes (e.g. a manual `check` while the daemon is checking) never delete each other's
 /// working copy mid-flight. Checks within one process are serialized, so reuse is safe.
-fn workdir() -> Result<PathBuf> {
-    Ok(candidate_base()?.join(std::process::id().to_string()))
+/// Names start with the PID either way, which is what stale-directory cleanup keys on.
+fn workdir(kind: &str) -> Result<PathBuf> {
+    let pid = std::process::id();
+    Ok(candidate_base()?.join(match kind {
+        "check" => pid.to_string(),
+        _ => format!("{pid}.{kind}"),
+    }))
 }
 
-/// Where this process's candidate `flake.lock` is kept once the working copy is discarded.
-fn candidate_lock_path() -> Result<PathBuf> {
-    Ok(candidate_base()?.join(format!("{}.flake.lock", std::process::id())))
+/// Where this process's candidate `file` (`flake.lock`, `flake.nix`) is kept once the
+/// working copy is discarded.
+fn candidate_path(kind: &str, file: &str) -> Result<PathBuf> {
+    let pid = std::process::id();
+    Ok(candidate_base()?.join(match kind {
+        "check" => format!("{pid}.{file}"),
+        _ => format!("{pid}.{kind}.{file}"),
+    }))
 }
 
 /// Copy the candidate lock out of the working copy so the copy itself can be deleted.
 async fn save_candidate_lock(work: &Path) -> Result<PathBuf> {
-    let dst = candidate_lock_path()?;
+    save_file(work, "check", "flake.lock").await
+}
+
+/// Copy the candidate `flake.lock` and `flake.nix` out of the working copy.
+pub(crate) async fn save_candidate(work: &Path, kind: &str) -> Result<(PathBuf, PathBuf)> {
+    Ok((
+        save_file(work, kind, "flake.lock").await?,
+        save_file(work, kind, "flake.nix").await?,
+    ))
+}
+
+async fn save_file(work: &Path, kind: &str, file: &str) -> Result<PathBuf> {
+    let dst = candidate_path(kind, file)?;
     if let Some(parent) = dst.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    tokio::fs::copy(work.join("flake.lock"), &dst)
+    tokio::fs::copy(work.join(file), &dst)
         .await
-        .with_context(|| format!("saving candidate lock to {}", dst.display()))?;
+        .with_context(|| format!("saving candidate {file} to {}", dst.display()))?;
     Ok(dst)
 }
 
 /// Remove this process's leftovers. Called on daemon shutdown so a clean exit leaves
 /// nothing behind, rather than waiting for some later run to notice the PID is gone.
 pub async fn cleanup_own_artifacts() {
-    if let Ok(dir) = workdir() {
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-    if let Ok(lock) = candidate_lock_path() {
-        let _ = tokio::fs::remove_file(&lock).await;
+    for kind in SCRATCH_KINDS {
+        if let Ok(dir) = workdir(kind) {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        }
+        for file in ["flake.lock", "flake.nix"] {
+            if let Ok(p) = candidate_path(kind, file) {
+                let _ = tokio::fs::remove_file(&p).await;
+            }
+        }
     }
 }
 
@@ -125,8 +157,8 @@ async fn cleanup_stale_workdirs(base: &Path) {
 /// section, so two files are enough, and the resulting lock can then be applied to the
 /// real repo at evaluation time via `--reference-lock-file`. That keeps the user's repo
 /// untouched while costing a few KB instead of a whole second checkout.
-async fn scratch_flake(src: &Path) -> Result<PathBuf> {
-    let dst = workdir()?;
+pub(crate) async fn scratch_flake(src: &Path, kind: &str) -> Result<PathBuf> {
+    let dst = workdir(kind)?;
     if let Some(parent) = dst.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
         cleanup_stale_workdirs(parent).await;
@@ -157,7 +189,7 @@ async fn scratch_flake(src: &Path) -> Result<PathBuf> {
 ///
 /// (Supersession needs no special handling: comparing version *sets* per package makes
 /// `zfs-user 2.4.2, 2.4.3 -> 2.4.3` read correctly on its own.)
-async fn annotate_runtime(changes: &mut [PackageChange]) {
+pub(crate) async fn annotate_runtime(changes: &mut [PackageChange]) {
     let installed = nix::closure_names("/run/current-system").await;
     if installed.is_empty() {
         // Could not read the running system (unusual). Leave everything as-is rather than
@@ -200,14 +232,15 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
     );
 
     let repo_ref = cfg.flake_path.display().to_string();
-    let scratch = scratch_flake(&cfg.flake_path).await?;
+    let scratch = scratch_flake(&cfg.flake_path, "check").await?;
 
     // Baseline: the real repo, evaluated with its own lock. Both sides evaluate the same
     // tree, so the comparison isolates the effect of advancing inputs even if the repo has
     // uncommitted edits.
-    let current_drv = nix::toplevel_drv_path(&repo_ref, &cfg.host_attr, None)
+    let current_drv = nix::toplevel_drv_path(&repo_ref, &cfg.host_attr, None, &[])
         .await
         .context("evaluating current toplevel drvPath")?;
+    let running_differs = repo_differs_from_running(&current_drv).await;
 
     // Advance only the configured inputs, in the scratch flake — the user's repo is never
     // written to. A failure here is per-input and non-fatal: we report which ones could not
@@ -229,7 +262,7 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
     // Candidate: the REAL repo again, but evaluated against the scratch flake's updated
     // lock. Same tree, different inputs — which is exactly the question being asked.
     let scratch_lock = scratch.join("flake.lock");
-    let candidate_drv = nix::toplevel_drv_path(&repo_ref, &cfg.host_attr, Some(&scratch_lock))
+    let candidate_drv = nix::toplevel_drv_path(&repo_ref, &cfg.host_attr, Some(&scratch_lock), &[])
         .await
         .context("evaluating candidate toplevel drvPath")?;
 
@@ -254,6 +287,7 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
             advanced_inputs: inputs,
             candidate_drv,
             failed_inputs,
+            running_differs,
         });
     }
 
@@ -275,5 +309,30 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         advanced_inputs: inputs,
         candidate_drv,
         failed_inputs,
+        running_differs,
     })
+}
+
+/// Whether the system the repo describes (with its own lock) is not the one running.
+///
+/// "No updates" only compares the repo's lock with a newer one. If `flake.lock` was
+/// advanced but never switched to — an apply still running, or killed before it could
+/// restore the lock, or a hand-run `nix flake update` — the repo is current and the machine
+/// is not. Comparing the baseline's output path with `/run/current-system` catches that. It
+/// equally reports configuration edits that have not been rebuilt yet, which is also a
+/// system that differs from its flake.
+///
+/// `false` when either side cannot be determined: a false "not applied" would offer a
+/// rebuild for no reason.
+async fn repo_differs_from_running(current_drv: &str) -> bool {
+    let Some(running) = crate::apply::current_system() else {
+        return false;
+    };
+    match nix::drv_out_path(current_drv).await {
+        Ok(out) => Path::new(&out) != running,
+        Err(e) => {
+            tracing::warn!("could not resolve the output path of {current_drv}: {e:#}");
+            false
+        }
+    }
 }

@@ -81,6 +81,23 @@ impl Updater {
             }
         }
     }
+
+    /// Send `cmd` if the caller is one of ours.
+    async fn restricted(
+        &self,
+        conn: &zbus::Connection,
+        hdr: &Header<'_>,
+        method: &str,
+        cmd: Command,
+    ) -> zbus::fdo::Result<()> {
+        if !self.caller_allowed(conn, hdr).await {
+            return Err(zbus::fdo::Error::AccessDenied(format!(
+                "{method} may only be called by the nixos-update-notifier client"
+            )));
+        }
+        let _ = self.tx.send(cmd);
+        Ok(())
+    }
 }
 
 #[interface(name = "org.nixos.UpdateNotifier1")]
@@ -89,6 +106,13 @@ impl Updater {
     /// open to any same-user caller.
     async fn check_now(&self) {
         let _ = self.tx.send(Command::CheckNow);
+    }
+
+    /// Open the updates window, as a left-click on the tray does. Used by a second
+    /// instance started from the app menu, so open to any same-user caller: it only shows
+    /// a window.
+    async fn show_updates(&self) {
+        let _ = self.tx.send(Command::ViewUpdates);
     }
 
     /// Apply the pending updates (starts the authenticated rebuild). Restricted.
@@ -141,14 +165,71 @@ impl Updater {
         Ok(())
     }
 
+    /// Put the newest `flake.lock` backup back (the current lock is itself backed up
+    /// first). Restricted: it changes a file in the user's repo.
+    async fn revert_lock(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] hdr: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.restricted(conn, &hdr, "RevertLock", Command::RevertLock)
+            .await
+    }
+
+    /// Evaluate and diff an upgrade to release `target` (`YY.MM`). Restricted: it starts a
+    /// full evaluation.
+    async fn preview_upgrade(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] hdr: Header<'_>,
+        target: String,
+    ) -> zbus::fdo::Result<()> {
+        self.restricted(
+            conn,
+            &hdr,
+            "PreviewUpgrade",
+            Command::PreviewUpgrade(target),
+        )
+        .await
+    }
+
+    /// Apply the previewed release upgrade (rewrites `flake.nix`, then the authenticated
+    /// rebuild). Restricted, like Apply.
+    async fn upgrade(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] hdr: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.restricted(conn, &hdr, "Upgrade", Command::Upgrade)
+            .await
+    }
+
+    /// Stop offering the newest release until a newer one appears. Restricted, like Dismiss.
+    async fn dismiss_release(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] hdr: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.restricted(conn, &hdr, "DismissRelease", Command::DismissRelease)
+            .await
+    }
+
+    /// Everything else the window shows, as a JSON `nun_core::ipc::Details`: the current
+    /// apply, why the last check failed, whether the running system differs from the repo,
+    /// and release upgrade state.
+    async fn get_details(&self) -> String {
+        let s = self.shared.lock().await;
+        serde_json::to_string(&s.details()).unwrap_or_else(|_| "{}".to_string())
+    }
+
     /// The pending package changes as a JSON array of `PackageChange`.
     async fn get_updates(&self) -> String {
         let s = self.shared.lock().await;
         serde_json::to_string(&s.changes).unwrap_or_else(|_| "[]".to_string())
     }
 
-    /// Current status string (`idle`/`checking`/`system-changes`/`updates`/`error`) and
-    /// the package-update count.
+    /// Current status string (`idle`/`checking`/`system-changes`/`updates`/`applying`/
+    /// `not-applied`/`error`) and the package-update count.
     async fn get_status(&self) -> (String, u32) {
         let s = self.shared.lock().await;
         (s.status.as_str().to_string(), s.status.count())

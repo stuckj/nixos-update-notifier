@@ -1,0 +1,70 @@
+@nix {"action":"start","id":420906795008,"level":4,"parent":0,"text":"copying \"/w\" to the store","type":0}
+@nix {"action":"stop","id":420906795008}
+@nix {"action":"start","id":420906795009,"level":6,"parent":0,"text":"querying info about missing paths","type":0}
+@nix {"action":"start","fields":["/nix/store/9wc544abp7flyyvi06244dqagnjf8m6z-nun-sample-1794028292","https://cache.nixos.org"],"id":420906795010,"level":4,"parent":0,"text":"querying info about '/nix/store/9wc544abp7flyyvi06244dqagnjf8m6z-nun-sample-1794028292' on 'https://cache.nixos.org'","type":109}
+@nix {"action":"start","fields":["https://cache.nixos.org/9wc544abp7flyyvi06244dqagnjf8m6z.narinfo"],"id":420906795011,"level":4,"parent":420906795010,"text":"downloading 'https://cache.nixos.org/9wc544abp7flyyvi06244dqagnjf8m6z.narinfo'","type":101}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795011,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795011,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795011,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795011,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795011,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795011,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795011,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795011,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":420906795011,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":420906795011,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":420906795011,"type":105}
+@nix {"action":"stop","id":420906795010}
+@nix {"action":"stop","id":420906795011}
+@nix {"action":"stop","id":420906795009}
+@nix {"action":"msg","level":3,"msg":"this derivation will be built:"}
+@nix {"action":"msg","level":3,"msg":"  /nix/store/qxy7xx97dsk4shkmqgbk9clp0jdvkw67-nun-sample-1794028292.drv"}
+@nix {"action":"start","id":420906795012,"level":0,"parent":0,"text":"","type":102}
+@nix {"action":"start","id":420906795013,"level":0,"parent":0,"text":"","type":104}
+@nix {"action":"start","id":420906795014,"level":0,"parent":0,"text":"","type":103}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795013,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795014,"type":105}
+@nix {"action":"result","fields":[101,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[100,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[0,1,0,0],"id":420906795013,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795014,"type":105}
+@nix {"action":"result","fields":[101,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[100,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[0,1,0,0],"id":420906795013,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795014,"type":105}
+@nix {"action":"result","fields":[101,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[100,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[0,1,0,0],"id":420906795013,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795014,"type":105}
+@nix {"action":"result","fields":[101,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[100,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[0,2,0,0],"id":420906795013,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795014,"type":105}
+@nix {"action":"result","fields":[101,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[100,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[0,3,0,0],"id":420906795013,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795014,"type":105}
+@nix {"action":"result","fields":[101,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[100,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[0,2,0,0],"id":420906795013,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795014,"type":105}
+@nix {"action":"result","fields":[101,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[100,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[0,1,0,0],"id":420906795013,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795014,"type":105}
+@nix {"action":"result","fields":[101,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[100,0],"id":420906795012,"type":106}
+@nix {"action":"start","fields":["/nix/store/qxy7xx97dsk4shkmqgbk9clp0jdvkw67-nun-sample-1794028292.drv","",1,1],"id":420906795015,"level":3,"parent":0,"text":"building '/nix/store/qxy7xx97dsk4shkmqgbk9clp0jdvkw67-nun-sample-1794028292.drv'","type":105}
+@nix {"action":"result","fields":[0,1,1,0],"id":420906795013,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795014,"type":105}
+@nix {"action":"result","fields":[101,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[100,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":["building"],"id":420906795015,"type":101}
+@nix {"action":"result","fields":[1,2,0,0],"id":420906795013,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":420906795014,"type":105}
+@nix {"action":"result","fields":[101,0],"id":420906795012,"type":106}
+@nix {"action":"result","fields":[100,0],"id":420906795012,"type":106}
+@nix {"action":"stop","id":420906795015}
+@nix {"action":"stop","id":420906795014}
+@nix {"action":"stop","id":420906795013}
+@nix {"action":"stop","id":420906795012}

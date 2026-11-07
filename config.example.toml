@@ -27,6 +27,15 @@ interval = 21600
 # Fire desktop notifications when updates appear.
 notify = true
 
+# Look for new NixOS stable releases and offer an upgrade (notification + update window).
+# The upgrade itself is always a separate, explicit action. No effect on nixos-unstable.
+check_releases = true
+
+# Inputs a release upgrade moves to the new branch in flake.nix (nixos-YY.MM / release-YY.MM).
+# The first of these locked from a release branch decides which release you are on.
+# exclude_inputs still wins.
+# release_inputs = ["nixpkgs", "home-manager"]
+
 # Which nixpkgs to resolve meta.changelog against when rendering the update list.
 # If omitted, the `nixpkgs` recorded in the candidate lock is used: the revision the
 # pending update would actually install, already fetched by the check, so reading it

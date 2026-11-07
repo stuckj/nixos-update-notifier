@@ -32,6 +32,38 @@ fn locked_of<'a>(lock: &'a Value, input: &str) -> Option<&'a Value> {
     lock.get("nodes")?.get(node_key)?.get("locked")
 }
 
+/// The branch or tag a top-level input was locked from (`original.ref`), e.g.
+/// `nixos-26.05`. `None` for a `follows` input or one declared without a ref.
+pub fn original_ref(lock: &str, input: &str) -> Option<String> {
+    let lock: Value = serde_json::from_str(lock).ok()?;
+    let root_key = lock.get("root")?.as_str()?;
+    let node_key = lock
+        .get("nodes")?
+        .get(root_key)?
+        .get("inputs")?
+        .get(input)?
+        .as_str()?;
+    lock.get("nodes")?
+        .get(node_key)?
+        .get("original")?
+        .get("ref")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// `(input, original.ref)` for every top-level input that was locked from a ref, sorted.
+pub fn original_refs(lock: &str) -> Vec<(String, String)> {
+    let Ok(parsed) = serde_json::from_str::<Value>(lock) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = input_names(&parsed)
+        .into_iter()
+        .filter_map(|n| original_ref(lock, &n).map(|r| (n, r)))
+        .collect();
+    out.sort();
+    out
+}
+
 /// Resolve an input reference — a node key, or a `follows` path — to its node key.
 ///
 /// A `follows` is recorded as a path rooted at the *root* node, e.g. `["hm", "nixpkgs"]`

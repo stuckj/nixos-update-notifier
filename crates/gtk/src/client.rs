@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use nun_core::diff::PackageChange;
+use nun_core::ipc::Details;
 
 #[zbus::proxy(
     interface = "org.nixos.UpdateNotifier1",
@@ -21,6 +22,11 @@ trait Updater {
     fn get_apply_log(&self) -> zbus::Result<String>;
     fn get_last_check(&self) -> zbus::Result<u64>;
     fn get_warnings(&self) -> zbus::Result<String>;
+    fn get_details(&self) -> zbus::Result<String>;
+    fn revert_lock(&self) -> zbus::Result<()>;
+    fn preview_upgrade(&self, target: &str) -> zbus::Result<()>;
+    fn upgrade(&self) -> zbus::Result<()>;
+    fn dismiss_release(&self) -> zbus::Result<()>;
 }
 
 pub struct Client {
@@ -52,6 +58,31 @@ impl Client {
     pub fn warnings(&self) -> Result<Vec<(String, String)>> {
         let json = self.proxy.get_warnings().context("GetWarnings")?;
         Ok(serde_json::from_str(&json).unwrap_or_default())
+    }
+
+    /// Apply/failure/release state. A daemon too old to serve it reads as the default.
+    pub fn details(&self) -> Details {
+        self.proxy
+            .get_details()
+            .ok()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn revert_lock(&self) -> Result<()> {
+        self.proxy.revert_lock().context("RevertLock")
+    }
+
+    pub fn preview_upgrade(&self, target: &str) -> Result<()> {
+        self.proxy.preview_upgrade(target).context("PreviewUpgrade")
+    }
+
+    pub fn upgrade(&self) -> Result<()> {
+        self.proxy.upgrade().context("Upgrade")
+    }
+
+    pub fn dismiss_release(&self) -> Result<()> {
+        self.proxy.dismiss_release().context("DismissRelease")
     }
 
     pub fn check_now(&self) -> Result<()> {

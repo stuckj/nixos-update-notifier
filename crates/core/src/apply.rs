@@ -13,10 +13,11 @@
 //! wrong because root does no file I/O on those paths at all.
 //!
 //! Flow:
-//!   1. (unprivileged) back up `flake.lock` to `flake.lock.bak.<epoch>`.
-//!   2. (unprivileged) copy the candidate lock over it.
+//!   1. (unprivileged) back up `flake.lock` to `flake.lock.bak.<epoch>` — and, for a
+//!      release upgrade, `flake.nix` to `flake.nix.bak.<epoch>`.
+//!   2. (unprivileged) copy the candidate lock (and `flake.nix`) over them.
 //!   3. (root, via pkexec) `nixos-rebuild switch --flake <repo>#<host>`.
-//!   4. (unprivileged) restore the backup if the rebuild failed; report reboot need.
+//!   4. (unprivileged) restore the backups if the rebuild failed; report reboot need.
 //!
 //! We NEVER call `sudo` silently or auto-apply — step 3 always goes through polkit.
 
@@ -71,27 +72,41 @@ fn runtime_dir() -> PathBuf {
 /// tree. A few is enough to recover from a bad update; older ones are what git is for.
 const KEEP_BACKUPS: usize = 3;
 
-/// Delete all but the newest `keep` lock backups. Best-effort: never fails an apply.
-async fn prune_old_backups(repo: &Path, keep: usize) {
+/// `<file>.bak.<epoch>` backups of `file` in `repo`, newest first.
+///
+/// Sorted by the epoch in the name rather than by mtime, which a checkout or a copy can
+/// rewrite.
+async fn backups_of(repo: &Path, file: &str) -> Vec<(u64, PathBuf)> {
     let Ok(mut entries) = tokio::fs::read_dir(repo).await else {
-        return;
+        return Vec::new();
     };
+    let prefix = format!("{file}.bak.");
     let mut backups: Vec<(u64, PathBuf)> = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        // `flake.lock.bak.<epoch>` — sort by the epoch in the name rather than by mtime,
-        // which a checkout or a copy can rewrite.
-        if let Some(stamp) = name.strip_prefix("flake.lock.bak.") {
+        if let Some(stamp) = name.strip_prefix(&prefix) {
             if let Ok(epoch) = stamp.parse::<u64>() {
                 backups.push((epoch, entry.path()));
             }
         }
     }
-    if backups.len() <= keep {
-        return;
-    }
     backups.sort_by_key(|(epoch, _)| std::cmp::Reverse(*epoch));
+    backups
+}
+
+/// The newest `flake.lock` backup, if it differs from the current lock — i.e. if
+/// restoring it would change anything.
+pub async fn revertable_lock_backup(repo: &Path) -> Option<PathBuf> {
+    let (_, newest) = backups_of(repo, "flake.lock").await.into_iter().next()?;
+    let backup = tokio::fs::read(&newest).await.ok()?;
+    let current = tokio::fs::read(repo.join("flake.lock")).await.ok()?;
+    (backup != current).then_some(newest)
+}
+
+/// Delete all but the newest `keep` backups of `file`. Best-effort: never fails an apply.
+async fn prune_old_backups(repo: &Path, file: &str, keep: usize) {
+    let backups = backups_of(repo, file).await;
     for (_, path) in backups.into_iter().skip(keep) {
         match tokio::fs::remove_file(&path).await {
             Ok(()) => tracing::info!("pruned old lock backup {}", path.display()),
@@ -134,7 +149,7 @@ pub async fn install_candidate_lock(repo: &Path, candidate_lock: &Path) -> Resul
         .with_context(|| format!("backing up {} -> {}", real_lock.display(), backup.display()))?;
     tracing::info!("backed up flake.lock to {}", backup.display());
 
-    prune_old_backups(repo, KEEP_BACKUPS).await;
+    prune_old_backups(repo, "flake.lock", KEEP_BACKUPS).await;
 
     tokio::fs::copy(candidate_lock, &real_lock)
         .await
@@ -143,16 +158,41 @@ pub async fn install_candidate_lock(repo: &Path, candidate_lock: &Path) -> Resul
     Ok(backup)
 }
 
+/// Back up the repo's `flake.nix` and install a release upgrade's rewritten one over it,
+/// returning the backup path. Unprivileged, like [`install_candidate_lock`].
+pub async fn install_candidate_flake_nix(repo: &Path, candidate: &Path) -> Result<PathBuf> {
+    let real = repo.join("flake.nix");
+    let backup: PathBuf = repo.join(format!("flake.nix.{}", timestamp()));
+    tokio::fs::copy(&real, &backup)
+        .await
+        .with_context(|| format!("backing up {} -> {}", real.display(), backup.display()))?;
+    tracing::info!("backed up flake.nix to {}", backup.display());
+    prune_old_backups(repo, "flake.nix", KEEP_BACKUPS).await;
+    tokio::fs::copy(candidate, &real)
+        .await
+        .with_context(|| format!("installing the upgraded flake.nix into {}", real.display()))?;
+    Ok(backup)
+}
+
 /// Restore a lock backup taken by [`install_candidate_lock`], leaving the repo as it was.
 /// Best-effort: a failure here is logged, not propagated, since it runs on an error path.
 pub async fn restore_lock(repo: &Path, backup: &Path) {
-    let real_lock = repo.join("flake.lock");
-    match tokio::fs::copy(backup, &real_lock).await {
-        Ok(_) => tracing::info!("restored previous flake.lock from {}", backup.display()),
+    restore(repo, "flake.lock", backup).await
+}
+
+/// Restore a `flake.nix` backup taken by [`install_candidate_flake_nix`]. Best-effort.
+pub async fn restore_flake_nix(repo: &Path, backup: &Path) {
+    restore(repo, "flake.nix", backup).await
+}
+
+async fn restore(repo: &Path, file: &str, backup: &Path) {
+    let real = repo.join(file);
+    match tokio::fs::copy(backup, &real).await {
+        Ok(_) => tracing::info!("restored previous {file} from {}", backup.display()),
         Err(e) => tracing::error!(
             "could not restore {} -> {}: {e}",
             backup.display(),
-            real_lock.display()
+            real.display()
         ),
     }
 }
@@ -172,10 +212,16 @@ pub async fn rebuild_privileged(
     // Lead its own process group, so cancelling can take down the whole build tree.
     // `nixos-rebuild` is a thin wrapper: the actual work happens in the `nix build` it
     // spawns. Signalling only the wrapper leaves that child orphaned and still downloading.
+    //
+    // `--log-format internal-json` is passed through to nix, which then writes its progress
+    // as `@nix {json}` events instead of plain lines; the unprivileged client turns those
+    // into download and build progress (see `nun_core::progress`). A constant flag, so it
+    // widens nothing about what root evaluates or builds.
     let mut child = Command::new("nixos-rebuild")
         .arg("switch")
         .arg("--flake")
         .arg(&flake_target)
+        .args(["--log-format", "internal-json"])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .process_group(0)

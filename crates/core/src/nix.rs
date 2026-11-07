@@ -180,11 +180,13 @@ pub async fn closure_names(path: &str) -> ClosureNames {
 /// downloaded. This is the offline signal we compare to decide "updates available".
 /// With `reference_lock`, the flake is evaluated against THAT lock file instead of its own.
 /// That is what lets the candidate be evaluated straight from the user's real repo — no
-/// copy of the tree required — while the repo itself stays untouched.
+/// copy of the tree required — while the repo itself stays untouched. `overrides` are
+/// `(input, flake ref)` pairs passed as `--override-input`.
 pub async fn toplevel_drv_path(
     flake_ref: &str,
     host_attr: &str,
     reference_lock: Option<&Path>,
+    overrides: &[(String, String)],
 ) -> Result<String> {
     let attr =
         format!("{flake_ref}#nixosConfigurations.{host_attr}.config.system.build.toplevel.drvPath");
@@ -193,12 +195,27 @@ pub async fn toplevel_drv_path(
     if let Some(lock) = reference_lock {
         c.arg("--reference-lock-file").arg(lock);
     }
+    for (input, r) in overrides {
+        c.args(["--override-input", input, r]);
+    }
     let out = run_capture(&mut c).await?;
     let path = out.trim().to_string();
     if path.is_empty() {
         bail!("empty drvPath evaluating {attr}");
     }
     Ok(path)
+}
+
+/// The `out` path of an instantiated derivation. Reads the `.drv`; builds nothing.
+pub async fn drv_out_path(drv: &str) -> Result<String> {
+    let mut c = Command::new("nix-store");
+    c.args(["--query", "--outputs", drv]);
+    let out = run_capture(&mut c).await?;
+    out.lines()
+        .next()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .with_context(|| format!("no outputs listed for {drv}"))
 }
 
 /// The system double this machine evaluates for, e.g. `x86_64-linux`.

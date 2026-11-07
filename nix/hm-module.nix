@@ -16,6 +16,8 @@ let
       exclude_inputs = cfg.excludeInputs;
       interval = cfg.interval;
       notify = cfg.notify;
+      check_releases = cfg.checkReleases;
+      release_inputs = cfg.releaseInputs;
     }
     // lib.optionalAttrs (cfg.nixpkgsRefForChangelogs != null) {
       nixpkgs_ref_for_changelogs = cfg.nixpkgsRefForChangelogs;
@@ -86,6 +88,28 @@ in
       type = lib.types.bool;
       default = true;
       description = "Fire desktop notifications when updates appear.";
+    };
+
+    checkReleases = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Look for new NixOS stable releases and offer an upgrade. Only notifies; the upgrade
+        is a separate action you start from the update window. Has no effect for a flake
+        that tracks nixos-unstable.
+      '';
+    };
+
+    releaseInputs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [
+        "nixpkgs"
+        "home-manager"
+      ];
+      description = ''
+        Inputs a release upgrade moves to the new release branch (nixos-YY.MM /
+        release-YY.MM) in flake.nix. excludeInputs still wins.
+      '';
     };
 
     nixpkgsRefForChangelogs = lib.mkOption {

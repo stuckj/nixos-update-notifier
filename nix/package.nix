@@ -10,6 +10,7 @@
   # — they must be the system's so the store/rebuild stay consistent. We only ensure a few
   # generic helpers are reachable via a wrapped PATH suffix.
   coreutils,
+  git,
   makeBinaryWrapper,
 }:
 rustPlatform.buildRustPackage {
@@ -48,7 +49,8 @@ rustPlatform.buildRustPackage {
 
   # Wrap each binary for what it actually needs:
   #  - the GTK client gets the GApps env (schemas, icons, …);
-  #  - the daemon gets a PATH suffix guaranteeing `cp` (coreutils). `nix`,
+  #  - the daemon gets a PATH suffix guaranteeing `cp` (coreutils) and `git` (to list
+  #    NixOS release branches with `git ls-remote`). `nix`,
   #    `nixos-rebuild` and `pkexec` come from the running system's PATH (the systemd unit
   #    sets it explicitly); the daemon re-execs the sibling GTK binary from the same bin/.
   postFixup = ''
@@ -56,7 +58,12 @@ rustPlatform.buildRustPackage {
       "''${gappsWrapperArgs[@]}"
 
     wrapProgram $out/bin/nixos-update-notifier \
-      --suffix PATH : ${lib.makeBinPath [ coreutils ]}
+      --suffix PATH : ${
+        lib.makeBinPath [
+          coreutils
+          git
+        ]
+      }
   '';
 
   meta = {

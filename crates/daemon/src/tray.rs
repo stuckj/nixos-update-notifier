@@ -43,6 +43,8 @@ impl NixTray {
     fn apply_item(&self) -> (String, bool) {
         if self.apply_incomplete {
             ("Retry unfinished apply".to_string(), true)
+        } else if self.status == Status::NotApplied {
+            ("Apply (rebuild from current flake)".to_string(), true)
         } else {
             ("Apply updates".to_string(), self.has_updates())
         }
@@ -98,7 +100,19 @@ impl ksni::Tray for NixTray {
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let updates = self.has_updates();
-        vec![
+        // While an apply runs, its progress window (with Cancel) must stay reachable after
+        // it has been closed.
+        let progress: Option<MenuItem<Self>> = (self.status == Status::Applying).then(|| {
+            StandardItem {
+                label: "Show apply progress…".into(),
+                icon_name: "system-run".into(),
+                activate: Box::new(|t: &mut Self| t.send(Command::ShowProgress)),
+                ..Default::default()
+            }
+            .into()
+        });
+        let mut items: Vec<MenuItem<Self>> = progress.into_iter().collect();
+        items.extend(vec![
             StandardItem {
                 label: "Check now".into(),
                 icon_name: "view-refresh".into(),
@@ -149,7 +163,8 @@ impl ksni::Tray for NixTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+        items
     }
 }
 
@@ -188,5 +203,32 @@ mod tests {
         let (label, enabled) = tray(Status::Idle, true).apply_item();
         assert!(enabled, "an unfinished switch must stay retryable");
         assert_eq!(label, "Retry unfinished apply");
+    }
+
+    /// A lock advanced without a switch has no pending updates either, yet must be
+    /// applicable.
+    #[test]
+    fn a_lock_ahead_of_the_running_system_can_be_applied() {
+        let (label, enabled) = tray(Status::NotApplied, false).apply_item();
+        assert!(enabled);
+        assert_eq!(label, "Apply (rebuild from current flake)");
+    }
+
+    fn labels(t: &NixTray) -> Vec<String> {
+        use ksni::Tray;
+        t.menu()
+            .into_iter()
+            .filter_map(|i| match i {
+                MenuItem::Standard(s) => Some(s.label),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_progress_window_is_reachable_only_while_applying() {
+        let show = "Show apply progress…".to_string();
+        assert!(labels(&tray(Status::Applying, false)).contains(&show));
+        assert!(!labels(&tray(Status::Idle, false)).contains(&show));
     }
 }

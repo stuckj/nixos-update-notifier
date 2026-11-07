@@ -42,9 +42,9 @@ GUI dependency**, which is what lets CI test them on a bare runner with no syste
 
 ```
 crates/
-  core/   src/{config,nix,check,diff,changelog,apply,lock}.rs, lib.rs
+  core/   src/{config,nix,check,diff,changelog,apply,lock,failure,progress,release}.rs, lib.rs
           tests/integration.rs + tests/fixtures/
-  daemon/ src/{main,daemon,tray,notify,state,dbus}.rs
+  daemon/ src/{main,daemon,tray,notify,state,dbus,persist}.rs
   gtk/    src/{main,ui,client}.rs
 nix/      package.nix, hm-module.nix, nixos-module.nix
 scripts/  set-version.sh, plasma-smoke-test.sh
@@ -62,16 +62,31 @@ scripts/  set-version.sh, plasma-smoke-test.sh
 The daemon is a standalone service; the GUI is a thin client that can come and go. This
 also keeps GTK's main-thread requirements from tangling with the tokio/ksni event loop.
 
-The client talks to the daemon via `CheckNow`, `Apply`, `Dismiss`, `GetUpdates`,
-`GetStatus`, and `GetWarnings`, and repaints from a short poll.
+The client talks to the daemon over D-Bus and repaints from a short poll. `GetStatus`,
+`GetUpdates` and `GetWarnings` carry the status and the package list; everything else the
+windows show (the current apply, why the last check failed, release upgrade state) comes as
+one JSON document from `GetDetails`, whose type (`nun_core::ipc::Details`) both sides
+share. Methods that change something (`Apply`, `CancelApply`, `Dismiss`, `RevertLock`,
+`PreviewUpgrade`, `Upgrade`, `DismissRelease`) check that the caller is one of our binaries.
+
+The bus name is also the single-instance lock. It is requested *without* replacement on
+either side (zbus's default flags allow it), before the tray is registered; a second
+`run` asks the first to show its window (`ShowUpdates`) and exits.
 
 ### Keep the command loop non-blocking
 
-Checks run in a spawned task and report back through a channel that `select!` handles
-alongside commands. Awaiting a check inline blocks every menu action for its whole duration
-— minutes, on a cold evaluation — and the daemon simply looks broken: clicks queue up
-silently and then all fire at once when the check finishes. There's a regression probe for
-this in the smoke test.
+Checks, applies and upgrade previews run in spawned tasks and report back through channels
+that `select!` handles alongside commands. Awaiting a check inline blocks every menu action
+for its whole duration — minutes, on a cold evaluation — and the daemon simply looks broken:
+clicks queue up silently and then all fire at once when the check finishes. There's a
+regression probe for this in the smoke test.
+
+A check and an apply must not overlap in effect. A check compares against the repo's
+`flake.lock`, which an apply replaces, so no check starts while an apply runs, and a check
+that was already running when an apply began is discarded rather than allowed to report
+"up to date" against the new lock (or overwrite the "applying" status). Each apply carries
+an increasing id, and the progress window follows one id, so it never mistakes an earlier
+apply's end for the current one's.
 
 ---
 
@@ -139,16 +154,64 @@ change 10 of 20,000 derivations — activation script, units, `/etc` — with
 are separate states (`SystemChangesOnly` vs `UpdatesAvailable`) so a config regeneration
 doesn't badge the tray as if packages had updates.
 
+### "Up to date" is about the running system
+
+Comparing the repo's lock with a newer one only says whether the *lock* is current. The
+baseline's output path is also compared with `/run/current-system`; if they differ — a lock
+advanced without a switch, or configuration edits not yet rebuilt — the state is
+`NotApplied`, offering a rebuild of the repo as it is (and a revert to the newest
+`flake.lock.bak.*`) instead of a false "up to date".
+
+### Failures
+
+A failed check keeps its error chain and nix's stderr (`failure.rs`): the step that failed,
+nix's last `error:` line, a hint for the common nixpkgs refusals (insecure, unfree, broken),
+and the full text for the window's "Show details" and Copy. A failed apply gets the same
+from its log.
+
+---
+
+## Release upgrades
+
+A check only advances inputs within the branches `flake.nix` names. Moving to a new NixOS
+release rewrites those branches, so it is a separate, explicit operation (`release.rs`):
+
+- **Detect.** Alongside each check, `git ls-remote` lists nixpkgs' `nixos-YY.MM` branches
+  and compares them with the `original.ref` of the first configured release input. A branch
+  exists weeks before its release, so a release counts as out from the first day of the
+  following month. Support ends roughly a month after the next release.
+- **Preview** (on request). The release inputs' branch names are rewritten in a scratch copy
+  of `flake.nix` — literal replacement of e.g. `nixos-26.05`, refused if the branch is not
+  written literally or another, non-retargeted input tracks the same branch — relocked, and
+  evaluated against the user's tree with `--override-input` for the relocked inputs (the
+  repo's own `flake.nix` still names the old branch). The diff is the same offline one a
+  check makes.
+- **Upgrade.** The daemon backs up and installs the new `flake.nix` and lock, unprivileged,
+  then runs the same rebuild as an apply; both files are restored if it fails. It refuses if
+  `flake.nix` changed since the preview. `system.stateVersion` is never touched.
+
+## Apply progress
+
+nix only draws its progress bar on a TTY. `apply-privileged` passes the constant
+`--log-format internal-json` to `nixos-rebuild`, which forwards it to nix, so the apply log
+carries nix's `@nix {json}` activity events. Root does no parsing: the GTK client folds the
+events into download/build totals (`progress.rs`, totals computed the way nix's own
+progress bar does) and shows the plain messages as the log. The fixtures under
+`tests/fixtures/nix-log/` are real nix output.
+
 ---
 
 ## The privilege boundary
 
 Only `nixos-rebuild switch` needs root. The design keeps root's surface minimal:
 
-- The unprivileged daemon does the lock backup, install and restore — they operate on
-  user-owned files. Root never opens a path inside a user-writable directory, which
-  eliminates a symlink/TOCTOU class **by construction** rather than by careful coding.
-- `apply-privileged` takes only `--repo` and `--host`. No lock path, no pass-through args.
+- The unprivileged daemon does the lock (and, for a release upgrade, `flake.nix`) backup,
+  install and restore — they operate on user-owned files. Root never opens a path inside a
+  user-writable directory, which eliminates a symlink/TOCTOU class **by construction**
+  rather than by careful coding.
+- `apply-privileged` takes only `--repo` and `--host` (and the cancel flag it only reads).
+  No lock path, no pass-through args; the one flag it adds itself is the constant
+  `--log-format internal-json`.
   There is deliberately no `rebuild_extra_args`: free-form arguments into root's
   `nixos-rebuild` (`--override-input`, `-I`, `--substituters`) would let anything that can
   write the config change what root evaluates, invisibly to the polkit prompt.
