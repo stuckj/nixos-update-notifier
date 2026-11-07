@@ -211,8 +211,9 @@ Only `nixos-rebuild switch` needs root. The design keeps root's surface minimal:
   user-writable directory, which eliminates a symlink/TOCTOU class **by construction**
   rather than by careful coding.
 - `apply-privileged` takes only `--repo` and `--host` (and the cancel flag it only reads).
-  No lock path, no pass-through args; the one flag it adds itself is the constant
-  `--log-format internal-json`.
+  No lock path, no pass-through args; the flags it adds itself are constants:
+  `--log-format internal-json`, and `--no-update-lock-file` so that a lock not covering
+  `flake.nix` fails the rebuild rather than being rewritten in the repo by root.
   There is deliberately no `rebuild_extra_args`: free-form arguments into root's
   `nixos-rebuild` (`--override-input`, `-I`, `--substituters`) would let anything that can
   write the config change what root evaluates, invisibly to the polkit prompt.

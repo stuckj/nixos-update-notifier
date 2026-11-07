@@ -62,11 +62,16 @@ impl Client {
 
     /// Apply/failure/release state. A daemon too old to serve it reads as the default.
     pub fn details(&self) -> Details {
+        self.try_details().unwrap_or_default()
+    }
+
+    /// `None` when the call fails, for callers that must not mistake a failed call for
+    /// "nothing is happening".
+    pub fn try_details(&self) -> Option<Details> {
         self.proxy
             .get_details()
             .ok()
             .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_default()
     }
 
     pub fn revert_lock(&self) -> Result<()> {

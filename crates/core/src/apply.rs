@@ -197,15 +197,34 @@ pub async fn install_candidate_flake_nix(repo: &Path, candidate: &Path) -> Resul
     Ok(backup)
 }
 
-/// Restore a lock backup taken by [`install_candidate_lock`], leaving the repo as it was.
-/// Best-effort: a failure here is logged, not propagated, since it runs on an error path.
-pub async fn restore_lock(repo: &Path, backup: &Path) {
-    restore(repo, "flake.lock", backup).await
+/// Restore a lock backup taken by [`install_candidate_lock`], leaving the repo as it was —
+/// provided the lock is still the `installed` candidate. Best-effort: a failure here is
+/// logged, not propagated, since it runs on an error path.
+pub async fn restore_lock(repo: &Path, backup: &Path, installed: &Path) {
+    restore_if_untouched(repo, "flake.lock", backup, installed).await
 }
 
-/// Restore a `flake.nix` backup taken by [`install_candidate_flake_nix`]. Best-effort.
-pub async fn restore_flake_nix(repo: &Path, backup: &Path) {
-    restore(repo, "flake.nix", backup).await
+/// Restore a `flake.nix` backup taken by [`install_candidate_flake_nix`], provided the file
+/// is still the `installed` candidate. Best-effort.
+pub async fn restore_flake_nix(repo: &Path, backup: &Path, installed: &Path) {
+    restore_if_untouched(repo, "flake.nix", backup, installed).await
+}
+
+/// A rebuild can run for many minutes, and the user may edit the repo meanwhile. Putting
+/// the backup back over such an edit would lose it (the backup predates it), so a file
+/// that no longer holds what was installed is left alone.
+async fn restore_if_untouched(repo: &Path, file: &str, backup: &Path, installed: &Path) {
+    let now = tokio::fs::read(repo.join(file)).await.ok();
+    let ours = tokio::fs::read(installed).await.ok();
+    if now.is_none() || now != ours {
+        tracing::warn!(
+            "{file} changed while the update ran; leaving it as it is (the previous version \
+             is in {})",
+            backup.display()
+        );
+        return;
+    }
+    restore(repo, file, backup).await
 }
 
 async fn restore(repo: &Path, file: &str, backup: &Path) {
@@ -254,11 +273,15 @@ pub async fn rebuild_privileged(
     // as `@nix {json}` events instead of plain lines; the unprivileged client turns those
     // into download and build progress (see `nun_core::progress`). A constant flag, so it
     // widens nothing about what root evaluates or builds.
+    //
+    // `--no-update-lock-file`: a lock that does not cover `flake.nix` fails the rebuild
+    // instead of nix relocking it and writing the result into the user's repo as root.
     let mut child = Command::new("nixos-rebuild")
         .arg("switch")
         .arg("--flake")
         .arg(&flake_target)
         .args(["--log-format", "internal-json"])
+        .arg("--no-update-lock-file")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .process_group(0)
@@ -451,6 +474,38 @@ mod tests {
         assert!(
             generations_differ(&profile, &current),
             "a profile pointing at a newer generation means activation has begun"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_rollback_keeps_edits_made_during_the_rebuild() {
+        let root = std::env::temp_dir().join(format!("nun-rollback-{}", std::process::id()));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let candidate = root.join("candidate.nix");
+        std::fs::write(&candidate, "upgraded").unwrap();
+        std::fs::write(repo.join("flake.nix"), "original").unwrap();
+        let backup = install_candidate_flake_nix(&repo, &candidate)
+            .await
+            .unwrap();
+
+        // Untouched since the install: rolled back.
+        restore_flake_nix(&repo, &backup, &candidate).await;
+        assert_eq!(
+            std::fs::read_to_string(repo.join("flake.nix")).unwrap(),
+            "original"
+        );
+
+        // Edited while the rebuild ran: kept.
+        let backup = install_candidate_flake_nix(&repo, &candidate)
+            .await
+            .unwrap();
+        std::fs::write(repo.join("flake.nix"), "upgraded + the user's edit").unwrap();
+        restore_flake_nix(&repo, &backup, &candidate).await;
+        assert_eq!(
+            std::fs::read_to_string(repo.join("flake.nix")).unwrap(),
+            "upgraded + the user's edit"
         );
         let _ = std::fs::remove_dir_all(root);
     }

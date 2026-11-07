@@ -91,7 +91,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             // Exit cleanly either way: a failure would have systemd restart the service
             // over and over while the other instance holds the name. Only a launch by the
             // user (not the service manager) asks for the window.
-            if std::env::var_os("INVOCATION_ID").is_some() {
+            if std::env::var_os("NIXOS_UPDATE_NOTIFIER_SERVICE").is_some() {
                 tracing::info!("another instance is running; exiting");
             } else {
                 tracing::info!("another instance is running; asking it to show its window");
@@ -193,7 +193,11 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     // The update list and release offer describe the old repo too; the
                     // follow-up check fills them in again.
                     if outcome.state != ApplyState::Failed {
-                        s.upgrade = UpgradeInfo::default();
+                        // A preview still running keeps showing as such until its (now
+                        // stale) result arrives and is dropped; only then can another start.
+                        if !previewing {
+                            s.upgrade = UpgradeInfo::default();
+                        }
                         s.upgrade_plan = None;
                         s.changes.clear();
                         s.candidate_lock = None;
@@ -416,7 +420,9 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 repo_gen += 1;
                 {
                     let mut s = shared.lock().await;
-                    s.upgrade = UpgradeInfo::default();
+                    if !previewing {
+                        s.upgrade = UpgradeInfo::default();
+                    }
                     s.upgrade_plan = None;
                 }
                 let _ = tx.send(Command::CheckNow);
@@ -864,7 +870,10 @@ async fn apply_flow(
             )
             .await
             {
-                Ok(b) => (Some(p.candidate_lock.clone()), Some(b)),
+                Ok(b) => (
+                    Some(p.candidate_lock.clone()),
+                    Some((b, p.candidate_flake_nix.clone())),
+                ),
                 Err(e) => {
                     let f = Failure::from_error(&e);
                     return abort_apply(
@@ -903,10 +912,10 @@ async fn apply_flow(
                 }),
         };
         match staged {
-            Ok(b) => Some(b),
+            Ok(b) => Some((b, candidate_lock.clone())),
             Err((title, body, e)) => {
-                if let Some(b) = &nix_backup {
-                    nun_core::apply::restore_flake_nix(&cfg.flake_path, b).await;
+                if let Some((b, installed)) = &nix_backup {
+                    nun_core::apply::restore_flake_nix(&cfg.flake_path, b, installed).await;
                 }
                 let f = Failure::from_error(&e);
                 return abort_apply(cfg, shared, handle, title, &body, f).await;
@@ -932,13 +941,14 @@ fn apply_log_failure() -> Failure {
     Failure::from_output("applying updates (nixos-rebuild switch)", &tail)
 }
 
-/// Run the privileged rebuild and report the outcome. The backups are `None` when nothing
-/// was staged (a rebuild of the current lock), so there is nothing to roll back.
+/// Run the privileged rebuild and report the outcome. The backups are `(backup, installed
+/// candidate)`, `None` when nothing was staged (a rebuild of the current lock), so there is
+/// nothing to roll back.
 async fn apply_rebuild(
     cfg: &Config,
     exe: &Path,
-    lock_backup: Option<PathBuf>,
-    nix_backup: Option<PathBuf>,
+    lock_backup: Option<(PathBuf, PathBuf)>,
+    nix_backup: Option<(PathBuf, PathBuf)>,
     shared: &SharedState,
     handle: &ksni::Handle<NixTray>,
 ) -> ApplyOutcome {
@@ -999,11 +1009,11 @@ async fn apply_rebuild(
     let system_before = nun_core::apply::current_system();
 
     let restore_all = || async {
-        if let Some(b) = &lock_backup {
-            nun_core::apply::restore_lock(&cfg.flake_path, b).await;
+        if let Some((b, installed)) = &lock_backup {
+            nun_core::apply::restore_lock(&cfg.flake_path, b, installed).await;
         }
-        if let Some(b) = &nix_backup {
-            nun_core::apply::restore_flake_nix(&cfg.flake_path, b).await;
+        if let Some((b, installed)) = &nix_backup {
+            nun_core::apply::restore_flake_nix(&cfg.flake_path, b, installed).await;
         }
     };
 

@@ -128,6 +128,13 @@ pub fn hint_for(text: &str) -> Option<String> {
             None => "A package is marked broken in this nixpkgs.".into(),
         });
     }
+    if text.contains("--no-update-lock-file") {
+        return Some(
+            "flake.lock does not cover every input flake.nix declares; run `nix flake lock` \
+             in the repo, then apply again."
+                .into(),
+        );
+    }
     if text.contains("is not available on the requested hostPlatform") {
         return Some(
             "A package does not support this platform any more; remove it or pin it from \

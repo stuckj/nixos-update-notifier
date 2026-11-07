@@ -159,7 +159,12 @@ in
       };
       Service = {
         ExecStart = "${cfg.package}/bin/nixos-update-notifier run";
-        Environment = [ "PATH=${daemonPath}" ];
+        Environment = [
+          "PATH=${daemonPath}"
+          # Tells a duplicate started by the service to exit quietly, rather than open the
+          # running daemon's window the way a launch from the app menu does.
+          "NIXOS_UPDATE_NOTIFIER_SERVICE=1"
+        ];
         Restart = "on-failure";
         RestartSec = 5;
       };

@@ -1188,11 +1188,15 @@ fn build_progress_window(app: &Application) {
         let cancel = cancel.clone();
 
         glib::timeout_add_local(Duration::from_millis(700), move || {
-            let details = client.as_ref().map(|c| c.details());
-            let apply = details
-                .as_ref()
-                .map(|d| d.apply.clone())
-                .unwrap_or_default();
+            // A failed call (the daemon restarting, a timeout) is not "no apply": keep what
+            // is on screen until the next poll answers.
+            let apply = match &client {
+                Some(c) => match c.try_details() {
+                    Some(d) => d.apply,
+                    None => return glib::ControlFlow::Continue,
+                },
+                None => Default::default(),
+            };
 
             // A newer apply than the one on screen: start over with it.
             if followed.borrow().is_some_and(|id| id != apply.id) || followed.borrow().is_none() {
