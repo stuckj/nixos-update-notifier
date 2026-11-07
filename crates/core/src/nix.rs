@@ -47,7 +47,7 @@ fn nix_base() -> Command {
 /// lock), so it is cheap and offline.
 pub async fn flake_input_names(flake_dir: &Path) -> Result<Vec<String>> {
     let mut c = nix_base();
-    c.args(["flake", "metadata", "--json"]);
+    c.args(["flake", "metadata", "--json", "--no-write-lock-file"]);
     c.arg(flake_dir);
     let json = run_capture(&mut c).await?;
     let meta: serde_json::Value =
@@ -191,7 +191,9 @@ pub async fn toplevel_drv_path(
     let attr =
         format!("{flake_ref}#nixosConfigurations.{host_attr}.config.system.build.toplevel.drvPath");
     let mut c = nix_base();
-    c.args(["eval", "--raw", &attr]);
+    // nix writes a lock it had to compute back into the flake — the user's repo, whose own
+    // lock it would overwrite even when the inputs came from `reference_lock`.
+    c.args(["eval", "--raw", "--no-write-lock-file", &attr]);
     if let Some(lock) = reference_lock {
         c.arg("--reference-lock-file").arg(lock);
     }

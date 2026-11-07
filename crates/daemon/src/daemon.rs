@@ -89,7 +89,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         // menu. Behave like "open the notifier" rather than an error.
         Err(zbus::Error::NameTaken) => {
             tracing::info!("another instance is running; asking it to show its window");
-            return show_running_instance().await;
+            // Exit cleanly either way: a failure here would have systemd restart the
+            // service over and over while the other instance holds the name.
+            if let Err(e) = show_running_instance().await {
+                tracing::warn!("{e:#}");
+            }
+            return Ok(());
         }
         Err(e) => return Err(e).context("building D-Bus connection"),
     };
@@ -328,6 +333,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 }
                 {
                     let mut s = shared.lock().await;
+                    // Vouched for against the lock this apply is about to replace.
+                    s.can_revert_lock = false;
                     s.apply = ApplyInfo {
                         id: s.apply.id + 1,
                         state: ApplyState::Running,
