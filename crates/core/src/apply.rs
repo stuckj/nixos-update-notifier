@@ -168,6 +168,21 @@ async fn install_over(repo: &Path, file: &str, candidate: &Path, backup: &Path) 
     Ok(())
 }
 
+/// Fail if the repo's `flake.lock` is no longer `base`, the lock a candidate was made from.
+/// A candidate carries every input at the revision it had then, so installing it over a
+/// lock that has moved on (an upgrade, a hand-run `nix flake update`) would move inputs
+/// back, or pair it with a `flake.nix` it was never evaluated against.
+pub async fn ensure_lock_unchanged(repo: &Path, base: &str) -> Result<()> {
+    let now = tokio::fs::read_to_string(repo.join("flake.lock"))
+        .await
+        .context("reading flake.lock")?;
+    anyhow::ensure!(
+        now == base,
+        "flake.lock has changed since the last check; check again before applying"
+    );
+    Ok(())
+}
+
 /// Back up the repo's `flake.nix` and install a release upgrade's rewritten one over it,
 /// returning the backup path. Unprivileged, like [`install_candidate_lock`].
 pub async fn install_candidate_flake_nix(repo: &Path, candidate: &Path) -> Result<PathBuf> {
@@ -438,6 +453,17 @@ mod tests {
             "a profile pointing at a newer generation means activation has begun"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_candidate_is_refused_over_a_lock_that_moved_on() {
+        let repo = std::env::temp_dir().join(format!("nun-base-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("flake.lock"), "L0").unwrap();
+        ensure_lock_unchanged(&repo, "L0").await.unwrap();
+        std::fs::write(repo.join("flake.lock"), "L1").unwrap();
+        assert!(ensure_lock_unchanged(&repo, "L0").await.is_err());
+        let _ = std::fs::remove_dir_all(repo);
     }
 
     /// A failed install must leave the file as it was. `/proc/self/mem` is a regular file

@@ -41,6 +41,9 @@ pub struct CheckOutcome {
     pub failed_inputs: Vec<(String, String)>,
     /// The repo, with its own lock, describes a different system from the one running.
     pub running_differs: bool,
+    /// The repo's `flake.lock` the candidate was made from. Installing the candidate over a
+    /// lock that has changed since would silently move inputs back to these revisions.
+    pub base_lock: String,
     /// …and with the newest `flake.lock` backup instead, it describes the running system.
     pub revert_matches_running: bool,
 }
@@ -246,6 +249,9 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
 
     let repo_ref = cfg.flake_path.display().to_string();
     let scratch = scratch_flake(&cfg.flake_path, "check").await?;
+    let base_lock = tokio::fs::read_to_string(scratch.join("flake.lock"))
+        .await
+        .context("reading the repo's flake.lock")?;
 
     // Baseline: the real repo, evaluated with its own lock. Both sides evaluate the same
     // tree, so the comparison isolates the effect of advancing inputs even if the repo has
@@ -303,6 +309,7 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
             failed_inputs,
             running_differs,
             revert_matches_running,
+            base_lock,
         });
     }
 
@@ -326,6 +333,7 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         failed_inputs,
         running_differs,
         revert_matches_running,
+        base_lock,
     })
 }
 

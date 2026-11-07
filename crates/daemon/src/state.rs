@@ -133,6 +133,8 @@ pub struct Shared {
     pub changes: Vec<PackageChange>,
     /// Candidate lock to apply, and the drv that identifies this update set.
     pub candidate_lock: Option<PathBuf>,
+    /// The repo lock `candidate_lock` was made from.
+    pub candidate_base_lock: Option<String>,
     pub candidate_drv: Option<String>,
     /// Dismiss / re-notify bookkeeping.
     pub dismissed_drv: Option<String>,

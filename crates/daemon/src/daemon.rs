@@ -25,7 +25,7 @@ type CheckResult = (Result<check::CheckOutcome>, Result<Option<ReleaseOffer>>);
 /// What an apply installs before the rebuild.
 enum ApplyPlan {
     /// The candidate lock from the last check.
-    Update(PathBuf),
+    Update { lock: PathBuf, base: String },
     /// Nothing: rebuild from the repo as it is, to finish an unfinished switch or to apply
     /// a lock that was advanced without one.
     Rebuild,
@@ -36,7 +36,7 @@ enum ApplyPlan {
 impl ApplyPlan {
     fn kind(&self) -> String {
         match self {
-            ApplyPlan::Update(_) => "update".into(),
+            ApplyPlan::Update { .. } => "update".into(),
             ApplyPlan::Rebuild => "rebuild".into(),
             ApplyPlan::Upgrade(p) => format!("upgrade to NixOS {}", p.target),
         }
@@ -185,9 +185,16 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     s.apply.failure = outcome.failure;
                     // Anything but a rolled-back failure changed the repo's lock, which makes
                     // a preview stale (and an upgrade has been done).
+                    // The update list and release offer describe the old repo too; the
+                    // follow-up check fills them in again.
                     if outcome.state != ApplyState::Failed {
                         s.upgrade = UpgradeInfo::default();
                         s.upgrade_plan = None;
+                        s.changes.clear();
+                        s.candidate_lock = None;
+                        s.candidate_base_lock = None;
+                        s.candidate_drv = None;
+                        s.release = None;
                         repo_gen += 1;
                     }
                 }
@@ -203,11 +210,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             }
             Some((gen, target, result)) = preview_rx.recv() => {
                 previewing = false;
+                let mut s = shared.lock().await;
                 if gen != repo_gen {
                     tracing::info!("discarding an upgrade preview made from replaced flake files");
+                    if s.upgrade.state == UpgradeState::Previewing {
+                        s.upgrade = UpgradeInfo::default();
+                    }
                     continue;
                 }
-                let mut s = shared.lock().await;
                 match result {
                     Ok(plan) => {
                         s.upgrade = UpgradeInfo {
@@ -305,9 +315,11 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     let s = shared.lock().await;
                     if matches!(cmd, Command::Upgrade) {
                         s.upgrade_plan.clone().map(ApplyPlan::Upgrade)
-                    } else if let Some(lock) = s.candidate_lock.clone() {
-                        Some(ApplyPlan::Update(lock))
-                    } else if s.apply_incomplete || s.status == Status::NotApplied {
+                    } else if let (Some(lock), Some(base)) =
+                        (s.candidate_lock.clone(), s.candidate_base_lock.clone())
+                    {
+                        Some(ApplyPlan::Update { lock, base })
+                    } else if s.apply_incomplete || s.running_differs {
                         // Rebuild the repo's existing lock: after an unfinished switch it
                         // already describes the running system, and when it was advanced
                         // without a switch it is exactly what should be built.
@@ -541,6 +553,7 @@ async fn handle_check_result(
                     None
                 }
             };
+            s.candidate_base_lock = Some(outcome.base_lock.clone());
             s.candidate_drv = Some(outcome.candidate_drv.clone());
             s.failed_inputs = outcome.failed_inputs.clone();
             s.running_differs = outcome.running_differs;
@@ -561,6 +574,7 @@ async fn handle_check_result(
             let mut s = shared.lock().await;
             s.changes.clear();
             s.candidate_lock = None;
+            s.candidate_base_lock = None;
             s.candidate_drv = None;
             s.dismissed_drv = None;
             // Keep these even when up to date: "no updates" means much less if an input
@@ -601,6 +615,7 @@ async fn handle_check_result(
             let mut s = shared.lock().await;
             s.changes.clear();
             s.candidate_lock = None;
+            s.candidate_base_lock = None;
             s.candidate_drv = None;
             s.running_differs = false;
             if notify_now {
@@ -808,7 +823,21 @@ async fn apply_flow(
             tracing::info!("rebuilding from the repo's current lock");
             (None, None)
         }
-        ApplyPlan::Update(lock) => (Some(lock.clone()), None),
+        ApplyPlan::Update { lock, base } => {
+            if let Err(e) = nun_core::apply::ensure_lock_unchanged(&cfg.flake_path, base).await {
+                let f = Failure::from_error(&e);
+                return abort_apply(
+                    cfg,
+                    shared,
+                    handle,
+                    "NixOS update blocked",
+                    &e.to_string(),
+                    f,
+                )
+                .await;
+            }
+            (Some(lock.clone()), None)
+        }
         ApplyPlan::Upgrade(p) => {
             if let Err(e) = release::ensure_repo_unchanged(&cfg.flake_path, p).await {
                 let f = Failure::from_error(&e);
