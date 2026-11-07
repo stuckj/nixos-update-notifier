@@ -159,8 +159,9 @@ doesn't badge the tray as if packages had updates.
 Comparing the repo's lock with a newer one only says whether the *lock* is current. The
 baseline's output path is also compared with `/run/current-system`; if they differ — a lock
 advanced without a switch, or configuration edits not yet rebuilt — the state is
-`NotApplied`, offering a rebuild of the repo as it is (and a revert to the newest
-`flake.lock.bak.*`) instead of a false "up to date".
+`NotApplied`, offering a rebuild of the repo as it is instead of a false "up to date" — and
+a revert to the newest `flake.lock.bak.*` only when evaluating with that backup gives the
+running system exactly.
 
 ### Failures
 

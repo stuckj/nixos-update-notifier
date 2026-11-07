@@ -158,7 +158,7 @@ pub struct Shared {
     /// The repo describes a different system from the running one (see `Status::NotApplied`;
     /// also shown alongside pending updates).
     pub running_differs: bool,
-    /// A `flake.lock` backup exists that differs from the current lock.
+    /// Restoring the newest `flake.lock` backup would make the repo match the running system.
     pub can_revert_lock: bool,
     /// The current or most recent apply.
     pub apply: ApplyInfo,

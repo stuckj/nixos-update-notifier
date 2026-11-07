@@ -211,8 +211,9 @@ If `flake.lock` ends up ahead of the running system — an apply that never fini
 hand-run `nix flake update` — the tray shows **not applied** rather than "up to date". The
 same state appears for configuration changes you have not rebuilt yet, including a new
 commit if your config embeds its git revision (`system.configurationRevision`). Apply
-rebuilds from the repo as it is; **Revert flake.lock** in the update window puts the newest
-backup back (backing up the current lock first).
+rebuilds from the repo as it is. When the newest lock backup is exactly what is running,
+the update window also offers **Revert flake.lock**, which puts it back (backing up the
+current lock first).
 
 ### Release upgrades
 
@@ -231,8 +232,9 @@ are restored if it fails.
 - Only literal branch names are rewritten. If yours are built from a variable, or another
   input tracks the same branch but is not being upgraded, the preview says so and you
   change `flake.nix` by hand.
-- A flake that tracks `nixos-unstable` is never offered an upgrade. Turn the check off with
-  `check_releases = false`.
+- The release you are on is read from the first of `release_inputs` (normally nixpkgs). A
+  flake whose nixpkgs tracks `nixos-unstable` or a `-small` channel, or excludes it, is not
+  offered an upgrade. Turn the check off with `check_releases = false`.
 
 If you want to see what a rebuild would do before trusting it:
 

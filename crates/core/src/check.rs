@@ -41,6 +41,8 @@ pub struct CheckOutcome {
     pub failed_inputs: Vec<(String, String)>,
     /// The repo, with its own lock, describes a different system from the one running.
     pub running_differs: bool,
+    /// …and with the newest `flake.lock` backup instead, it describes the running system.
+    pub revert_matches_running: bool,
 }
 
 impl CheckOutcome {
@@ -241,6 +243,7 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         .await
         .context("evaluating current toplevel drvPath")?;
     let running_differs = repo_differs_from_running(&current_drv).await;
+    let revert_matches_running = running_differs && backup_matches_running(cfg).await;
 
     // Advance only the configured inputs, in the scratch flake — the user's repo is never
     // written to. A failure here is per-input and non-fatal: we report which ones could not
@@ -288,6 +291,7 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
             candidate_drv,
             failed_inputs,
             running_differs,
+            revert_matches_running,
         });
     }
 
@@ -310,7 +314,26 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         candidate_drv,
         failed_inputs,
         running_differs,
+        revert_matches_running,
     })
+}
+
+/// Whether restoring the newest `flake.lock` backup would make the repo describe exactly
+/// the running system — the case where the lock was advanced without a switch. Any other
+/// backup (the lock before an update that did go live, say) would only move the repo
+/// further from what is running, so it is not offered.
+async fn backup_matches_running(cfg: &Config) -> bool {
+    let Some(backup) = crate::apply::revertable_lock_backup(&cfg.flake_path).await else {
+        return false;
+    };
+    let repo_ref = cfg.flake_path.display().to_string();
+    match nix::toplevel_drv_path(&repo_ref, &cfg.host_attr, Some(&backup), &[]).await {
+        Ok(drv) => is_running_system(&drv).await == Some(true),
+        Err(e) => {
+            tracing::debug!("could not evaluate with {}: {e:#}", backup.display());
+            false
+        }
+    }
 }
 
 /// Whether the system the repo describes (with its own lock) is not the one running.
@@ -325,14 +348,18 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
 /// `false` when either side cannot be determined: a false "not applied" would offer a
 /// rebuild for no reason.
 async fn repo_differs_from_running(current_drv: &str) -> bool {
-    let Some(running) = crate::apply::current_system() else {
-        return false;
-    };
-    match nix::drv_out_path(current_drv).await {
-        Ok(out) => Path::new(&out) != running,
+    is_running_system(current_drv).await == Some(false)
+}
+
+/// Whether `drv` builds the system at `/run/current-system`; `None` if either side cannot
+/// be determined.
+async fn is_running_system(drv: &str) -> Option<bool> {
+    let running = crate::apply::current_system()?;
+    match nix::drv_out_path(drv).await {
+        Ok(out) => Some(Path::new(&out) == running),
         Err(e) => {
-            tracing::warn!("could not resolve the output path of {current_drv}: {e:#}");
-            false
+            tracing::warn!("could not resolve the output path of {drv}: {e:#}");
+            None
         }
     }
 }

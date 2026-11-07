@@ -1355,6 +1355,7 @@ fn show_progress(
         }
         downloads.set_text(&text);
         downloads.set_visible(true);
+        dl_bar.set_visible(true);
         dl_bar.set_fraction(bytes.fraction().or(paths.fraction()).unwrap_or(0.0));
     } else {
         downloads.set_visible(false);

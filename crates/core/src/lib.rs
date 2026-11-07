@@ -38,7 +38,8 @@ pub mod ipc {
         pub check_failure: Option<Failure>,
         /// The repo, with its own lock, describes a different system from the running one.
         pub running_differs: bool,
-        /// A `flake.lock` backup exists that differs from the current lock.
+        /// Restoring the newest `flake.lock` backup would make the repo match the running
+        /// system.
         pub can_revert_lock: bool,
         pub release: Option<ReleaseOffer>,
         /// Whether the user dismissed `release`'s newest version.

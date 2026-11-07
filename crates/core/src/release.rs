@@ -179,13 +179,23 @@ pub fn offer(current: Version, branches: &[Version], today: Date) -> Option<Rele
     })
 }
 
-/// The release the configured release inputs track, taken from the first of
-/// `release_inputs` whose `original.ref` is a release branch.
-pub fn current_release(lock_json: &str, release_inputs: &[String]) -> Option<Version> {
-    release_inputs
+/// The release the system is on: the branch of the first of `release_inputs` that is
+/// locked from a ref (normally nixpkgs). `None` — no upgrade to offer — when that input is
+/// excluded or its ref is not a plain release branch (`nixos-unstable`,
+/// `nixos-26.05-small`): an upgrade must move the input that decides the release, or it
+/// would move only the others (home-manager) and leave the system where it was.
+pub fn current_release(
+    lock_json: &str,
+    release_inputs: &[String],
+    exclude_inputs: &[String],
+) -> Option<Version> {
+    let (input, r) = release_inputs
         .iter()
-        .filter_map(|i| lock::original_ref(lock_json, i))
-        .find_map(|r| branch_version(&r).map(|(_, v)| v))
+        .find_map(|i| lock::original_ref(lock_json, i).map(|r| (i, r)))?;
+    if exclude_inputs.contains(input) {
+        return None;
+    }
+    branch_version(&r).map(|(_, v)| v)
 }
 
 /// List the released nixpkgs release branches.
@@ -216,7 +226,8 @@ pub async fn detect(cfg: &Config) -> Result<Option<ReleaseOffer>> {
     let lock_json = tokio::fs::read_to_string(cfg.flake_path.join("flake.lock"))
         .await
         .context("reading flake.lock")?;
-    let Some(current) = current_release(&lock_json, &cfg.release_inputs) else {
+    let Some(current) = current_release(&lock_json, &cfg.release_inputs, &cfg.exclude_inputs)
+    else {
         return Ok(None);
     };
     let branches = ls_remote_releases().await?;
@@ -339,7 +350,7 @@ pub async fn preview(cfg: &Config, target: Version) -> Result<UpgradePreview> {
     let flake_nix = tokio::fs::read_to_string(repo.join("flake.nix"))
         .await
         .context("reading flake.nix")?;
-    let current = current_release(&lock_json, &cfg.release_inputs)
+    let current = current_release(&lock_json, &cfg.release_inputs, &cfg.exclude_inputs)
         .context("the configured release inputs do not track a NixOS release branch")?;
     anyhow::ensure!(target > current, "{target} is not newer than {current}");
 
@@ -553,7 +564,10 @@ g\trefs/heads/nixos-24.11
             ("hardware", "master"),
         ]);
         let c = cfg();
-        assert_eq!(current_release(&lock, &c.release_inputs), Some(v("26.05")));
+        assert_eq!(
+            current_release(&lock, &c.release_inputs, &c.exclude_inputs),
+            Some(v("26.05"))
+        );
         assert_eq!(
             inputs_to_retarget(&c, &lock, v("26.05")),
             vec![
@@ -565,8 +579,27 @@ g\trefs/heads/nixos-24.11
 
     #[test]
     fn an_unstable_flake_tracks_no_release() {
-        let lock = lock_with(&[("nixpkgs", "nixos-unstable")]);
-        assert_eq!(current_release(&lock, &cfg().release_inputs), None);
+        let c = cfg();
+        // Home-manager on a release branch must not make nixpkgs' release look like that one.
+        for nixpkgs in ["nixos-unstable", "nixos-26.05-small"] {
+            let lock = lock_with(&[("nixpkgs", nixpkgs), ("home-manager", "release-26.05")]);
+            assert_eq!(
+                current_release(&lock, &c.release_inputs, &c.exclude_inputs),
+                None,
+                "{nixpkgs}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_excluded_nixpkgs_means_no_upgrade_is_offered() {
+        let lock = lock_with(&[
+            ("nixpkgs", "nixos-26.05"),
+            ("home-manager", "release-26.05"),
+        ]);
+        let c = cfg();
+        let excluded = vec!["nixpkgs".to_string()];
+        assert_eq!(current_release(&lock, &c.release_inputs, &excluded), None);
     }
 
     const FLAKE: &str = r#"{

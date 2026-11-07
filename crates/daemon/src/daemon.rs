@@ -131,8 +131,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let (apply_done_tx, mut apply_done_rx) = mpsc::unbounded_channel::<ApplyOutcome>();
     let mut applying = false;
     let (preview_tx, mut preview_rx) =
-        mpsc::unbounded_channel::<(Version, Result<UpgradePreview>)>();
+        mpsc::unbounded_channel::<(u64, Version, Result<UpgradePreview>)>();
     let mut previewing = false;
+    // Bumped whenever the repo's flake files change under us (an apply, a revert). A
+    // preview carries the generation it started in and is dropped if that has moved on: it
+    // describes files that are no longer there.
+    let mut repo_gen: u64 = 0;
 
     // Kick off an initial check shortly after startup.
     let _ = tx.send(Command::CheckNow);
@@ -179,14 +183,25 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     if outcome.state != ApplyState::Failed {
                         s.upgrade = UpgradeInfo::default();
                         s.upgrade_plan = None;
+                        repo_gen += 1;
                     }
+                }
+                // A failure has already set Error. After a success the follow-up check
+                // owns the status, but it is dropped while a stale check is still running,
+                // which would leave the tray saying "applying" until that one ends.
+                if checking && outcome.state == ApplyState::Succeeded {
+                    set_status(&shared, &tray_handle, Status::Checking).await;
                 }
                 // Re-check so the tray reflects the new baseline.
                 let _ = tx.send(Command::CheckNow);
                 continue;
             }
-            Some((target, result)) = preview_rx.recv() => {
+            Some((gen, target, result)) = preview_rx.recv() => {
                 previewing = false;
+                if gen != repo_gen {
+                    tracing::info!("discarding an upgrade preview made from replaced flake files");
+                    continue;
+                }
                 let mut s = shared.lock().await;
                 match result {
                     Ok(plan) => {
@@ -306,6 +321,11 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 // might want.
                 applying = true;
                 check_stale = checking;
+                // Empty the log before the new id is visible, so a progress window that
+                // switches to the new apply never reads the previous one's output as its own.
+                if let Err(e) = std::fs::File::create(nun_core::apply::apply_log_path()) {
+                    tracing::debug!("could not reset the apply log: {e}");
+                }
                 {
                     let mut s = shared.lock().await;
                     s.apply = ApplyInfo {
@@ -358,6 +378,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 // The lock moved: a check in flight describes the old one, and a preview
                 // was made from it.
                 check_stale = checking;
+                repo_gen += 1;
                 {
                     let mut s = shared.lock().await;
                     s.upgrade = UpgradeInfo::default();
@@ -389,8 +410,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 previewing = true;
                 let cfg2 = cfg.clone();
                 let preview_tx = preview_tx.clone();
+                let gen = repo_gen;
                 tokio::spawn(async move {
-                    let _ = preview_tx.send((target, release::preview(&cfg2, target).await));
+                    let result = release::preview(&cfg2, target).await;
+                    let _ = preview_tx.send((gen, target, result));
                 });
             }
 
@@ -444,9 +467,7 @@ async fn handle_check_result(
     shared: &SharedState,
     tray_handle: &ksni::Handle<NixTray>,
 ) {
-    let can_revert = nun_core::apply::revertable_lock_backup(&cfg.flake_path)
-        .await
-        .is_some();
+    let can_revert = result.as_ref().is_ok_and(|o| o.revert_matches_running);
     // Stamped for every outcome, including a failed check: "we looked and it went wrong"
     // is still information the window should be able to show.
     {
