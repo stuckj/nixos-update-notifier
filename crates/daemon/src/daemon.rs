@@ -58,6 +58,15 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
     let shared: SharedState = Arc::new(Mutex::new(Shared {
         persisted: crate::persist::Persisted::load(),
+        // Apply ids continue from the start time, so a progress window that outlived a
+        // daemon restart never takes the new daemon's first apply for one it already saw.
+        apply: ApplyInfo {
+            id: SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            ..ApplyInfo::default()
+        },
         ..Shared::default()
     }));
 
@@ -1075,7 +1084,12 @@ async fn apply_rebuild(
         }
         Ok(status) => {
             tracing::error!("apply failed: pkexec exited with {status}");
-            let failure = apply_log_failure();
+            let mut failure = apply_log_failure();
+            // pkexec's own exit codes for a dismissed or refused authentication; its message
+            // carries no `error:` prefix for the summary to find.
+            if matches!(status.code(), Some(126 | 127)) {
+                failure.summary = "Authentication was cancelled or not authorized.".into();
+            }
 
             // A non-zero exit does NOT mean nothing happened. `switch-to-configuration`
             // updates /run/current-system partway through activation, so the new system can

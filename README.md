@@ -274,7 +274,7 @@ the more informative check.
 | **Updates available** | One or more packages changed version. The window lists them. |
 | **Applying** | A rebuild is running. Checks wait until it finishes. |
 | **Not applied** | Nothing newer upstream, but your flake (lock or config) is not what is running. Apply rebuilds it. |
-| **Error** | The check failed. The update window shows why, with a suggested fix where one is known. |
+| **Error** | The last check or apply failed. The update window shows why, with a suggested fix where one is known. |
 
 A **⚠ input skipped** banner in the update window means one of your flake inputs could not
 be advanced (e.g. a local fork whose repo has moved). The rest were still checked — but
