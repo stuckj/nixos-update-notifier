@@ -51,6 +51,11 @@ pub fn original_ref(lock: &str, input: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether the lock declares a top-level input of this name.
+pub fn has_input(lock: &str, input: &str) -> bool {
+    serde_json::from_str::<Value>(lock).is_ok_and(|v| input_names(&v).iter().any(|n| n == input))
+}
+
 /// `(input, original.ref)` for every top-level input that was locked from a ref, sorted.
 pub fn original_refs(lock: &str) -> Vec<(String, String)> {
     let Ok(parsed) = serde_json::from_str::<Value>(lock) else {

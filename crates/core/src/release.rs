@@ -179,23 +179,26 @@ pub fn offer(current: Version, branches: &[Version], today: Date) -> Option<Rele
     })
 }
 
-/// The release the system is on: the branch of the first of `release_inputs` that is
-/// locked from a ref (normally nixpkgs). `None` — no upgrade to offer — when that input is
-/// excluded or its ref is not a plain release branch (`nixos-unstable`,
-/// `nixos-26.05-small`): an upgrade must move the input that decides the release, or it
-/// would move only the others (home-manager) and leave the system where it was.
+/// The release the system is on: the `nixos-YY.MM` branch of the first of `release_inputs`
+/// the flake has (normally nixpkgs). `None` — no upgrade to offer — when that input is
+/// excluded or not on such a branch (`nixos-unstable`, `nixos-26.05-small`, a pinned
+/// revision): an upgrade must move the input that decides the release, or it would move
+/// only the others (home-manager) and leave the system where it was.
 pub fn current_release(
     lock_json: &str,
     release_inputs: &[String],
     exclude_inputs: &[String],
 ) -> Option<Version> {
-    let (input, r) = release_inputs
+    let input = release_inputs
         .iter()
-        .find_map(|i| lock::original_ref(lock_json, i).map(|r| (i, r)))?;
+        .find(|i| lock::has_input(lock_json, i))?;
     if exclude_inputs.contains(input) {
         return None;
     }
-    branch_version(&r).map(|(_, v)| v)
+    match branch_version(&lock::original_ref(lock_json, input)?)? {
+        ("nixos", v) => Some(v),
+        _ => None,
+    }
 }
 
 /// List the released nixpkgs release branches.
@@ -589,6 +592,32 @@ g\trefs/heads/nixos-24.11
                 "{nixpkgs}"
             );
         }
+    }
+
+    #[test]
+    fn home_manager_never_decides_the_release() {
+        let c = cfg();
+        // nixpkgs pinned to a revision (no ref): its release is unknown.
+        let pinned = lock_with(&[("home-manager", "release-26.05")]).replace(
+            r#""inputs":{"home-manager":"home-manager"}"#,
+            r#""inputs":{"home-manager":"home-manager","nixpkgs":"nixpkgs"}"#,
+        );
+        let pinned = pinned.replacen(
+            r#""root":{"#,
+            r#""nixpkgs":{"locked":{"type":"github","owner":"o","repo":"nixpkgs","rev":"abc"},"original":{"type":"github","owner":"o","repo":"nixpkgs","rev":"abc"}},"root":{"#,
+            1,
+        );
+        assert!(lock::has_input(&pinned, "nixpkgs"), "{pinned}");
+        assert_eq!(
+            current_release(&pinned, &c.release_inputs, &c.exclude_inputs),
+            None
+        );
+        // No input called nixpkgs at all: home-manager's branch is not a NixOS release.
+        let renamed = lock_with(&[("nixos", "nixos-26.05"), ("home-manager", "release-26.05")]);
+        assert_eq!(
+            current_release(&renamed, &c.release_inputs, &c.exclude_inputs),
+            None
+        );
     }
 
     #[test]

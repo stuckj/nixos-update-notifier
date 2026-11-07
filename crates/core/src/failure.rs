@@ -75,23 +75,31 @@ pub fn last_error_line(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The text between the first pair of single quotes after `marker`'s position.
+/// The first quoted name on the line containing `marker`. Older nixpkgs quotes with `‘…’`,
+/// newer with `'…'`.
 fn quoted_before(text: &str, marker: &str) -> Option<String> {
     let line = text.lines().find(|l| l.contains(marker))?;
-    let start = line.find('\'')? + 1;
-    let end = start + line[start..].find('\'')?;
-    Some(line[start..end].to_string())
+    let start = line.find(['\'', '‘'])?;
+    let rest = &line[start..];
+    let open = rest.chars().next()?;
+    let rest = &rest[open.len_utf8()..];
+    let end = rest.find(['\'', '’'])?;
+    Some(rest[..end].to_string())
 }
 
 /// Suggest a fix for the nixpkgs refusals that account for most evaluation failures after
 /// an input bump. Wording follows the option names in the nixpkgs manual.
 pub fn hint_for(text: &str) -> Option<String> {
-    if text.contains("because it is marked as insecure") {
-        let pkg = quoted_before(text, "marked as insecure")?;
-        return Some(format!(
-            "Add \"{pkg}\" to nixpkgs.config.permittedInsecurePackages, or stop using \
-             the package that depends on it."
-        ));
+    if text.contains("marked as insecure") {
+        return Some(match quoted_before(text, "marked as insecure") {
+            Some(pkg) => format!(
+                "Add \"{pkg}\" to nixpkgs.config.permittedInsecurePackages, or stop using \
+                 the package that depends on it."
+            ),
+            None => "An insecure package is refused: see \
+                     nixpkgs.config.permittedInsecurePackages."
+                .into(),
+        });
     }
     if text.contains("has an unfree license") {
         let pkg = quoted_before(text, "has an unfree license");
@@ -103,8 +111,15 @@ pub fn hint_for(text: &str) -> Option<String> {
             None => "An unfree package is refused: see nixpkgs.config.allowUnfree.".into(),
         });
     }
-    if text.contains("is marked as broken") {
-        let pkg = quoted_before(text, "is marked as broken");
+    // Newer nixpkgs lists meta problems ("because it has problems:" then "- broken: …").
+    let broken = text.contains("is marked as broken")
+        || (text.contains("because it has problems")
+            && text
+                .lines()
+                .any(|l| l.trim_start().starts_with("- broken:")));
+    if broken {
+        let pkg = quoted_before(text, "is marked as broken")
+            .or_else(|| quoted_before(text, "because it has problems"));
         return Some(match pkg {
             Some(p) => format!(
                 "\"{p}\" is marked broken in this nixpkgs: wait for a fix, pin it from an \
@@ -196,6 +211,18 @@ error:
             "{}",
             f.summary
         );
+    }
+
+    #[test]
+    fn recognises_both_nixpkgs_message_styles() {
+        // nixpkgs ≥ 26.05: meta problems listed under the refusal.
+        let problems = "error: Refusing to evaluate package 'foo-1.2' in /nix/store/z.nix:1 because it has problems:\n       - broken: This package is broken.";
+        assert!(hint_for(problems).unwrap().contains("\"foo-1.2\""));
+        // Older nixpkgs: typographic quotes.
+        let old = "error: Package ‘electron-42.11.18’ in /nix/store/z.nix:50 is marked as insecure, refusing to evaluate.";
+        assert!(hint_for(old).unwrap().contains("\"electron-42.11.18\""));
+        let old = "error: Refusing to evaluate package ‘electron-42.11.18’ in /x.nix:50 because it is marked as insecure";
+        assert!(hint_for(old).unwrap().contains("\"electron-42.11.18\""));
     }
 
     #[test]
