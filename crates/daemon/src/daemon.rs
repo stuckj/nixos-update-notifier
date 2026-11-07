@@ -330,7 +330,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                         (s.candidate_lock.clone(), s.candidate_base_lock.clone())
                     {
                         Some(ApplyPlan::Update { lock, base })
-                    } else if s.apply_incomplete || s.running_differs {
+                    } else if s.candidate_drv.is_none() && (s.apply_incomplete || s.running_differs)
+                    {
+                        // Only with no update set pending: a listed update whose lock could
+                        // not be kept must not quietly turn into a rebuild of the old lock.
                         // Rebuild the repo's existing lock: after an unfinished switch it
                         // already describes the running system, and when it was advanced
                         // without a switch it is exactly what should be built.

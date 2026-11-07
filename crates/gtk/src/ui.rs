@@ -1307,9 +1307,14 @@ impl LogTail {
         }
         self.partial.push_str(&new);
         let mut shown = String::new();
-        while let Some(i) = self.partial.find('\n') {
-            let line: String = self.partial.drain(..=i).collect();
-            if let Some(text) = self.progress.feed_line(line.trim_end_matches('\n')) {
+        // Split off every complete line at once: a reopened window replays a log that can
+        // run to many megabytes, and removing lines from the front one by one is quadratic.
+        let Some(end) = self.partial.rfind('\n') else {
+            return (restarted, shown);
+        };
+        let complete: String = self.partial.drain(..=end).collect();
+        for line in complete.lines() {
+            if let Some(text) = self.progress.feed_line(line) {
                 shown.push_str(&text);
                 shown.push('\n');
             }
@@ -1463,7 +1468,40 @@ fn read_new(path: &std::path::Path, offset: &mut u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::relative_time;
+    use super::{relative_time, LogTail};
+
+    #[test]
+    fn the_log_tail_keeps_partial_lines_and_replays_large_logs_quickly() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("nun-tail-{}.log", std::process::id()));
+        let event = r#"@nix {"action":"result","fields":["compiling foo.c"],"id":7,"type":101}"#;
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            for _ in 0..50_000 {
+                writeln!(f, "{event}").unwrap();
+            }
+            write!(f, "building the sys").unwrap();
+        }
+        let mut t = LogTail::default();
+        let started = std::time::Instant::now();
+        let (_, shown) = t.read(&path);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "replaying ~4 MB took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(shown, "", "build-log events are not shown as text");
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"tem configuration...\n")
+            .unwrap();
+        let (_, shown) = t.read(&path);
+        assert_eq!(shown, "building the system configuration...\n");
+        let _ = std::fs::remove_file(path);
+    }
 
     fn ago(secs: u64) -> String {
         let now = std::time::SystemTime::now()

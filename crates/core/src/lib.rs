@@ -72,12 +72,6 @@ pub mod ipc {
         PartlyApplied,
     }
 
-    impl ApplyState {
-        pub fn is_finished(self) -> bool {
-            !matches!(self, ApplyState::None | ApplyState::Running)
-        }
-    }
-
     /// A release upgrade preview.
     #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
     #[serde(default)]
