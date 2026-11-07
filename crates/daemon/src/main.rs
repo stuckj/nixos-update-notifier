@@ -139,8 +139,18 @@ async fn run_check_cli(config_path: &std::path::Path, json: bool, exact: bool) -
         }
         println!("The results below reflect only the inputs that did advance.\n");
     }
+    if outcome.running_differs {
+        println!(
+            "NOTE — the running system is not built from the repo as it is now (flake.lock \
+             or configuration changed without a switch)."
+        );
+    }
     if !outcome.updates_available {
-        println!("System is up to date — no changes from advancing those inputs.");
+        if outcome.running_differs {
+            println!("No newer updates, but the repo has not been applied to this system.");
+        } else {
+            println!("System is up to date — no changes from advancing those inputs.");
+        }
         return Ok(());
     }
 

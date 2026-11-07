@@ -108,7 +108,9 @@ in
       ];
       description = ''
         Inputs a release upgrade moves to the new release branch (nixos-YY.MM /
-        release-YY.MM) in flake.nix. excludeInputs still wins.
+        release-YY.MM) in flake.nix. The first of these the flake has decides which release
+        you are on; if it is not on a nixos-YY.MM branch, or is excluded, no upgrade is
+        offered. excludeInputs still wins.
       '';
     };
 

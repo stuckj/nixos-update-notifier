@@ -32,8 +32,8 @@ notify = true
 check_releases = true
 
 # Inputs a release upgrade moves to the new branch in flake.nix (nixos-YY.MM / release-YY.MM).
-# The first of these locked from a release branch decides which release you are on.
-# exclude_inputs still wins.
+# The first of these your flake has decides which release you are on; if it is not on a
+# nixos-YY.MM branch (or is excluded), no upgrade is offered. exclude_inputs still wins.
 # release_inputs = ["nixpkgs", "home-manager"]
 
 # Which nixpkgs to resolve meta.changelog against when rendering the update list.

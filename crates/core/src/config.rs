@@ -59,8 +59,9 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub check_releases: bool,
 
-    /// Inputs a release upgrade moves to the new release branch. The first one locked from
-    /// a release branch decides which release the system is on. `exclude_inputs` still wins.
+    /// Inputs a release upgrade moves to the new release branch. The first of these the
+    /// flake has decides which release the system is on; if it is not on a `nixos-YY.MM`
+    /// branch, or is excluded, no upgrade is offered. `exclude_inputs` still wins.
     #[serde(default = "default_release_inputs")]
     pub release_inputs: Vec<String>,
 

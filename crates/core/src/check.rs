@@ -351,15 +351,56 @@ async fn repo_differs_from_running(current_drv: &str) -> bool {
     is_running_system(current_drv).await == Some(false)
 }
 
-/// Whether `drv` builds the system at `/run/current-system`; `None` if either side cannot
-/// be determined.
+/// Whether `drv` builds the system at `/run/current-system` — the system itself or one of
+/// its specialisations, which is what runs after booting or switching into one. `None` if
+/// either side cannot be determined.
 async fn is_running_system(drv: &str) -> Option<bool> {
     let running = crate::apply::current_system()?;
     match nix::drv_out_path(drv).await {
-        Ok(out) => Some(Path::new(&out) == running),
+        Ok(out) => Some(is_system_or_specialisation(Path::new(&out), &running)),
         Err(e) => {
             tracing::warn!("could not resolve the output path of {drv}: {e:#}");
             None
         }
+    }
+}
+
+/// `running` (canonical) is `toplevel` or one of its `specialisation/*` links' targets.
+fn is_system_or_specialisation(toplevel: &Path, running: &Path) -> bool {
+    if toplevel == running {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(toplevel.join("specialisation")) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|e| std::fs::canonicalize(e.path()).is_ok_and(|p| p == running))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_system_or_specialisation;
+
+    /// Mirrors the store layout: a specialisation is its own store path, linked from
+    /// `<toplevel>/specialisation/<name>`, and `/run/current-system` points at it directly.
+    #[test]
+    fn a_running_specialisation_is_the_running_system() {
+        let root = std::env::temp_dir().join(format!("nun-spec-{}", std::process::id()));
+        let toplevel = root.join("aaa-nixos-system");
+        let gaming = root.join("bbb-nixos-system-gaming");
+        let other = root.join("ccc-nixos-system");
+        for d in [&toplevel, &gaming, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir_all(toplevel.join("specialisation")).unwrap();
+        std::os::unix::fs::symlink(&gaming, toplevel.join("specialisation/gaming")).unwrap();
+
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+        let top = canon(&toplevel);
+        assert!(is_system_or_specialisation(&top, &top));
+        assert!(is_system_or_specialisation(&top, &canon(&gaming)));
+        assert!(!is_system_or_specialisation(&top, &canon(&other)));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

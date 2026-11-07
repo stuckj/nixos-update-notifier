@@ -1121,14 +1121,18 @@ fn build_progress_window(app: &Application) {
     buttons.append(&cancel);
     buttons.append(&close);
 
+    // Set once Cancel is clicked, so the poll does not offer it again for the same apply.
+    let cancel_requested = Rc::new(std::cell::Cell::new(false));
     {
         let client = client.clone();
         let cancel_btn = cancel.clone();
         let subtitle = subtitle.clone();
+        let cancel_requested = cancel_requested.clone();
         cancel.connect_clicked(move |_| {
             if let Some(c) = &client {
                 let _ = c.cancel_apply();
             }
+            cancel_requested.set(true);
             // Cancellation is cooperative and may be declined during activation, so say
             // "requested" rather than claiming it stopped.
             cancel_btn.set_sensitive(false);
@@ -1197,6 +1201,13 @@ fn build_progress_window(app: &Application) {
                     *tail.borrow_mut() = LogTail::default();
                     heading.set_text("Applying updates…");
                     subtitle.set_text("Running nixos-rebuild switch.");
+                    cancel_requested.set(false);
+                    for w in [&downloads, &builds, &current, &stall] {
+                        w.set_visible(false);
+                    }
+                    builds_bar.set_visible(false);
+                    bar.set_visible(true);
+                    bar.set_fraction(0.0);
                 }
                 *followed.borrow_mut() = Some(apply.id);
             }
@@ -1226,7 +1237,7 @@ fn build_progress_window(app: &Application) {
                 [&bar, &builds_bar],
             );
 
-            cancel.set_sensitive(running);
+            cancel.set_sensitive(running && !cancel_requested.get());
             if running {
                 heading.set_text(&format!("Applying ({})…", apply.kind));
             } else {

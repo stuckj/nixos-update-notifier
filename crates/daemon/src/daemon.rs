@@ -364,6 +364,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 if applying {
                     continue;
                 }
+                // Only what the last check vouched for, once: after a revert the newest
+                // backup is the lock just replaced, and acting again would undo it.
+                if !std::mem::take(&mut shared.lock().await.can_revert_lock) {
+                    tracing::info!("no revert is on offer; ignoring");
+                    continue;
+                }
                 let Some(backup) = nun_core::apply::revertable_lock_backup(&cfg.flake_path).await
                 else {
                     tracing::info!("no flake.lock backup differs from the current lock");

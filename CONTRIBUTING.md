@@ -189,7 +189,7 @@ release rewrites those branches, so it is a separate, explicit operation (`relea
   check makes.
 - **Upgrade.** The daemon backs up and installs the new `flake.nix` and lock, unprivileged,
   then runs the same rebuild as an apply; both files are restored if it fails. It refuses if
-  `flake.nix` changed since the preview. `system.stateVersion` is never touched.
+  `flake.nix` or `flake.lock` changed since the preview. `system.stateVersion` is never touched.
 
 ## Apply progress
 
