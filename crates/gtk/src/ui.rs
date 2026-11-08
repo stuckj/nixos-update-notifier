@@ -439,6 +439,7 @@ fn build_updates_window(app: &Application) {
         let client = client.clone();
         let refresh = refresh.clone();
         let last: RefCell<Option<String>> = RefCell::new(None);
+        let again = std::cell::Cell::new(false);
         glib::timeout_add_local(Duration::from_millis(500), move || {
             // An unreachable daemon is not checking: the indicator must not outlive it.
             let status = client
@@ -450,6 +451,11 @@ fn build_updates_window(app: &Application) {
             let changed = last.borrow().as_deref() != Some(status.as_str());
             if changed {
                 *last.borrow_mut() = Some(status);
+            }
+            // The daemon publishes a check's status a moment before its lists, so a change
+            // is repainted on this tick and once more on the next.
+            let changed_last_tick = again.replace(changed);
+            if changed || changed_last_tick {
                 refresh();
             }
             glib::ControlFlow::Continue

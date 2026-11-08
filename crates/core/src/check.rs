@@ -362,20 +362,26 @@ async fn unapplied_diff(cfg: &Config, repo_drv: &str) -> crate::ipc::UnappliedDi
         return unavailable("could not resolve /run/current-system".into());
     };
     let base = diff_base(&running, Path::new("/nix/var/nix/profiles/system"));
-    let key = (base.display().to_string(), repo_drv.to_string());
+    // The running system is part of the key even when the diff starts from its generation:
+    // which packages count as installed is judged against what is running.
+    let key = (
+        running.display().to_string(),
+        base.display().to_string(),
+        repo_drv.to_string(),
+    );
     if let Some((k, cached)) = UNAPPLIED_CACHE.lock().ok().and_then(|c| c.clone()) {
         if k == key {
             return cached;
         }
     }
-    if !nix::deriver_present(&key.0).await {
+    if !nix::deriver_present(&key.1).await {
         return unavailable(
             "the running system was not built on this machine (its derivation is not in \
              the store), so what differs cannot be listed"
                 .into(),
         );
     }
-    let result = diff_running(cfg, &key.0, repo_drv).await;
+    let result = diff_running(cfg, &key.1, repo_drv).await;
     if result.error.is_none() {
         if let Ok(mut c) = UNAPPLIED_CACHE.lock() {
             *c = Some((key, result.clone()));
@@ -384,10 +390,10 @@ async fn unapplied_diff(cfg: &Config, repo_drv: &str) -> crate::ipc::UnappliedDi
     result
 }
 
-/// The last listed difference, by (running system, repo derivation). The not-applied state
+/// The last listed difference, by (running system, diff base, repo derivation). The not-applied state
 /// can last for days (a config edit kept unapplied) and every check would otherwise read
 /// both closures again to produce the same list.
-type UnappliedKey = (String, String);
+type UnappliedKey = (String, String, String);
 static UNAPPLIED_CACHE: std::sync::Mutex<Option<(UnappliedKey, crate::ipc::UnappliedDiff)>> =
     std::sync::Mutex::new(None);
 
