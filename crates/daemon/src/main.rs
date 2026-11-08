@@ -66,7 +66,15 @@ fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("nixos_update_notifier=info,nun_core=info,warn"));
-    fmt().with_env_filter(filter).with_target(false).init();
+    // stderr, not fmt's default stdout: `check --json` output must be JSON alone.
+    let stderr = std::io::stderr();
+    let ansi = std::io::IsTerminal::is_terminal(&stderr);
+    fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .with_ansi(ansi)
+        .init();
 }
 
 fn main() -> Result<()> {
