@@ -16,6 +16,59 @@ pub mod pkgs;
 pub mod progress;
 pub mod release;
 
+/// Scratch directories for unit tests.
+///
+/// Unit tests run as threads of one process, so a directory named from the PID alone is
+/// shared by every test that picks the same name, and one test's cleanup deletes another's
+/// fixture mid-run. Each call gets a directory of its own, removed when the guard drops
+/// (also when the test panics).
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub struct ScratchDir(PathBuf);
+
+    pub fn scratch_dir(tag: &str) -> ScratchDir {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("nun-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creating a test scratch dir");
+        ScratchDir(dir)
+    }
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for ScratchDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn every_scratch_dir_is_its_own() {
+        let a = scratch_dir("same");
+        let b = scratch_dir("same");
+        assert_ne!(&*a, &*b);
+        let path = a.to_path_buf();
+        drop(a);
+        assert!(!path.exists(), "dropping the guard removes the directory");
+        assert!(b.exists(), "and leaves the other one alone");
+    }
+}
+
 /// D-Bus well-known name, object path, and interface the daemon exposes and the GTK
 /// client talks to. Kept here so both sides share one definition.
 pub mod ipc {

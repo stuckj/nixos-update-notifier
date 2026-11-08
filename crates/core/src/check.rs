@@ -504,7 +504,7 @@ mod tests {
     /// the repo's toplevel is comparable with); otherwise from the running system itself.
     #[test]
     fn the_diff_starts_from_the_generation_of_a_running_specialisation() {
-        let root = std::env::temp_dir().join(format!("nun-base-{}", std::process::id()));
+        let root = crate::testutil::scratch_dir("diff-base");
         let gen = root.join("aaa-nixos-system");
         let gaming = root.join("bbb-nixos-system-gaming");
         let older = root.join("ccc-nixos-system");
@@ -522,14 +522,13 @@ mod tests {
         // Running something the current profile does not contain (an older generation
         // switched to by hand): diff from what is running.
         assert_eq!(diff_base(&canon(&older), &profile), canon(&older));
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Mirrors the store layout: a specialisation is its own store path, linked from
     /// `<toplevel>/specialisation/<name>`, and `/run/current-system` points at it directly.
     #[test]
     fn a_running_specialisation_is_the_running_system() {
-        let root = std::env::temp_dir().join(format!("nun-spec-{}", std::process::id()));
+        let root = crate::testutil::scratch_dir("spec");
         let toplevel = root.join("aaa-nixos-system");
         let gaming = root.join("bbb-nixos-system-gaming");
         let other = root.join("ccc-nixos-system");
@@ -544,6 +543,5 @@ mod tests {
         assert!(is_system_or_specialisation(&top, &top));
         assert!(is_system_or_specialisation(&top, &canon(&gaming)));
         assert!(!is_system_or_specialisation(&top, &canon(&other)));
-        let _ = std::fs::remove_dir_all(root);
     }
 }

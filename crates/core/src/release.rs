@@ -671,8 +671,7 @@ g\trefs/heads/nixos-24.11
 
     #[tokio::test]
     async fn an_upgrade_refuses_a_repo_changed_since_its_preview() {
-        let dir = std::env::temp_dir().join(format!("nun-upgrade-base-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::scratch_dir("upgrade-base");
         std::fs::write(dir.join("flake.nix"), "nix-0").unwrap();
         std::fs::write(dir.join("flake.lock"), "lock-0").unwrap();
         let p = UpgradePreview {
@@ -696,7 +695,6 @@ g\trefs/heads/nixos-24.11
         std::fs::write(dir.join("flake.nix"), "nix-1").unwrap();
         let e = ensure_repo_unchanged(&dir, &p).await.unwrap_err();
         assert!(e.to_string().contains("flake.nix"), "{e}");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

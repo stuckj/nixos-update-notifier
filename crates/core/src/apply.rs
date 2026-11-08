@@ -480,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rollback_keeps_edits_made_during_the_rebuild() {
-        let root = std::env::temp_dir().join(format!("nun-rollback-{}", std::process::id()));
+        let root = crate::testutil::scratch_dir("rollback");
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let candidate = root.join("candidate.nix");
@@ -507,18 +507,15 @@ mod tests {
             std::fs::read_to_string(repo.join("flake.nix")).unwrap(),
             "upgraded + the user's edit"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn a_candidate_is_refused_over_a_lock_that_moved_on() {
-        let repo = std::env::temp_dir().join(format!("nun-base-{}", std::process::id()));
-        std::fs::create_dir_all(&repo).unwrap();
+        let repo = crate::testutil::scratch_dir("lock-base");
         std::fs::write(repo.join("flake.lock"), "L0").unwrap();
         ensure_lock_unchanged(&repo, "L0").await.unwrap();
         std::fs::write(repo.join("flake.lock"), "L1").unwrap();
         assert!(ensure_lock_unchanged(&repo, "L0").await.is_err());
-        let _ = std::fs::remove_dir_all(repo);
     }
 
     /// A failed install must leave the file as it was. `/proc/self/mem` is a regular file
@@ -526,7 +523,7 @@ mod tests {
     /// destination and then fails: a write failing partway.
     #[tokio::test]
     async fn a_failed_install_leaves_the_file_as_it_was() {
-        let root = std::env::temp_dir().join(format!("nun-install-{}", std::process::id()));
+        let root = crate::testutil::scratch_dir("install");
         let repo = root.join("repo");
         let not_a_file = PathBuf::from("/proc/self/mem");
         std::fs::create_dir_all(&repo).unwrap();
@@ -546,7 +543,6 @@ mod tests {
             std::fs::read_to_string(repo.join("flake.nix")).unwrap(),
             "original nix"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A cancelled rebuild must take its whole build tree down with it.
