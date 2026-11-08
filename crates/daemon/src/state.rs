@@ -2,6 +2,9 @@
 
 use nun_core::config::Icons;
 use nun_core::diff::PackageChange;
+use nun_core::failure::Failure;
+use nun_core::ipc::{ApplyInfo, Details, UnappliedDiff, UpgradeInfo};
+use nun_core::release::{ReleaseOffer, UpgradePreview};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -25,6 +28,9 @@ pub enum Status {
     Applying,
     /// At least one package version changed; `usize` is how many.
     UpdatesAvailable(usize),
+    /// Nothing newer upstream, but the repo describes a different system from the running
+    /// one: `flake.lock` (or the configuration) moved without a switch.
+    NotApplied,
     Error,
 }
 
@@ -36,6 +42,7 @@ impl Status {
             Status::SystemChangesOnly => &icons.system_changes,
             Status::Applying => &icons.applying,
             Status::UpdatesAvailable(_) => &icons.updates_available,
+            Status::NotApplied => &icons.system_changes,
             Status::Error => &icons.error,
         }
     }
@@ -49,6 +56,9 @@ impl Status {
             }
             Status::Applying => "NixOS: applying updates…".to_string(),
             Status::UpdatesAvailable(n) => format!("NixOS: {n} package update(s) available"),
+            Status::NotApplied => {
+                "NixOS: flake changes not applied to the running system".to_string()
+            }
             Status::Error => "NixOS update check failed".to_string(),
         }
     }
@@ -61,6 +71,7 @@ impl Status {
             Status::SystemChangesOnly => "system-changes",
             Status::Applying => "applying",
             Status::UpdatesAvailable(_) => "updates",
+            Status::NotApplied => "not-applied",
             Status::Error => "error",
         }
     }
@@ -82,7 +93,7 @@ impl Status {
     pub fn is_applicable(&self) -> bool {
         matches!(
             self,
-            Status::UpdatesAvailable(_) | Status::SystemChangesOnly
+            Status::UpdatesAvailable(_) | Status::SystemChangesOnly | Status::NotApplied
         )
     }
 }
@@ -96,7 +107,17 @@ pub enum Command {
     Apply,
     /// Ask an in-flight privileged rebuild to stop.
     CancelApply,
+    /// Reopen the progress window of a running apply (tray only).
+    ShowProgress,
+    /// Put the newest `flake.lock` backup back.
+    RevertLock,
     Dismiss,
+    /// Evaluate and diff an upgrade to this release (`YY.MM`).
+    PreviewUpgrade(String),
+    /// Apply the previewed release upgrade.
+    Upgrade,
+    /// Stop offering the newest available release until a newer one appears.
+    DismissRelease,
     /// Open the settings window (tray only — spawns the GTK client).
     Settings,
     Quit,
@@ -112,6 +133,8 @@ pub struct Shared {
     pub changes: Vec<PackageChange>,
     /// Candidate lock to apply, and the drv that identifies this update set.
     pub candidate_lock: Option<PathBuf>,
+    /// The repo lock `candidate_lock` was made from.
+    pub candidate_base_lock: Option<String>,
     pub candidate_drv: Option<String>,
     /// Dismiss / re-notify bookkeeping.
     pub dismissed_drv: Option<String>,
@@ -130,6 +153,47 @@ pub struct Shared {
     /// Without this the tool would offer no way back to a consistent state; cleared by the
     /// next successful apply.
     pub apply_incomplete: bool,
+    /// Why the last check failed, for the window; cleared by a successful check.
+    pub check_failure: Option<Failure>,
+    /// The headline of the last check failure that was notified, so it is notified once.
+    pub notified_failure: Option<String>,
+    /// The repo describes a different system from the running one (see `Status::NotApplied`;
+    /// also shown alongside pending updates).
+    pub running_differs: bool,
+    /// Restoring the newest `flake.lock` backup would make the repo match the running system.
+    pub can_revert_lock: bool,
+    /// The current or most recent apply.
+    pub apply: ApplyInfo,
+    /// Newer NixOS releases, from the last check.
+    pub release: Option<ReleaseOffer>,
+    /// The release upgrade preview the window shows…
+    pub upgrade: UpgradeInfo,
+    /// …and what applying it installs, once it is ready.
+    pub upgrade_plan: Option<UpgradePreview>,
+    /// What differs from the running system, in the not-applied state.
+    pub unapplied: Option<UnappliedDiff>,
+    /// Remembered across restarts so a release is announced once.
+    pub persisted: crate::persist::Persisted,
+}
+
+impl Shared {
+    /// Everything `GetDetails` serves.
+    pub fn details(&self) -> Details {
+        let release_dismissed = self
+            .release
+            .as_ref()
+            .is_some_and(|r| self.persisted.dismissed_release.as_deref() == Some(r.newest()));
+        Details {
+            apply: self.apply.clone(),
+            check_failure: self.check_failure.clone(),
+            running_differs: self.running_differs,
+            can_revert_lock: self.can_revert_lock,
+            release: self.release.clone(),
+            release_dismissed,
+            upgrade: self.upgrade.clone(),
+            unapplied: self.unapplied.clone(),
+        }
+    }
 }
 
 pub type SharedState = Arc<Mutex<Shared>>;

@@ -171,6 +171,8 @@ mod tests {
             interval_secs: 86400,
             notify: true,
             nixpkgs_ref_for_changelogs: explicit.map(str::to_string),
+            check_releases: true,
+            release_inputs: crate::config::default_release_inputs(),
             icons: crate::config::Icons::default(),
         }
     }

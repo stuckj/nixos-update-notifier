@@ -11,10 +11,43 @@ use ksni::TrayMethods;
 use nun_core::check;
 use nun_core::config::Config;
 use nun_core::diff::PackageChange;
+use nun_core::failure::Failure;
+use nun_core::ipc::{ApplyInfo, ApplyState, UpgradeInfo, UpgradeState};
+use nun_core::release::{self, ReleaseOffer, UpgradePreview, Version};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, Mutex};
+
+/// A finished check: the update check itself, and the release lookup made alongside it.
+type CheckResult = (Result<check::CheckOutcome>, Result<Option<ReleaseOffer>>);
+
+/// What an apply installs before the rebuild.
+enum ApplyPlan {
+    /// The candidate lock from the last check.
+    Update { lock: PathBuf, base: String },
+    /// Nothing: rebuild from the repo as it is, to finish an unfinished switch or to apply
+    /// a lock that was advanced without one.
+    Rebuild,
+    /// A previewed release upgrade: a rewritten `flake.nix` and its lock.
+    Upgrade(UpgradePreview),
+}
+
+impl ApplyPlan {
+    fn kind(&self) -> String {
+        match self {
+            ApplyPlan::Update { .. } => "update".into(),
+            ApplyPlan::Rebuild => "rebuild".into(),
+            ApplyPlan::Upgrade(p) => format!("upgrade to NixOS {}", p.target),
+        }
+    }
+}
+
+/// How an apply ended, for `GetDetails`.
+struct ApplyOutcome {
+    state: ApplyState,
+    failure: Option<Failure>,
+}
 
 /// Run the daemon until "Quit". `config_path` is retained so we can hot-reload settings
 /// changes between checks and pass it to the settings window.
@@ -23,20 +56,31 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
-    let shared: SharedState = Arc::new(Mutex::new(Shared::default()));
-
-    // Bring up the tray.
-    let tray_handle = NixTray::new(cfg.icons.clone(), tx.clone())
-        .spawn()
-        .await
-        .context("registering StatusNotifierItem (is a StatusNotifierHost running?)")?;
+    let shared: SharedState = Arc::new(Mutex::new(Shared {
+        persisted: crate::persist::Persisted::load(),
+        // Apply ids continue from the start time, so a progress window that outlived a
+        // daemon restart never takes the new daemon's first apply for one it already saw.
+        apply: ApplyInfo {
+            id: SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            ..ApplyInfo::default()
+        },
+        ..Shared::default()
+    }));
 
     // Export the D-Bus service so an independently-launched GTK client can drive us.
-    // Requesting the well-known name also enforces a single daemon instance.
-    let _conn = zbus::connection::Builder::session()
+    // Owning the well-known name is also what keeps this a single instance, so it is
+    // claimed before the tray exists and without replacement on either side: zbus's
+    // default flags let a second daemon take the name from the first, leaving two tray
+    // icons and the windows talking to whichever started last.
+    let conn = zbus::connection::Builder::session()
         .context("connecting to session bus")?
+        .allow_name_replacements(false)
+        .replace_existing_names(false)
         .name(nun_core::ipc::BUS_NAME)
-        .context("requesting D-Bus name (is another daemon already running?)")?
+        .context("requesting D-Bus name")?
         .serve_at(
             nun_core::ipc::OBJECT_PATH,
             Updater {
@@ -47,8 +91,33 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         )
         .context("exporting D-Bus object")?
         .build()
+        .await;
+    let _conn = match conn {
+        Ok(c) => c,
+        // Already running — typically the service, with the app also launched from the
+        // menu. Behave like "open the notifier" rather than an error.
+        Err(zbus::Error::NameTaken) => {
+            // Exit cleanly either way: a failure would have systemd restart the service
+            // over and over while the other instance holds the name. Only a launch by the
+            // user (not the service manager) asks for the window.
+            if std::env::var_os("NIXOS_UPDATE_NOTIFIER_SERVICE").is_some() {
+                tracing::info!("another instance is running; exiting");
+            } else {
+                tracing::info!("another instance is running; asking it to show its window");
+                if let Err(e) = show_running_instance().await {
+                    tracing::warn!("{e:#}");
+                }
+            }
+            return Ok(());
+        }
+        Err(e) => return Err(e).context("building D-Bus connection"),
+    };
+
+    // Bring up the tray.
+    let tray_handle = NixTray::new(cfg.icons.clone(), tx.clone())
+        .spawn()
         .await
-        .context("building D-Bus connection")?;
+        .context("registering StatusNotifierItem (is a StatusNotifierHost running?)")?;
 
     // Scheduling is a wall-clock THRESHOLD, polled once a minute — not a monotonic
     // interval. Tokio's timer is driven by a monotonic clock, which on Linux does not
@@ -69,11 +138,24 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     // evaluation — during which every tray menu action (Settings, View updates, Quit)
     // would sit unprocessed in the channel and the daemon would look dead. Menu clicks
     // then all fired at once when the check finally finished.
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<Result<check::CheckOutcome>>();
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<CheckResult>();
     let mut checking = false;
+    // A check and an apply must not overlap in effect. A check compares against the repo's
+    // flake.lock, which an apply replaces, so a check that was running when an apply began
+    // would report on a lock that is no longer the baseline — "no updates", while the
+    // running system is still the old one — and its status would overwrite "applying".
+    // Such a result is discarded and a fresh check runs once the apply is over.
+    let mut check_stale = false;
     // Applies run in their own task for the same reason, so Cancel stays reachable.
-    let (apply_done_tx, mut apply_done_rx) = mpsc::unbounded_channel::<()>();
+    let (apply_done_tx, mut apply_done_rx) = mpsc::unbounded_channel::<ApplyOutcome>();
     let mut applying = false;
+    let (preview_tx, mut preview_rx) =
+        mpsc::unbounded_channel::<(u64, Version, Result<UpgradePreview>)>();
+    let mut previewing = false;
+    // Bumped whenever the repo's flake files change under us (an apply, a revert). A
+    // preview carries the generation it started in and is dropped if that has moved on: it
+    // describes files that are no longer there.
+    let mut repo_gen: u64 = 0;
 
     // Kick off an initial check shortly after startup.
     let _ = tx.send(Command::CheckNow);
@@ -95,15 +177,90 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             _ = sigusr1.recv() => Command::CheckNow,
             // A finished check is handled here rather than as a Command, so it can never
             // block command processing.
-            Some(result) = done_rx.recv() => {
+            Some((result, release)) = done_rx.recv() => {
                 checking = false;
+                if applying || check_stale {
+                    tracing::info!("discarding a check that overlapped an apply");
+                    check_stale = false;
+                    if !applying {
+                        let _ = tx.send(Command::CheckNow);
+                    }
+                    continue;
+                }
                 handle_check_result(result, &cfg, &shared, &tray_handle).await;
+                handle_release(release, &cfg, &shared).await;
                 continue;
             }
-            Some(()) = apply_done_rx.recv() => {
+            Some(outcome) = apply_done_rx.recv() => {
                 applying = false;
+                {
+                    let mut s = shared.lock().await;
+                    s.apply.state = outcome.state;
+                    s.apply.failure = outcome.failure;
+                    // Anything but a rolled-back failure changed the repo's lock, which makes
+                    // a preview stale (and an upgrade has been done).
+                    // The update list and release offer describe the old repo too; the
+                    // follow-up check fills them in again.
+                    if outcome.state != ApplyState::Failed {
+                        // A preview still running keeps showing as such until its (now
+                        // stale) result arrives and is dropped; only then can another start.
+                        if !previewing {
+                            s.upgrade = UpgradeInfo::default();
+                        }
+                        s.upgrade_plan = None;
+                        s.changes.clear();
+                        s.candidate_lock = None;
+                        s.candidate_base_lock = None;
+                        s.candidate_drv = None;
+                        s.release = None;
+                        s.running_differs = false;
+                        s.unapplied = None;
+                        s.can_revert_lock = false;
+                        repo_gen += 1;
+                    }
+                }
+                // A failure has already set Error. After a success the follow-up check
+                // owns the status, but it is dropped while a stale check is still running,
+                // which would leave the tray saying "applying" until that one ends.
+                if checking && outcome.state == ApplyState::Succeeded {
+                    set_status(&shared, &tray_handle, Status::Checking).await;
+                }
                 // Re-check so the tray reflects the new baseline.
                 let _ = tx.send(Command::CheckNow);
+                continue;
+            }
+            Some((gen, target, result)) = preview_rx.recv() => {
+                previewing = false;
+                let mut s = shared.lock().await;
+                if gen != repo_gen {
+                    tracing::info!("discarding an upgrade preview made from replaced flake files");
+                    if s.upgrade.state == UpgradeState::Previewing {
+                        s.upgrade = UpgradeInfo::default();
+                    }
+                    continue;
+                }
+                match result {
+                    Ok(plan) => {
+                        s.upgrade = UpgradeInfo {
+                            state: UpgradeState::Ready,
+                            target: target.to_string(),
+                            retargeted: plan.retargeted.clone(),
+                            changes: plan.changes.clone(),
+                            failure: None,
+                        };
+                        s.upgrade_plan = Some(plan);
+                    }
+                    Err(e) => {
+                        tracing::error!("upgrade preview failed: {e:#}");
+                        s.upgrade = UpgradeInfo {
+                            state: UpgradeState::Failed,
+                            target: target.to_string(),
+                            failure: Some(Failure::from_error(&e)),
+                            ..UpgradeInfo::default()
+                        };
+                        s.upgrade_plan = None;
+                    }
+                }
                 continue;
             }
             maybe = rx.recv() => match maybe {
@@ -118,6 +275,11 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 // check is already in flight is a no-op rather than a queued duplicate.
                 if checking {
                     tracing::debug!("check already in progress; ignoring request");
+                    continue;
+                }
+                // The tray keeps saying "applying"; the apply's end triggers a check.
+                if applying {
+                    tracing::info!("an apply is in progress; checking once it finishes");
                     continue;
                 }
 
@@ -140,7 +302,9 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 let cfg_for_check = cfg.clone();
                 let done_tx = done_tx.clone();
                 tokio::spawn(async move {
-                    let _ = done_tx.send(check::run(&cfg_for_check).await);
+                    let (outcome, release) =
+                        tokio::join!(check::run(&cfg_for_check), release::detect(&cfg_for_check));
+                    let _ = done_tx.send((outcome, release));
                 });
             }
 
@@ -157,35 +321,83 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 }
             }
 
-            Command::Apply => {
+            Command::ShowProgress => {
+                if let Err(e) = spawn_gtk(&["progress"]) {
+                    tracing::warn!("could not open the progress window: {e:#}");
+                }
+            }
+
+            Command::Apply | Command::Upgrade => {
                 if applying {
                     tracing::debug!("an apply is already running; ignoring request");
                     continue;
                 }
-                let (lock, incomplete) = {
+                let plan = {
                     let s = shared.lock().await;
-                    (s.candidate_lock.clone(), s.apply_incomplete)
+                    if matches!(cmd, Command::Upgrade) {
+                        s.upgrade_plan.clone().map(ApplyPlan::Upgrade)
+                    } else if let (Some(lock), Some(base)) =
+                        (s.candidate_lock.clone(), s.candidate_base_lock.clone())
+                    {
+                        Some(ApplyPlan::Update { lock, base })
+                    } else if s.candidate_drv.is_none() && (s.apply_incomplete || s.running_differs)
+                    {
+                        // Only with no update set pending: a listed update whose lock could
+                        // not be kept must not quietly turn into a rebuild of the old lock.
+                        // Rebuild the repo's existing lock: after an unfinished switch it
+                        // already describes the running system, and when it was advanced
+                        // without a switch it is exactly what should be built.
+                        Some(ApplyPlan::Rebuild)
+                    } else {
+                        None
+                    }
                 };
-                // With no candidate but an unfinished switch, this is a retry: rebuild the
-                // repo's existing lock, which already describes the running system.
-                if lock.is_some() || incomplete {
-                    // Spawned, not awaited: a rebuild takes many minutes, and awaiting it
-                    // here would block this loop exactly as awaiting a check once did —
-                    // which would make Cancel unreachable for the entire time it is the
-                    // one thing the user might want.
-                    applying = true;
-                    let cfg2 = cfg.clone();
-                    let shared2 = shared.clone();
-                    let handle2 = tray_handle.clone();
-                    let done = apply_done_tx.clone();
-                    tokio::spawn(async move {
-                        apply_flow(&cfg2, lock.as_deref(), &shared2, &handle2).await;
-                        let _ = done.send(());
-                    });
+                let Some(plan) = plan else {
+                    tracing::debug!("nothing to apply");
+                    continue;
+                };
+                // Spawned, not awaited: a rebuild takes many minutes, and awaiting it here
+                // would block this loop exactly as awaiting a check once did — which would
+                // make Cancel unreachable for the entire time it is the one thing the user
+                // might want.
+                applying = true;
+                check_stale = checking;
+                // The apply stages files in the repo even if it later rolls them back, so a
+                // preview evaluating meanwhile may have seen them.
+                repo_gen += 1;
+                // Empty the log before the new id is visible, so a progress window that
+                // switches to the new apply never reads the previous one's output as its own.
+                if let Err(e) = std::fs::File::create(nun_core::apply::apply_log_path()) {
+                    tracing::debug!("could not reset the apply log: {e}");
                 }
+                // A stale flag from an earlier run must not abort this one.
+                let _ = std::fs::remove_file(nun_core::apply::cancel_flag_path());
+                {
+                    let mut s = shared.lock().await;
+                    // Vouched for against the lock this apply is about to replace.
+                    s.can_revert_lock = false;
+                    s.apply = ApplyInfo {
+                        id: s.apply.id + 1,
+                        state: ApplyState::Running,
+                        kind: plan.kind(),
+                        failure: None,
+                    };
+                }
+                let cfg2 = cfg.clone();
+                let shared2 = shared.clone();
+                let handle2 = tray_handle.clone();
+                let done = apply_done_tx.clone();
+                tokio::spawn(async move {
+                    let outcome = apply_flow(&cfg2, plan, &shared2, &handle2).await;
+                    let _ = done.send(outcome);
+                });
             }
 
             Command::CancelApply => {
+                if !applying {
+                    tracing::debug!("no apply is running; ignoring cancel");
+                    continue;
+                }
                 // The daemon cannot signal a root process, so drop the flag the
                 // privileged side polls. It stops itself, or declines if activation has
                 // already begun.
@@ -193,6 +405,79 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 match std::fs::write(&flag, b"") {
                     Ok(()) => tracing::info!("cancellation requested"),
                     Err(e) => tracing::warn!("could not request cancellation: {e}"),
+                }
+            }
+
+            Command::RevertLock => {
+                if applying {
+                    continue;
+                }
+                // Only what the last check vouched for, once: after a revert the newest
+                // backup is the lock just replaced, and acting again would undo it.
+                if !std::mem::take(&mut shared.lock().await.can_revert_lock) {
+                    tracing::info!("no revert is on offer; ignoring");
+                    continue;
+                }
+                let Some(backup) = nun_core::apply::revertable_lock_backup(&cfg.flake_path).await
+                else {
+                    tracing::info!("no flake.lock backup differs from the current lock");
+                    continue;
+                };
+                // Installed like any candidate, so the lock being replaced is itself backed
+                // up first and the revert can be undone.
+                match nun_core::apply::install_candidate_lock(&cfg.flake_path, &backup).await {
+                    Ok(_) => tracing::info!("reverted flake.lock to {}", backup.display()),
+                    Err(e) => tracing::error!("could not revert flake.lock: {e:#}"),
+                }
+                // The lock moved: a check in flight describes the old one, and a preview
+                // was made from it.
+                check_stale = checking;
+                repo_gen += 1;
+                {
+                    let mut s = shared.lock().await;
+                    if !previewing {
+                        s.upgrade = UpgradeInfo::default();
+                    }
+                    s.upgrade_plan = None;
+                }
+                let _ = tx.send(Command::CheckNow);
+            }
+
+            Command::PreviewUpgrade(target) => {
+                if previewing || applying {
+                    continue;
+                }
+                let target: Version = match target.parse() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("ignoring an upgrade preview for {target:?}: {e}");
+                        continue;
+                    }
+                };
+                {
+                    let mut s = shared.lock().await;
+                    s.upgrade = UpgradeInfo {
+                        state: UpgradeState::Previewing,
+                        target: target.to_string(),
+                        ..UpgradeInfo::default()
+                    };
+                    s.upgrade_plan = None;
+                }
+                previewing = true;
+                let cfg2 = cfg.clone();
+                let preview_tx = preview_tx.clone();
+                let gen = repo_gen;
+                tokio::spawn(async move {
+                    let result = release::preview(&cfg2, target).await;
+                    let _ = preview_tx.send((gen, target, result));
+                });
+            }
+
+            Command::DismissRelease => {
+                let mut s = shared.lock().await;
+                if let Some(newest) = s.release.as_ref().map(|r| r.newest().to_string()) {
+                    s.persisted.dismissed_release = Some(newest);
+                    s.persisted.save();
                 }
             }
 
@@ -213,6 +498,23 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Ask the daemon that owns the bus name to open its updates window.
+async fn show_running_instance() -> Result<()> {
+    let conn = zbus::Connection::session()
+        .await
+        .context("connecting to session bus")?;
+    conn.call_method(
+        Some(nun_core::ipc::BUS_NAME),
+        nun_core::ipc::OBJECT_PATH,
+        Some(nun_core::ipc::INTERFACE),
+        "ShowUpdates",
+        &(),
+    )
+    .await
+    .context("asking the running daemon to show its window")?;
+    Ok(())
+}
+
 /// Fold a finished check into the shared state, the tray, and (if warranted) a
 /// notification. Split out of the loop so the check itself can run in its own task.
 async fn handle_check_result(
@@ -221,6 +523,7 @@ async fn handle_check_result(
     shared: &SharedState,
     tray_handle: &ksni::Handle<NixTray>,
 ) {
+    let can_revert = result.as_ref().is_ok_and(|o| o.revert_matches_running);
     // Stamped for every outcome, including a failed check: "we looked and it went wrong"
     // is still information the window should be able to show.
     {
@@ -229,6 +532,7 @@ async fn handle_check_result(
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .map(|d| d.as_secs());
+        s.can_revert_lock = can_revert;
     }
 
     match result {
@@ -270,27 +574,69 @@ async fn handle_check_result(
 
             let mut s = shared.lock().await;
             s.changes = outcome.changes.clone();
-            s.candidate_lock = Some(outcome.candidate_lock.clone());
+            s.candidate_lock = match check::accept_candidate_lock(&outcome.candidate_lock) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!("{e:#}");
+                    None
+                }
+            };
+            s.candidate_base_lock = Some(outcome.base_lock.clone());
             s.candidate_drv = Some(outcome.candidate_drv.clone());
             s.failed_inputs = outcome.failed_inputs.clone();
+            s.running_differs = outcome.running_differs;
+            s.unapplied = None;
+            s.check_failure = None;
+            s.notified_failure = None;
             if notified {
                 s.last_notified_drv = Some(outcome.candidate_drv.clone());
             }
         }
         Ok(up_to_date) => {
-            set_status(shared, tray_handle, Status::Idle).await;
+            // Nothing newer upstream — but if the repo itself describes a system other than
+            // the running one, "up to date" would be a false all-clear.
+            let status = if up_to_date.running_differs {
+                Status::NotApplied
+            } else {
+                Status::Idle
+            };
+            set_status(shared, tray_handle, status).await;
             let mut s = shared.lock().await;
             s.changes.clear();
             s.candidate_lock = None;
+            s.candidate_base_lock = None;
             s.candidate_drv = None;
             s.dismissed_drv = None;
             // Keep these even when up to date: "no updates" means much less if an input
             // was silently skipped, so the client must still be able to say so.
             s.failed_inputs = up_to_date.failed_inputs.clone();
+            s.running_differs = up_to_date.running_differs;
+            s.unapplied = up_to_date.unapplied.clone();
+            s.check_failure = None;
+            s.notified_failure = None;
         }
         Err(e) => {
             tracing::error!("update check failed: {e:#}");
+            let failure = Failure::from_error(&e);
             set_status(shared, tray_handle, Status::Error).await;
+
+            // Notify only failures we can name a fix for, and each one once. Those are
+            // configuration problems that persist until the user acts (an insecure or
+            // unfree package after a bump); a network blip is retried by the next check
+            // and is not worth a popup.
+            let notify_now = {
+                let s = shared.lock().await;
+                failure.hint.is_some() && s.notified_failure.as_deref() != Some(failure.headline())
+            };
+            if cfg.notify && notify_now {
+                let body = format!(
+                    "{}\n{}",
+                    failure.headline(),
+                    failure.hint.as_deref().unwrap_or_default()
+                );
+                let _ = notify::notify("NixOS update check failed", &body, &cfg.icons.error).await;
+            }
+
             // Drop the previous candidate. The working copy is wiped at the
             // start of every check, so after a failure the retained lock path
             // may be gone or hold the unmodified lock — applying it would
@@ -301,7 +647,66 @@ async fn handle_check_result(
             let mut s = shared.lock().await;
             s.changes.clear();
             s.candidate_lock = None;
+            s.candidate_base_lock = None;
             s.candidate_drv = None;
+            s.running_differs = false;
+            s.unapplied = None;
+            if notify_now {
+                s.notified_failure = Some(failure.headline().to_string());
+            }
+            s.check_failure = Some(failure);
+        }
+    }
+}
+
+/// Record the release lookup, announcing a newly available release once.
+async fn handle_release(release: Result<Option<ReleaseOffer>>, cfg: &Config, shared: &SharedState) {
+    let offer = match release {
+        Ok(o) => o,
+        Err(e) => {
+            // A network failure keeps the last known answer rather than hiding the banner.
+            tracing::warn!("could not look for new NixOS releases: {e:#}");
+            return;
+        }
+    };
+    let mut s = shared.lock().await;
+    s.release = offer.clone();
+    // A finished preview for a release no longer on offer (upgraded by hand, say) would
+    // only lead to an upgrade that is refused.
+    let offered = |t: &str| {
+        offer
+            .as_ref()
+            .is_some_and(|o| o.choices.iter().any(|c| c.version == t))
+    };
+    if s.upgrade.state != UpgradeState::Previewing && !offered(&s.upgrade.target) {
+        s.upgrade = UpgradeInfo::default();
+        s.upgrade_plan = None;
+    }
+    let Some(offer) = offer else { return };
+    let newest = offer.newest().to_string();
+    if s.persisted.notified_release.as_deref() == Some(newest.as_str())
+        || s.persisted.dismissed_release.as_deref() == Some(newest.as_str())
+    {
+        return;
+    }
+    s.persisted.notified_release = Some(newest.clone());
+    s.persisted.save();
+    drop(s);
+
+    if cfg.notify {
+        let support = if offer.current_eol {
+            ", which is no longer supported"
+        } else {
+            ""
+        };
+        let body = format!(
+            "You are on NixOS {}{support}. Open \"View updates…\" to preview the upgrade; \
+             nothing changes until you choose to upgrade.",
+            offer.current
+        );
+        let title = format!("NixOS {newest} is available");
+        if let Err(e) = notify::notify(&title, &body, &cfg.icons.updates_available).await {
+            tracing::warn!("notification failed: {e:#}");
         }
     }
 }
@@ -393,101 +798,201 @@ fn gtk_client_exe() -> PathBuf {
 }
 
 /// Launch the independent GTK client, which connects back over D-Bus.
+///
+/// The child is waited on in its own task: an exited child stays a zombie until its parent
+/// reaps it, and the daemon outlives every window it opens.
 fn spawn_gtk(args: &[&str]) -> Result<()> {
-    std::process::Command::new(gtk_client_exe())
+    let mut child = tokio::process::Command::new(gtk_client_exe())
         .args(args)
         .spawn()
         .context("spawning GTK client")?;
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(s) if !s.success() => tracing::warn!("GTK client exited with {s}"),
+            Err(e) => tracing::warn!("waiting for GTK client: {e}"),
+            _ => {}
+        }
+    });
     Ok(())
 }
 
-/// Run the privileged apply via pkexec, then notify the outcome and prompt for reboot if
-/// warranted.
-/// `candidate_lock` is `None` for a RETRY of an unfinished switch: the repo's lock is
-/// already the one that produced the running system, so there is nothing to install and
-/// nothing to roll back — only the rebuild needs re-running.
-async fn apply_flow(
+/// Report a failure that stopped an apply before the rebuild: notify, show the error state,
+/// and return the outcome to record.
+async fn abort_apply(
     cfg: &Config,
-    candidate_lock: Option<&Path>,
     shared: &SharedState,
     handle: &ksni::Handle<NixTray>,
-) {
+    title: &str,
+    body: &str,
+    failure: Failure,
+) -> ApplyOutcome {
+    tracing::error!("apply aborted: {}", failure.details);
+    if cfg.notify {
+        let _ = notify::notify(title, body, &cfg.icons.error).await;
+    }
+    set_status(shared, handle, Status::Error).await;
+    ApplyOutcome {
+        state: ApplyState::Failed,
+        failure: Some(failure),
+    }
+}
+
+/// Install what `plan` needs, run the privileged rebuild, and report the outcome.
+async fn apply_flow(
+    cfg: &Config,
+    plan: ApplyPlan,
+    shared: &SharedState,
+    handle: &ksni::Handle<NixTray>,
+) -> ApplyOutcome {
     set_status(shared, handle, Status::Applying).await;
 
     let exe = match self_exe() {
         Ok(p) => p,
         Err(e) => {
-            tracing::error!("apply aborted: {e:#}");
-            return;
+            let f = Failure::from_error(&e);
+            return abort_apply(
+                cfg,
+                shared,
+                handle,
+                "NixOS update failed",
+                &f.step.clone(),
+                f,
+            )
+            .await;
         }
     };
 
-    let backup = if let Some(candidate_lock) = candidate_lock {
+    let (lock, nix_backup) = match &plan {
+        ApplyPlan::Rebuild => {
+            tracing::info!("rebuilding from the repo's current lock");
+            (None, None)
+        }
+        ApplyPlan::Update { lock, base } => {
+            if let Err(e) = nun_core::apply::ensure_lock_unchanged(&cfg.flake_path, base).await {
+                let f = Failure::from_error(&e);
+                return abort_apply(
+                    cfg,
+                    shared,
+                    handle,
+                    "NixOS update blocked",
+                    &e.to_string(),
+                    f,
+                )
+                .await;
+            }
+            (Some(lock.clone()), None)
+        }
+        ApplyPlan::Upgrade(p) => {
+            if let Err(e) = release::ensure_repo_unchanged(&cfg.flake_path, p).await {
+                let f = Failure::from_error(&e);
+                return abort_apply(
+                    cfg,
+                    shared,
+                    handle,
+                    "NixOS upgrade blocked",
+                    &e.to_string(),
+                    f,
+                )
+                .await;
+            }
+            match nun_core::apply::install_candidate_flake_nix(
+                &cfg.flake_path,
+                &p.candidate_flake_nix,
+            )
+            .await
+            {
+                Ok(b) => (
+                    Some(p.candidate_lock.clone()),
+                    Some((b, p.candidate_flake_nix.clone())),
+                ),
+                Err(e) => {
+                    let f = Failure::from_error(&e);
+                    return abort_apply(
+                        cfg,
+                        shared,
+                        handle,
+                        "NixOS upgrade failed",
+                        "Could not write the upgraded flake.nix; nothing was changed.",
+                        f,
+                    )
+                    .await;
+                }
+            }
+        }
+    };
+
+    let lock_backup = if let Some(candidate_lock) = &lock {
         // Last-chance safety net before anything is written: verify this candidate does not
         // advance a pinned input. check.rs already restricts `nix flake update` to the
         // configured set, so this only fires if that logic is wrong — which is exactly when
         // you want it, since silently advancing e.g. a rev-pinned kernel input can leave
         // the machine unbootable.
-        if let Err(e) = verify_pins(cfg, candidate_lock).await {
-            tracing::error!("apply aborted: {e:#}");
-            if cfg.notify {
-                let _ =
-                    notify::notify("NixOS update blocked", &e.to_string(), &cfg.icons.error).await;
+        let staged = match verify_pins(cfg, candidate_lock).await {
+            Err(e) => Err(("NixOS update blocked", e.to_string(), e)),
+            // Install the candidate lock ourselves, UNPRIVILEGED — it's the user's own
+            // file, and keeping root away from user-writable paths is a deliberate security
+            // property (see nun_core::apply docs). Root only ever activates the result.
+            Ok(()) => nun_core::apply::install_candidate_lock(&cfg.flake_path, candidate_lock)
+                .await
+                .map_err(|e| {
+                    (
+                        "NixOS update failed",
+                        "Could not stage the new flake.lock; nothing was changed.".to_string(),
+                        e,
+                    )
+                }),
+        };
+        match staged {
+            Ok(b) => Some((b, candidate_lock.clone())),
+            Err((title, body, e)) => {
+                if let Some((b, installed)) = &nix_backup {
+                    nun_core::apply::restore_flake_nix(&cfg.flake_path, b, installed).await;
+                }
+                let f = Failure::from_error(&e);
+                return abort_apply(cfg, shared, handle, title, &body, f).await;
             }
-            set_status(shared, handle, Status::Error).await;
-            return;
-        }
-        match install_lock_or_bail(cfg, candidate_lock, shared, handle).await {
-            Some(b) => Some(b),
-            None => return,
         }
     } else {
-        tracing::info!("retrying an unfinished switch against the repo's current lock");
         None
     };
 
-    apply_rebuild(cfg, &exe, backup, shared, handle).await;
+    apply_rebuild(cfg, &exe, lock_backup, nix_backup, shared, handle).await
 }
 
-/// Install the candidate lock, or report the failure and stop. `None` means stop.
-async fn install_lock_or_bail(
-    cfg: &Config,
-    candidate_lock: &Path,
-    shared: &SharedState,
-    handle: &ksni::Handle<NixTray>,
-) -> Option<PathBuf> {
-    // Install the candidate lock ourselves, UNPRIVILEGED — it's the user's own file, and
-    // keeping root away from user-writable paths is a deliberate security property (see
-    // nun_core::apply docs). Root only ever activates the result.
-    let backup =
-        match nun_core::apply::install_candidate_lock(&cfg.flake_path, candidate_lock).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!("could not install candidate lock: {e:#}");
-                if cfg.notify {
-                    let _ = notify::notify(
-                        "NixOS update failed",
-                        "Could not stage the new flake.lock; nothing was changed.",
-                        &cfg.icons.error,
-                    )
-                    .await;
-                }
-                set_status(shared, handle, Status::Error).await;
-                return None;
-            }
-        };
-    Some(backup)
+/// What the apply log says went wrong: its text (with nix's JSON events folded back into
+/// messages), as a [`Failure`].
+fn apply_log_failure() -> Failure {
+    const TAIL_LINES: usize = 200;
+    // nix logs every builder output line as an event, so a source build leaves megabytes;
+    // the cause is at the end.
+    const TAIL_BYTES: u64 = 1 << 20;
+    let text = (|| -> std::io::Result<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(nun_core::apply::apply_log_path())?;
+        let len = f.metadata()?.len();
+        f.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    })()
+    .unwrap_or_default();
+    let mut progress = nun_core::progress::Progress::default();
+    let lines: Vec<String> = text.lines().filter_map(|l| progress.feed_line(l)).collect();
+    let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
+    Failure::from_output("applying updates (nixos-rebuild switch)", &tail)
 }
 
-/// Run the privileged rebuild and report the outcome. `backup` is `None` on a retry, where
-/// there is no staged lock to roll back to.
+/// Run the privileged rebuild and report the outcome. The backups are `(backup, installed
+/// candidate)`, `None` when nothing was staged (a rebuild of the current lock), so there is
+/// nothing to roll back.
 async fn apply_rebuild(
     cfg: &Config,
     exe: &Path,
-    backup: Option<PathBuf>,
+    lock_backup: Option<(PathBuf, PathBuf)>,
+    nix_backup: Option<(PathBuf, PathBuf)>,
     shared: &SharedState,
     handle: &ksni::Handle<NixTray>,
-) {
+) -> ApplyOutcome {
     // Capture the rebuild's output to a file the GTK client tails, so the user can watch
     // what is happening. Previously it went to the daemon's journal, which meant a long
     // privileged operation ran with no visible indication of progress at all.
@@ -500,9 +1005,9 @@ async fn apply_rebuild(
         }
     };
 
-    // A fresh cancel flag: any stale one from a previous run must not abort this apply.
+    // Cleared when the apply was started, so a cancel clicked while files were being staged
+    // still stops the rebuild.
     let cancel_flag = nun_core::apply::cancel_flag_path();
-    let _ = std::fs::remove_file(&cancel_flag);
 
     // Show the progress window straight away, before the polkit prompt, so the user can
     // see the operation and reach Cancel.
@@ -544,8 +1049,18 @@ async fn apply_rebuild(
     // "the new system is already live but a later step failed".
     let system_before = nun_core::apply::current_system();
 
+    let restore_all = || async {
+        if let Some((b, installed)) = &lock_backup {
+            nun_core::apply::restore_lock(&cfg.flake_path, b, installed).await;
+        }
+        if let Some((b, installed)) = &nix_backup {
+            nun_core::apply::restore_flake_nix(&cfg.flake_path, b, installed).await;
+        }
+    };
+
     match cmd.status().await {
         Ok(status) if status.success() => {
+            tracing::info!("apply succeeded");
             // A complete switch clears any unfinished-apply state, including one left by an
             // earlier attempt this retry has just put right.
             set_apply_incomplete(shared, handle, false).await;
@@ -566,9 +1081,19 @@ async fn apply_rebuild(
                 };
                 let _ = notify::notify(summary, body, icon).await;
             }
+            ApplyOutcome {
+                state: ApplyState::Succeeded,
+                failure: None,
+            }
         }
         Ok(status) => {
             tracing::error!("apply failed: pkexec exited with {status}");
+            let mut failure = apply_log_failure();
+            // pkexec's own exit codes for a dismissed or refused authentication; its message
+            // carries no `error:` prefix for the summary to find.
+            if matches!(status.code(), Some(126 | 127)) {
+                failure.summary = "Authentication was cancelled or not authorized.".into();
+            }
 
             // A non-zero exit does NOT mean nothing happened. `switch-to-configuration`
             // updates /run/current-system partway through activation, so the new system can
@@ -581,7 +1106,7 @@ async fn apply_rebuild(
             let activated =
                 system_before.is_some() && nun_core::apply::current_system() != system_before;
 
-            if activated {
+            let state = if activated {
                 tracing::warn!(
                     "rebuild reported failure but the new system is already active; \
                      keeping the new flake.lock so the repo matches the running system"
@@ -600,30 +1125,34 @@ async fn apply_rebuild(
                     )
                     .await;
                 }
+                ApplyState::PartlyApplied
             } else {
                 // Covers a failed build and a cancelled/denied polkit prompt alike: put the
-                // previous lock back so the repo is left exactly as it was. A retry staged
-                // no lock, so there is nothing to restore and the flag stands.
-                if let Some(backup) = &backup {
-                    nun_core::apply::restore_lock(&cfg.flake_path, backup).await;
-                }
+                // previous files back so the repo is left exactly as it was. A rebuild
+                // staged nothing, so there is nothing to restore.
+                restore_all().await;
                 if cfg.notify {
                     let _ = notify::notify(
                         "NixOS update failed",
-                        "nixos-rebuild did not complete (or was not authorized). The previous \
-                         flake.lock was restored.",
+                        &format!(
+                            "{}\nThe previous flake files were restored.",
+                            failure.headline()
+                        ),
                         &cfg.icons.error,
                     )
                     .await;
                 }
-            }
+                ApplyState::Failed
+            };
             set_status(shared, handle, Status::Error).await;
+            ApplyOutcome {
+                state,
+                failure: Some(failure),
+            }
         }
         Err(e) => {
             tracing::error!("could not launch pkexec: {e:#}");
-            if let Some(backup) = &backup {
-                nun_core::apply::restore_lock(&cfg.flake_path, backup).await;
-            }
+            restore_all().await;
             if cfg.notify {
                 let _ = notify::notify(
                     "NixOS update failed",
@@ -633,6 +1162,11 @@ async fn apply_rebuild(
                 .await;
             }
             set_status(shared, handle, Status::Error).await;
+            let e = anyhow::Error::from(e).context("launching the privileged helper (pkexec)");
+            ApplyOutcome {
+                state: ApplyState::Failed,
+                failure: Some(Failure::from_error(&e)),
+            }
         }
     }
 }

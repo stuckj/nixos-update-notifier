@@ -13,10 +13,11 @@
 //! wrong because root does no file I/O on those paths at all.
 //!
 //! Flow:
-//!   1. (unprivileged) back up `flake.lock` to `flake.lock.bak.<epoch>`.
-//!   2. (unprivileged) copy the candidate lock over it.
+//!   1. (unprivileged) back up `flake.lock` to `flake.lock.bak.<epoch>` — and, for a
+//!      release upgrade, `flake.nix` to `flake.nix.bak.<epoch>`.
+//!   2. (unprivileged) copy the candidate lock (and `flake.nix`) over them.
 //!   3. (root, via pkexec) `nixos-rebuild switch --flake <repo>#<host>`.
-//!   4. (unprivileged) restore the backup if the rebuild failed; report reboot need.
+//!   4. (unprivileged) restore the backups if the rebuild failed; report reboot need.
 //!
 //! We NEVER call `sudo` silently or auto-apply — step 3 always goes through polkit.
 
@@ -71,27 +72,41 @@ fn runtime_dir() -> PathBuf {
 /// tree. A few is enough to recover from a bad update; older ones are what git is for.
 const KEEP_BACKUPS: usize = 3;
 
-/// Delete all but the newest `keep` lock backups. Best-effort: never fails an apply.
-async fn prune_old_backups(repo: &Path, keep: usize) {
+/// `<file>.bak.<epoch>` backups of `file` in `repo`, newest first.
+///
+/// Sorted by the epoch in the name rather than by mtime, which a checkout or a copy can
+/// rewrite.
+async fn backups_of(repo: &Path, file: &str) -> Vec<(u64, PathBuf)> {
     let Ok(mut entries) = tokio::fs::read_dir(repo).await else {
-        return;
+        return Vec::new();
     };
+    let prefix = format!("{file}.bak.");
     let mut backups: Vec<(u64, PathBuf)> = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        // `flake.lock.bak.<epoch>` — sort by the epoch in the name rather than by mtime,
-        // which a checkout or a copy can rewrite.
-        if let Some(stamp) = name.strip_prefix("flake.lock.bak.") {
+        if let Some(stamp) = name.strip_prefix(&prefix) {
             if let Ok(epoch) = stamp.parse::<u64>() {
                 backups.push((epoch, entry.path()));
             }
         }
     }
-    if backups.len() <= keep {
-        return;
-    }
     backups.sort_by_key(|(epoch, _)| std::cmp::Reverse(*epoch));
+    backups
+}
+
+/// The newest `flake.lock` backup, if it differs from the current lock — i.e. if
+/// restoring it would change anything.
+pub async fn revertable_lock_backup(repo: &Path) -> Option<PathBuf> {
+    let (_, newest) = backups_of(repo, "flake.lock").await.into_iter().next()?;
+    let backup = tokio::fs::read(&newest).await.ok()?;
+    let current = tokio::fs::read(repo.join("flake.lock")).await.ok()?;
+    (backup != current).then_some(newest)
+}
+
+/// Delete all but the newest `keep` backups of `file`. Best-effort: never fails an apply.
+async fn prune_old_backups(repo: &Path, file: &str, keep: usize) {
+    let backups = backups_of(repo, file).await;
     for (_, path) in backups.into_iter().skip(keep) {
         match tokio::fs::remove_file(&path).await {
             Ok(()) => tracing::info!("pruned old lock backup {}", path.display()),
@@ -134,28 +149,109 @@ pub async fn install_candidate_lock(repo: &Path, candidate_lock: &Path) -> Resul
         .with_context(|| format!("backing up {} -> {}", real_lock.display(), backup.display()))?;
     tracing::info!("backed up flake.lock to {}", backup.display());
 
-    prune_old_backups(repo, KEEP_BACKUPS).await;
+    prune_old_backups(repo, "flake.lock", KEEP_BACKUPS).await;
 
-    tokio::fs::copy(candidate_lock, &real_lock)
-        .await
-        .with_context(|| format!("installing candidate lock into {}", real_lock.display()))?;
-
+    install_over(repo, "flake.lock", candidate_lock, &backup).await?;
     Ok(backup)
 }
 
-/// Restore a lock backup taken by [`install_candidate_lock`], leaving the repo as it was.
-/// Best-effort: a failure here is logged, not propagated, since it runs on an error path.
-pub async fn restore_lock(repo: &Path, backup: &Path) {
-    let real_lock = repo.join("flake.lock");
-    match tokio::fs::copy(backup, &real_lock).await {
-        Ok(_) => tracing::info!("restored previous flake.lock from {}", backup.display()),
+/// Copy `candidate` over `repo/file`. A copy can fail after truncating the destination, so
+/// on failure the backup is put back before the error is returned: the caller reports
+/// that nothing was changed.
+async fn install_over(repo: &Path, file: &str, candidate: &Path, backup: &Path) -> Result<()> {
+    let real = repo.join(file);
+    if let Err(e) = tokio::fs::copy(candidate, &real).await {
+        restore(repo, file, backup).await;
+        return Err(e)
+            .with_context(|| format!("installing the new {file} into {}", real.display()));
+    }
+    Ok(())
+}
+
+/// Fail if the repo's `flake.lock` is no longer `base`, the lock a candidate was made from.
+/// A candidate carries every input at the revision it had then, so installing it over a
+/// lock that has moved on (an upgrade, a hand-run `nix flake update`) would move inputs
+/// back, or pair it with a `flake.nix` it was never evaluated against.
+pub async fn ensure_lock_unchanged(repo: &Path, base: &str) -> Result<()> {
+    let now = tokio::fs::read_to_string(repo.join("flake.lock"))
+        .await
+        .context("reading flake.lock")?;
+    anyhow::ensure!(
+        now == base,
+        "flake.lock has changed since the last check; check again before applying"
+    );
+    Ok(())
+}
+
+/// Back up the repo's `flake.nix` and install a release upgrade's rewritten one over it,
+/// returning the backup path. Unprivileged, like [`install_candidate_lock`].
+pub async fn install_candidate_flake_nix(repo: &Path, candidate: &Path) -> Result<PathBuf> {
+    let real = repo.join("flake.nix");
+    let backup: PathBuf = repo.join(format!("flake.nix.{}", timestamp()));
+    tokio::fs::copy(&real, &backup)
+        .await
+        .with_context(|| format!("backing up {} -> {}", real.display(), backup.display()))?;
+    tracing::info!("backed up flake.nix to {}", backup.display());
+    prune_old_backups(repo, "flake.nix", KEEP_BACKUPS).await;
+    install_over(repo, "flake.nix", candidate, &backup).await?;
+    Ok(backup)
+}
+
+/// Restore a lock backup taken by [`install_candidate_lock`], leaving the repo as it was —
+/// provided the lock is still the `installed` candidate. Best-effort: a failure here is
+/// logged, not propagated, since it runs on an error path.
+pub async fn restore_lock(repo: &Path, backup: &Path, installed: &Path) {
+    restore_if_untouched(repo, "flake.lock", backup, installed).await
+}
+
+/// Restore a `flake.nix` backup taken by [`install_candidate_flake_nix`], provided the file
+/// is still the `installed` candidate. Best-effort.
+pub async fn restore_flake_nix(repo: &Path, backup: &Path, installed: &Path) {
+    restore_if_untouched(repo, "flake.nix", backup, installed).await
+}
+
+/// A rebuild can run for many minutes, and the user may edit the repo meanwhile. Putting
+/// the backup back over such an edit would lose it (the backup predates it), so a file
+/// that no longer holds what was installed is left alone.
+async fn restore_if_untouched(repo: &Path, file: &str, backup: &Path, installed: &Path) {
+    let now = tokio::fs::read(repo.join(file)).await.ok();
+    let ours = tokio::fs::read(installed).await.ok();
+    if now.is_none() || now != ours {
+        tracing::warn!(
+            "{file} changed while the update ran; leaving it as it is (the previous version \
+             is in {})",
+            backup.display()
+        );
+        return;
+    }
+    restore(repo, file, backup).await
+}
+
+async fn restore(repo: &Path, file: &str, backup: &Path) {
+    let real = repo.join(file);
+    match tokio::fs::copy(backup, &real).await {
+        Ok(_) => tracing::info!("restored previous {file} from {}", backup.display()),
         Err(e) => tracing::error!(
             "could not restore {} -> {}: {e}",
             backup.display(),
-            real_lock.display()
+            real.display()
         ),
     }
 }
+
+/// `nixos-rebuild` itself failed. Its own output (nix's `error:` lines) already says why,
+/// so the privileged helper reports this without an `Error:` line of its own, which would
+/// otherwise be the last word in the log and stand in for nix's message.
+#[derive(Debug)]
+pub struct RebuildFailed(pub std::process::ExitStatus);
+
+impl std::fmt::Display for RebuildFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "nixos-rebuild switch failed with {}", self.0)
+    }
+}
+
+impl std::error::Error for RebuildFailed {}
 
 /// Privileged entry point (runs as root via pkexec): the ONE operation that requires root.
 ///
@@ -172,10 +268,20 @@ pub async fn rebuild_privileged(
     // Lead its own process group, so cancelling can take down the whole build tree.
     // `nixos-rebuild` is a thin wrapper: the actual work happens in the `nix build` it
     // spawns. Signalling only the wrapper leaves that child orphaned and still downloading.
+    //
+    // `--log-format internal-json` is passed through to nix, which then writes its progress
+    // as `@nix {json}` events instead of plain lines; the unprivileged client turns those
+    // into download and build progress (see `nun_core::progress`). A constant flag, so it
+    // widens nothing about what root evaluates or builds.
+    //
+    // `--no-update-lock-file`: a lock that does not cover `flake.nix` fails the rebuild
+    // instead of nix relocking it and writing the result into the user's repo as root.
     let mut child = Command::new("nixos-rebuild")
         .arg("switch")
         .arg("--flake")
         .arg(&flake_target)
+        .args(["--log-format", "internal-json"])
+        .arg("--no-update-lock-file")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .process_group(0)
@@ -219,10 +325,9 @@ pub async fn rebuild_privileged(
         }
     };
 
-    anyhow::ensure!(
-        status.success(),
-        "nixos-rebuild switch failed with {status}"
-    );
+    if !status.success() {
+        return Err(RebuildFailed(status).into());
+    }
 
     Ok(RebootNeeded(current_vs_booted_differs().await))
 }
@@ -369,6 +474,77 @@ mod tests {
         assert!(
             generations_differ(&profile, &current),
             "a profile pointing at a newer generation means activation has begun"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_rollback_keeps_edits_made_during_the_rebuild() {
+        let root = std::env::temp_dir().join(format!("nun-rollback-{}", std::process::id()));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let candidate = root.join("candidate.nix");
+        std::fs::write(&candidate, "upgraded").unwrap();
+        std::fs::write(repo.join("flake.nix"), "original").unwrap();
+        let backup = install_candidate_flake_nix(&repo, &candidate)
+            .await
+            .unwrap();
+
+        // Untouched since the install: rolled back.
+        restore_flake_nix(&repo, &backup, &candidate).await;
+        assert_eq!(
+            std::fs::read_to_string(repo.join("flake.nix")).unwrap(),
+            "original"
+        );
+
+        // Edited while the rebuild ran: kept.
+        let backup = install_candidate_flake_nix(&repo, &candidate)
+            .await
+            .unwrap();
+        std::fs::write(repo.join("flake.nix"), "upgraded + the user's edit").unwrap();
+        restore_flake_nix(&repo, &backup, &candidate).await;
+        assert_eq!(
+            std::fs::read_to_string(repo.join("flake.nix")).unwrap(),
+            "upgraded + the user's edit"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_candidate_is_refused_over_a_lock_that_moved_on() {
+        let repo = std::env::temp_dir().join(format!("nun-base-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("flake.lock"), "L0").unwrap();
+        ensure_lock_unchanged(&repo, "L0").await.unwrap();
+        std::fs::write(repo.join("flake.lock"), "L1").unwrap();
+        assert!(ensure_lock_unchanged(&repo, "L0").await.is_err());
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// A failed install must leave the file as it was. `/proc/self/mem` is a regular file
+    /// whose read fails (nothing is mapped at offset 0), so the copy opens and truncates the
+    /// destination and then fails: a write failing partway.
+    #[tokio::test]
+    async fn a_failed_install_leaves_the_file_as_it_was() {
+        let root = std::env::temp_dir().join(format!("nun-install-{}", std::process::id()));
+        let repo = root.join("repo");
+        let not_a_file = PathBuf::from("/proc/self/mem");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("flake.lock"), "original lock").unwrap();
+        std::fs::write(repo.join("flake.nix"), "original nix").unwrap();
+
+        assert!(install_candidate_lock(&repo, &not_a_file).await.is_err());
+        assert!(install_candidate_flake_nix(&repo, &not_a_file)
+            .await
+            .is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("flake.lock")).unwrap(),
+            "original lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("flake.nix")).unwrap(),
+            "original nix"
         );
         let _ = std::fs::remove_dir_all(root);
     }

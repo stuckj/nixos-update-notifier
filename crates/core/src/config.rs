@@ -54,6 +54,17 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nixpkgs_ref_for_changelogs: Option<String>,
 
+    /// Look for new NixOS stable releases and offer an upgrade. Only ever notifies; the
+    /// upgrade itself is a separate, explicit action.
+    #[serde(default = "default_true")]
+    pub check_releases: bool,
+
+    /// Inputs a release upgrade moves to the new release branch. The first of these the
+    /// flake has decides which release the system is on; if it is not on a `nixos-YY.MM`
+    /// branch, or is excluded, no upgrade is offered. `exclude_inputs` still wins.
+    #[serde(default = "default_release_inputs")]
+    pub release_inputs: Vec<String>,
+
     // NOTE: there is deliberately no `rebuild_extra_args` option. Arbitrary arguments
     // forwarded into root's `nixos-rebuild` (`--override-input`, `-I`, `--substituters`, …)
     // would let anything that can write this file change what root evaluates and builds —
@@ -110,6 +121,9 @@ fn default_interval_secs() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+pub fn default_release_inputs() -> Vec<String> {
+    vec!["nixpkgs".into(), "home-manager".into()]
 }
 
 impl Config {
@@ -188,6 +202,8 @@ mod tests {
             interval_secs: DEFAULT_INTERVAL_SECS,
             notify: true,
             nixpkgs_ref_for_changelogs: None,
+            check_releases: true,
+            release_inputs: default_release_inputs(),
             icons: Icons::default(),
         }
     }
@@ -240,5 +256,7 @@ mod tests {
         assert_eq!(c.interval_secs, DEFAULT_INTERVAL_SECS);
         assert!(c.notify);
         assert_eq!(c.exclude_inputs, vec!["nixpkgs-kernel"]);
+        assert!(c.check_releases);
+        assert_eq!(c.release_inputs, vec!["nixpkgs", "home-manager"]);
     }
 }

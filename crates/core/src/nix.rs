@@ -47,7 +47,7 @@ fn nix_base() -> Command {
 /// lock), so it is cheap and offline.
 pub async fn flake_input_names(flake_dir: &Path) -> Result<Vec<String>> {
     let mut c = nix_base();
-    c.args(["flake", "metadata", "--json"]);
+    c.args(["flake", "metadata", "--json", "--no-write-lock-file"]);
     c.arg(flake_dir);
     let json = run_capture(&mut c).await?;
     let meta: serde_json::Value =
@@ -180,18 +180,25 @@ pub async fn closure_names(path: &str) -> ClosureNames {
 /// downloaded. This is the offline signal we compare to decide "updates available".
 /// With `reference_lock`, the flake is evaluated against THAT lock file instead of its own.
 /// That is what lets the candidate be evaluated straight from the user's real repo — no
-/// copy of the tree required — while the repo itself stays untouched.
+/// copy of the tree required — while the repo itself stays untouched. `overrides` are
+/// `(input, flake ref)` pairs passed as `--override-input`.
 pub async fn toplevel_drv_path(
     flake_ref: &str,
     host_attr: &str,
     reference_lock: Option<&Path>,
+    overrides: &[(String, String)],
 ) -> Result<String> {
     let attr =
         format!("{flake_ref}#nixosConfigurations.{host_attr}.config.system.build.toplevel.drvPath");
     let mut c = nix_base();
-    c.args(["eval", "--raw", &attr]);
+    // nix writes a lock it had to compute back into the flake — the user's repo, whose own
+    // lock it would overwrite even when the inputs came from `reference_lock`.
+    c.args(["eval", "--raw", "--no-write-lock-file", &attr]);
     if let Some(lock) = reference_lock {
         c.arg("--reference-lock-file").arg(lock);
+    }
+    for (input, r) in overrides {
+        c.args(["--override-input", input, r]);
     }
     let out = run_capture(&mut c).await?;
     let path = out.trim().to_string();
@@ -199,6 +206,32 @@ pub async fn toplevel_drv_path(
         bail!("empty drvPath evaluating {attr}");
     }
     Ok(path)
+}
+
+/// Whether the derivation that built `path` is in the local store. A system copied in from
+/// another machine (`--target-host`, deploy tools) has no local derivation to read.
+pub async fn deriver_present(path: &str) -> bool {
+    let mut c = Command::new("nix-store");
+    c.args(["--query", "--deriver", path]);
+    match run_capture(&mut c).await {
+        Ok(out) => {
+            let drv = out.trim();
+            drv.starts_with('/') && Path::new(drv).exists()
+        }
+        Err(_) => false,
+    }
+}
+
+/// The `out` path of an instantiated derivation. Reads the `.drv`; builds nothing.
+pub async fn drv_out_path(drv: &str) -> Result<String> {
+    let mut c = Command::new("nix-store");
+    c.args(["--query", "--outputs", drv]);
+    let out = run_capture(&mut c).await?;
+    out.lines()
+        .next()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .with_context(|| format!("no outputs listed for {drv}"))
 }
 
 /// The system double this machine evaluates for, e.g. `x86_64-linux`.

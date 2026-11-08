@@ -308,3 +308,53 @@ async fn pkgs_diff_reads_structured_attrs_from_real_nix() {
     assert_eq!(bar.new, vec!["2.0"]);
     assert_eq!(bar.kind, nun_core::diff::ChangeKind::Changed);
 }
+
+/// Evaluating the user's repo must never write its `flake.lock`, even when the lock is
+/// incomplete for its `flake.nix` or a reference lock is supplied. nix writes a relocked
+/// lock back to the flake by default, and with `--reference-lock-file` the repo's own lock
+/// is the file it would overwrite.
+#[tokio::test]
+#[ignore = "requires the `nix` CLI; run in CI with --ignored"]
+async fn evaluating_the_repo_never_writes_its_lock() {
+    let dir = copy_to_temp(&fixture("hostflake"), "nowrite");
+    std::fs::write(
+        dir.join("flake.nix"),
+        r#"{
+  inputs.dep1.url = "path:./dep1";
+  inputs.dep2.url = "path:./dep2";
+  outputs = { self, ... }: {
+    nixosConfigurations.h.config.system.build.toplevel = derivation {
+      name = "toplevel"; system = "x86_64-linux"; builder = "/bin/sh";
+    };
+  };
+}
+"#,
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(dir.join("flake.lock"));
+    let repo = dir.display().to_string();
+
+    // No lock at all.
+    nun_core::nix::toplevel_drv_path(&repo, "h", None, &[])
+        .await
+        .expect("eval without a lock");
+    assert!(
+        !dir.join("flake.lock").exists(),
+        "a lock was created in the repo"
+    );
+
+    // A lock (and reference lock) that lacks dep2: nix must relock in memory only.
+    let partial = r#"{"nodes":{"dep1":{"locked":{"path":"./dep1","type":"path"},"original":{"path":"./dep1","type":"path"},"parent":[]},"root":{"inputs":{"dep1":"dep1"}}},"root":"root","version":7}"#;
+    std::fs::write(dir.join("flake.lock"), partial).unwrap();
+    let reference = dir.join("reference.lock");
+    std::fs::write(&reference, partial).unwrap();
+    nun_core::nix::toplevel_drv_path(&repo, "h", Some(&reference), &[])
+        .await
+        .expect("eval with a partial reference lock");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("flake.lock")).unwrap(),
+        partial,
+        "the repo's flake.lock was rewritten"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -16,6 +16,8 @@ let
       exclude_inputs = cfg.excludeInputs;
       interval = cfg.interval;
       notify = cfg.notify;
+      check_releases = cfg.checkReleases;
+      release_inputs = cfg.releaseInputs;
     }
     // lib.optionalAttrs (cfg.nixpkgsRefForChangelogs != null) {
       nixpkgs_ref_for_changelogs = cfg.nixpkgsRefForChangelogs;
@@ -88,6 +90,30 @@ in
       description = "Fire desktop notifications when updates appear.";
     };
 
+    checkReleases = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Look for new NixOS stable releases and offer an upgrade. Only notifies; the upgrade
+        is a separate action you start from the update window. Has no effect for a flake
+        that tracks nixos-unstable.
+      '';
+    };
+
+    releaseInputs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [
+        "nixpkgs"
+        "home-manager"
+      ];
+      description = ''
+        Inputs a release upgrade moves to the new release branch (nixos-YY.MM /
+        release-YY.MM) in flake.nix. The first of these the flake has decides which release
+        you are on; if it is not on a nixos-YY.MM branch, or is excluded, no upgrade is
+        offered. excludeInputs still wins.
+      '';
+    };
+
     nixpkgsRefForChangelogs = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
@@ -133,7 +159,12 @@ in
       };
       Service = {
         ExecStart = "${cfg.package}/bin/nixos-update-notifier run";
-        Environment = [ "PATH=${daemonPath}" ];
+        Environment = [
+          "PATH=${daemonPath}"
+          # Tells a duplicate started by the service to exit quietly, rather than open the
+          # running daemon's window the way a launch from the app menu does.
+          "NIXOS_UPDATE_NOTIFIER_SERVICE=1"
+        ];
         Restart = "on-failure";
         RestartSec = 5;
       };

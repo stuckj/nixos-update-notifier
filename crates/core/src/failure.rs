@@ -1,0 +1,311 @@
+//! Turning a failed check (or apply) into something the window can show.
+//!
+//! A failure reaches us as an `anyhow` chain whose outermost context names the step
+//! ("evaluating candidate toplevel drvPath") and whose innermost message is the captured
+//! stderr of the `nix` command that failed. Nix's useful sentence is the last `error:` line
+//! of that output; everything above it is evaluation trace.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Failure {
+    /// What was being done, e.g. "evaluating candidate toplevel drvPath".
+    pub step: String,
+    /// Nix's final `error:` line, without the prefix. Empty if there was none.
+    pub summary: String,
+    /// The full error chain, including nix's stderr, for "Show details" / "Copy".
+    pub details: String,
+    /// A one-line suggested fix, for failures we recognise.
+    pub hint: Option<String>,
+}
+
+impl Failure {
+    /// Build from an error chain. `step` is the outermost context.
+    pub fn from_error(e: &anyhow::Error) -> Self {
+        let details = format!("{e:#}");
+        let step = e.to_string();
+        let step = step
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(':');
+        let summary = last_error_line(&details).unwrap_or_default();
+        Self {
+            step: step.to_string(),
+            hint: hint_for(&details),
+            summary,
+            details,
+        }
+    }
+
+    /// Build from free-form output, e.g. the tail of the apply log.
+    pub fn from_output(step: &str, output: &str) -> Self {
+        Self {
+            step: step.to_string(),
+            summary: last_error_line(output).unwrap_or_default(),
+            details: output.to_string(),
+            hint: hint_for(output),
+        }
+    }
+
+    /// One line for a notification body: the summary if nix gave one, else the step.
+    pub fn headline(&self) -> &str {
+        if self.summary.is_empty() {
+            &self.step
+        } else {
+            &self.summary
+        }
+    }
+}
+
+/// The last non-empty `error: …` line, with the prefix removed.
+///
+/// Nix often prints a bare `error:` header followed by indented trace lines and the real
+/// message as a later, indented `error: …`, so the bare header is skipped. `Error: …` is
+/// how our own privileged helper reports (a cancelled rebuild, say), after nix is done.
+///
+/// A failed build always ends with nix reporting that the system derivation's
+/// dependencies failed. That names the system, not the cause, so such lines are passed
+/// over while anything else is available.
+pub fn last_error_line(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let errors: Vec<(usize, &str)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            let l = l.trim_start();
+            l.strip_prefix("error:")
+                .or_else(|| l.strip_prefix("Error:"))
+                .map(|e| (i, e.trim()))
+        })
+        .filter(|(_, e)| !e.is_empty())
+        .collect();
+    let propagation = |i: usize, e: &str| {
+        e.contains("dependencies of derivation")
+            || (e.starts_with("Cannot build")
+                && lines[i + 1..]
+                    .iter()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty())
+                    .is_some_and(|l| l.starts_with("Reason:") && l.contains("dependenc")))
+    };
+    errors
+        .iter()
+        .rfind(|(i, e)| !propagation(*i, e))
+        .or(errors.last())
+        .map(|(_, e)| e.to_string())
+}
+
+/// The first quoted name on the line containing `marker`. Older nixpkgs quotes with `‘…’`,
+/// newer with `'…'`.
+fn quoted_before(text: &str, marker: &str) -> Option<String> {
+    let line = text.lines().find(|l| l.contains(marker))?;
+    let start = line.find(['\'', '‘'])?;
+    let rest = &line[start..];
+    let open = rest.chars().next()?;
+    let rest = &rest[open.len_utf8()..];
+    let end = rest.find(['\'', '’'])?;
+    Some(rest[..end].to_string())
+}
+
+/// Suggest a fix for the nixpkgs refusals that account for most evaluation failures after
+/// an input bump. Wording follows the option names in the nixpkgs manual.
+pub fn hint_for(text: &str) -> Option<String> {
+    if text.contains("marked as insecure") {
+        return Some(match quoted_before(text, "marked as insecure") {
+            Some(pkg) => format!(
+                "Add \"{pkg}\" to nixpkgs.config.permittedInsecurePackages, or stop using \
+                 the package that depends on it."
+            ),
+            None => "An insecure package is refused: see \
+                     nixpkgs.config.permittedInsecurePackages."
+                .into(),
+        });
+    }
+    if text.contains("has an unfree license") {
+        let pkg = quoted_before(text, "has an unfree license");
+        return Some(match pkg {
+            Some(p) => format!(
+                "\"{p}\" is unfree: allow it with nixpkgs.config.allowUnfreePredicate \
+                 (or allowUnfree = true)."
+            ),
+            None => "An unfree package is refused: see nixpkgs.config.allowUnfree.".into(),
+        });
+    }
+    // Newer nixpkgs lists meta problems ("because it has problems:" then "- broken: …").
+    let broken = text.contains("is marked as broken")
+        || (text.contains("because it has problems")
+            && text
+                .lines()
+                .any(|l| l.trim_start().starts_with("- broken:")));
+    if broken {
+        let pkg = quoted_before(text, "is marked as broken")
+            .or_else(|| quoted_before(text, "because it has problems"));
+        return Some(match pkg {
+            Some(p) => format!(
+                "\"{p}\" is marked broken in this nixpkgs: wait for a fix, pin it from an \
+                 older nixpkgs, or set nixpkgs.config.allowBroken."
+            ),
+            None => "A package is marked broken in this nixpkgs.".into(),
+        });
+    }
+    // nix's own refusal, not the flag: nixos-rebuild echoes its failed command line, flags
+    // included, after every failed build.
+    if text.contains("requires lock file changes but they're not allowed") {
+        return Some(
+            "flake.lock does not cover every input flake.nix declares; run `nix flake lock` \
+             in the repo, then apply again."
+                .into(),
+        );
+    }
+    if text.contains("is not available on the requested hostPlatform") {
+        return Some(
+            "A package does not support this platform any more; remove it or pin it from \
+             an older nixpkgs."
+                .into(),
+        );
+    }
+    if text.contains("hash mismatch in fixed-output derivation") {
+        return Some(
+            "A fixed-output hash no longer matches what was downloaded; update the hash \
+             in your configuration (or retry if the source is flaky)."
+                .into(),
+        );
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shape of the real failure reported in issue #25.
+    const INSECURE: &str = "command \"nix\" failed (exit status: 1):
+error:
+       … while evaluating the option `system.build.toplevel':
+
+       … while evaluating definitions from `/nix/store/x-source/nixos/modules/system/activation/top-level.nix':
+
+       error: Refusing to evaluate package 'electron-42.11.18' in /nix/store/y-source/pkgs/development/tools/electron/binary/generic.nix:50 because it is marked as insecure
+
+       Known issues:
+        - Electron version 42.11.18 is EOL";
+
+    #[test]
+    fn summarises_an_insecure_package_refusal() {
+        let e = anyhow::anyhow!(INSECURE).context("evaluating candidate toplevel drvPath");
+        let f = Failure::from_error(&e);
+        assert_eq!(f.step, "evaluating candidate toplevel drvPath");
+        assert!(
+            f.summary
+                .starts_with("Refusing to evaluate package 'electron-42.11.18'"),
+            "{}",
+            f.summary
+        );
+        assert!(f.summary.ends_with("because it is marked as insecure"));
+        assert!(f.details.contains("Known issues"));
+        let hint = f.hint.expect("hint");
+        assert!(hint.contains("\"electron-42.11.18\""), "{hint}");
+        assert!(hint.contains("permittedInsecurePackages"), "{hint}");
+    }
+
+    #[test]
+    fn a_bare_error_header_is_not_the_summary() {
+        assert_eq!(last_error_line("error:\n   trace\n"), None);
+        assert_eq!(
+            last_error_line("error:\n  … x\n  error: the real one\n").as_deref(),
+            Some("the real one")
+        );
+    }
+
+    /// nixos-rebuild-ng ends a failed build with the command it ran, which carries the
+    /// rebuild's own flags; that must not read as the lock-file refusal.
+    #[test]
+    fn the_echoed_command_line_is_not_a_cause() {
+        let log = "error: hash mismatch in fixed-output derivation '/nix/store/x-src.drv':\n\
+                   Command 'nix --extra-experimental-features 'nix-command flakes' build --print-out-paths /r#nixosConfigurations.h.config.system.build.toplevel --no-update-lock-file --log-format internal-json' returned non-zero exit status 1.";
+        let hint = hint_for(log).unwrap();
+        assert!(hint.contains("fixed-output hash"), "{hint}");
+
+        let refused = "error: flake 'path:/r' requires lock file changes but they're not allowed due to '--no-update-lock-file'";
+        assert!(hint_for(refused).unwrap().contains("nix flake lock"));
+    }
+
+    #[test]
+    fn a_failed_build_is_summarised_by_its_cause_not_the_system() {
+        let old = "error: unable to download 'https://vendor.example/x.tar.gz': HTTP error 525\n\
+                   error: 1 dependencies of derivation '/nix/store/a-nixos-system-x1.drv' failed to build";
+        assert_eq!(
+            last_error_line(old).unwrap(),
+            "unable to download 'https://vendor.example/x.tar.gz': HTTP error 525"
+        );
+        let new = "error: Cannot build '/nix/store/b-foo.drv'.\n       Reason: builder failed with exit code 2.\n\
+                   error: Cannot build '/nix/store/a-nixos-system-x1.drv'.\n       Reason: 1 dependency failed.";
+        assert_eq!(
+            last_error_line(new).unwrap(),
+            "Cannot build '/nix/store/b-foo.drv'."
+        );
+        // Nothing else to go on: the propagation line is better than nothing.
+        let only = "error: 1 dependencies of derivation '/nix/store/a.drv' failed to build";
+        assert!(last_error_line(only).unwrap().contains("dependencies"));
+    }
+
+    #[test]
+    fn the_helpers_own_final_error_wins() {
+        let log = "error: interrupted by the user\nError: apply cancelled before activation; the system was not changed\n";
+        assert_eq!(
+            Failure::from_output("applying", log).summary,
+            "apply cancelled before activation; the system was not changed"
+        );
+    }
+
+    /// The tail of a failed apply log: nix's error, then the helper's own exit report.
+    #[test]
+    fn a_failed_rebuild_is_summarised_by_nix_not_by_the_exit_status() {
+        let failed =
+            crate::apply::RebuildFailed(std::os::unix::process::ExitStatusExt::from_raw(256));
+        let log = format!(
+            "error: Refusing to evaluate package 'electron-42.11.18' in /x.nix:50 because it is marked as insecure\n{failed}\n"
+        );
+        let f = Failure::from_output("applying", &log);
+        assert!(
+            f.summary.starts_with("Refusing to evaluate"),
+            "{}",
+            f.summary
+        );
+    }
+
+    #[test]
+    fn recognises_both_nixpkgs_message_styles() {
+        // nixpkgs ≥ 26.05: meta problems listed under the refusal.
+        let problems = "error: Refusing to evaluate package 'foo-1.2' in /nix/store/z.nix:1 because it has problems:\n       - broken: This package is broken.";
+        assert!(hint_for(problems).unwrap().contains("\"foo-1.2\""));
+        // Older nixpkgs: typographic quotes.
+        let old = "error: Package ‘electron-42.11.18’ in /nix/store/z.nix:50 is marked as insecure, refusing to evaluate.";
+        assert!(hint_for(old).unwrap().contains("\"electron-42.11.18\""));
+        let old = "error: Refusing to evaluate package ‘electron-42.11.18’ in /x.nix:50 because it is marked as insecure";
+        assert!(hint_for(old).unwrap().contains("\"electron-42.11.18\""));
+    }
+
+    #[test]
+    fn recognises_unfree_and_broken() {
+        let unfree = "error: Package 'slack-4.0' in /nix/store/z.nix:1 has an unfree license ('unfree'), refusing to evaluate.";
+        assert!(hint_for(unfree).unwrap().contains("\"slack-4.0\""));
+        let broken = "error: Package 'foo-1.2' in /nix/store/z.nix:1 is marked as broken, refusing to evaluate.";
+        assert!(hint_for(broken).unwrap().contains("\"foo-1.2\""));
+    }
+
+    #[test]
+    fn unrecognised_failures_get_no_hint() {
+        assert_eq!(hint_for("error: something else entirely"), None);
+        let f = Failure::from_output("applying updates", "no error lines here");
+        assert_eq!(f.summary, "");
+        assert_eq!(f.headline(), "applying updates");
+    }
+
+    #[test]
+    fn step_is_the_outermost_context_only() {
+        let e = anyhow::anyhow!("inner").context("outer step");
+        assert_eq!(Failure::from_error(&e).step, "outer step");
+    }
+}

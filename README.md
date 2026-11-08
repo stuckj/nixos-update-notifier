@@ -35,7 +35,12 @@ Settings are editable from the tray, or in `config.toml` directly.
 - **Update list** showing each change as `name: old -> new`, with a changelog link where
   nixpkgs provides one.
 - **Apply** from the menu: installs the new `flake.lock` and runs `nixos-rebuild switch`
-  behind a polkit prompt, then tells you if a reboot is warranted.
+  behind a polkit prompt, then tells you if a reboot is warranted. A progress window shows
+  downloads and builds as they happen (paths, bytes, speed) and can cancel.
+- **New NixOS releases** are announced once, and can be previewed and upgraded to from the
+  update window — a separate, explicit step that never happens as part of Apply.
+- **Failures explain themselves**: a failed check shows nix's error, a suggested fix for
+  common cases (an insecure or unfree package), and the full output to copy.
 - **Pinned inputs are never advanced** — an `exclude_inputs` list protects things like a
   rev-pinned `nixpkgs-kernel` that provides your kernel + ZFS.
 - Fully config-driven; nothing is hardcoded to a particular machine.
@@ -150,6 +155,8 @@ The home-manager module generates the config for you. Running standalone, copy
 | `exclude_inputs` | Inputs to **never** advance, e.g. a pinned kernel. |
 | `interval` | Seconds between checks (minimum 60). |
 | `notify` | Whether to show desktop notifications. |
+| `check_releases` | Look for new NixOS stable releases (default on). Notifies only; see [Release upgrades](#release-upgrades). |
+| `release_inputs` | Inputs a release upgrade moves to the new release branch. Default `["nixpkgs", "home-manager"]`. |
 | `nixpkgs_ref_for_changelogs` | Which nixpkgs to resolve changelog links against. Defaults to the one in the candidate lock — the revision the pending update would install — so links match the version offered and nothing is downloaded to read them. Override only for a flake that names its nixpkgs something else, and pin what you set. |
 | `[icons]` | Icon name per state — see the example file before changing. |
 
@@ -161,6 +168,10 @@ Settings can also be edited from the tray's **Settings** window.
 
 The tray menu covers everything: **Check now**, **View updates…**, **Apply updates**,
 **Dismiss until next check**, **Settings**, **Quit**. Left-click opens the update list.
+While an apply runs, **Show apply progress…** reopens its progress window.
+
+Only one daemon runs at a time. Starting it again (from the app menu, say) opens the running
+daemon's update window instead.
 
 There is also a CLI, useful for scripting or a quick look:
 
@@ -182,13 +193,50 @@ $ systemctl --user kill -s SIGUSR1 nixos-update-notifier.service
 `nixos-rebuild switch` behind a polkit prompt. Your previous lock is backed up first and
 restored automatically if the rebuild fails or you cancel the prompt.
 
-Those backups are written next to your lock as `flake.lock.bak.<epoch>`, and only the
-newest three are kept. They are working files, not history — git already records your
-previous locks — so add this to your config repo's `.gitignore`:
+Those backups are written next to your lock as `flake.lock.bak.<epoch>` (and
+`flake.nix.bak.<epoch>` for a release upgrade), and only the newest three of each are kept.
+They are working files, not history — git already records your previous locks — so add
+this to your config repo's `.gitignore`:
 
 ```gitignore
 flake.lock.bak.*
+flake.nix.bak.*
 ```
+
+The progress window shows how many paths have been downloaded and built, bytes and speed,
+and what is being fetched right now, and warns if downloads stop moving. **Details** has
+the full log. Cancel is safe while building and downloading.
+
+If `flake.lock` ends up ahead of the running system — an apply that never finished, or a
+hand-run `nix flake update` — the tray shows **not applied** rather than "up to date". The
+same state appears for configuration changes you have not rebuilt yet, including a new
+commit if your config embeds its git revision (`system.configurationRevision`). The update
+window (and `nixos-update-notifier check`) lists what applying would change — e.g.
+`wakeful: (new) -> 0.1.0` — or says that only configuration differs, so you can tell an
+intended edit from an accidental one. Apply rebuilds from the repo as it is. When the newest
+lock backup is exactly what is running, the update window also offers **Revert
+flake.lock**, which puts it back (backing up the current lock first).
+
+### Release upgrades
+
+When a new NixOS stable release is out (from the first day of the month after its
+release), you get one notification, and the update window shows it above the package list
+with a choice of target if several are newer than yours. **Preview upgrade** moves the
+release inputs (`release_inputs`, minus `exclude_inputs`) from e.g. `nixos-26.05` to
+`nixos-26.11` and `release-26.05` to `release-26.11` in a copy of `flake.nix`, relocks
+them, and shows the package diff — nothing in your repo changes. **Upgrade to NixOS …**
+then backs up and installs the new `flake.nix` and `flake.lock` and runs the rebuild; both
+are restored if it fails.
+
+- `system.stateVersion` / `home.stateVersion` are never changed, and should not be.
+- Read the release notes first: releases often need configuration changes. Upgrading one
+  release at a time is safest, since removed options usually warn for one release first.
+- Only literal branch names are rewritten. If yours are built from a variable, or another
+  input tracks the same branch but is not being upgraded, the preview says so and you
+  change `flake.nix` by hand.
+- The release you are on is read from the first of `release_inputs` (normally nixpkgs). A
+  flake whose nixpkgs tracks `nixos-unstable` or a `-small` channel, or excludes it, is not
+  offered an upgrade. Turn the check off with `check_releases = false`.
 
 If you want to see what a rebuild would do before trusting it:
 
@@ -226,7 +274,9 @@ the more informative check.
 | **Checking** | A check is running. |
 | **Configuration changes** | Inputs moved, but no package changed version — usually a module regenerating its config. Safe to apply, not urgent. |
 | **Updates available** | One or more packages changed version. The window lists them. |
-| **Error** | The check failed; see `journalctl --user -u nixos-update-notifier`. |
+| **Applying** | A rebuild is running. Checks wait until it finishes. |
+| **Not applied** | Nothing newer upstream, but your flake (lock or config) is not what is running. Apply rebuilds it. |
+| **Error** | The last check or apply failed. The update window shows why, with a suggested fix where one is known. |
 
 A **⚠ input skipped** banner in the update window means one of your flake inputs could not
 be advanced (e.g. a local fork whose repo has moved). The rest were still checked — but
@@ -270,8 +320,11 @@ part of Plasma. Verify the service is up with
 **The update window says "Daemon not running".** The GTK window is a client; start the
 service with `systemctl --user start nixos-update-notifier`.
 
-**Checks fail.** Look at `journalctl --user -u nixos-update-notifier -e`. A common cause is
-a flake input that can't be fetched — that now appears as a ⚠ banner naming the input.
+**Checks fail.** Open **View updates…**: it shows the step that failed and nix's error,
+with **Show details** / **Copy** for the full output (also in
+`journalctl --user -u nixos-update-notifier -e`). A common cause after a nixpkgs bump is a
+package marked insecure or unfree, for which the window suggests the setting to change. A
+flake input that can't be fetched appears as a ⚠ banner naming the input.
 
 **A check takes a long time.** The first check after a reboot evaluates your whole system
 config and can take a minute or more. The tray stays responsive throughout.

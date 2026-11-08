@@ -10,6 +10,9 @@ use gtk::prelude::*;
 use gtk::{glib, Align, Application, ApplicationWindow, Orientation};
 use nun_core::config::Config;
 use nun_core::diff::{ChangeKind, PackageChange};
+use nun_core::failure::Failure;
+use nun_core::ipc::{ApplyState, Details, UpgradeState};
+use nun_core::progress::{act, human_bytes, Progress, RateMeter};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -64,8 +67,11 @@ fn build_updates_window(app: &Application) {
         Vec<PackageChange>,
         Vec<(String, String)>,
         Option<u64>,
+        Details,
     );
     let rendered: Rc<RefCell<Option<Rendered>>> = Rc::new(RefCell::new(None));
+    // The release picked in the upgrade section, kept across repaints of the list.
+    let selected_release: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
     // Rebuild the list from the daemon's current state. Cloneable so we can hand it to
     // several button handlers and a periodic poll.
@@ -82,6 +88,7 @@ fn build_updates_window(app: &Application) {
                     c.updates().unwrap_or_default(),
                     c.warnings().unwrap_or_default(),
                     c.last_check(),
+                    c.details(),
                 );
                 if rendered.borrow().as_ref() == Some(&now) {
                     return;
@@ -105,6 +112,25 @@ fn build_updates_window(app: &Application) {
                 Some(c) => match c.updates() {
                     Ok(changes) => {
                         let status = c.status().map(|(s, _)| s).unwrap_or_default();
+                        let details = c.details();
+
+                        // A new release is a separate decision from the package list, so it
+                        // gets its own section above it.
+                        if let Some(b) = release_box(c, &details, &selected_release) {
+                            list.append(&b);
+                        }
+
+                        // Why the last apply failed. The tray moves on to a fresh check
+                        // straight after, so without this the reason is only in the log.
+                        if status != "applying" {
+                            if let Some(f) = &details.apply.failure {
+                                let title = match details.apply.state {
+                                    ApplyState::PartlyApplied => "Last apply only partly completed",
+                                    _ => "Last apply failed",
+                                };
+                                list.append(&failure_box(title, f));
+                            }
+                        }
 
                         // Surface skipped inputs prominently: "no updates" (or any count)
                         // means something different if an input could not be advanced at
@@ -112,18 +138,18 @@ fn build_updates_window(app: &Application) {
                         for (name, reason) in c.warnings().unwrap_or_default() {
                             let w = gtk::Label::new(None);
                             w.set_markup(&format!(
-                                "<b>⚠ input '{}' was skipped</b>\n<small>{}</small>",
+                                "<b>Input '{}' was skipped</b>\n<small>{}</small>",
                                 glib::markup_escape_text(&name),
                                 glib::markup_escape_text(&reason)
                             ));
                             w.set_wrap(true);
                             w.set_xalign(0.0);
-                            w.set_margin_start(8);
-                            w.set_margin_end(8);
-                            w.set_margin_top(8);
-                            w.set_margin_bottom(8);
-                            w.add_css_class("warning");
-                            list.append(&w);
+                            let row = flagged("dialog-warning-symbolic", "warning", &w);
+                            row.set_margin_start(8);
+                            row.set_margin_end(8);
+                            row.set_margin_top(8);
+                            row.set_margin_bottom(8);
+                            list.append(&row);
                         }
 
                         // An empty list is ambiguous on its own, so let the daemon's status
@@ -131,7 +157,108 @@ fn build_updates_window(app: &Application) {
                         // without changing any package version (a flake rev bump with no
                         // rebuilt packages) — there IS something to apply, and saying "no
                         // pending updates" here would flatly contradict the tray icon.
+                        if details.running_differs && !changes.is_empty() {
+                            let note = note_label(
+                                "<b>Your running system is not built from the current \
+                                 flake.lock either.</b>\n<small>The list below shows only \
+                                 what the newer inputs change; applying also builds what is \
+                                 already in the repo.</small>",
+                                "",
+                            );
+                            // The row carries the margins, so the icon lines up with the text.
+                            note.set_margin_start(0);
+                            note.set_margin_end(0);
+                            note.set_margin_top(0);
+                            note.set_margin_bottom(0);
+                            let row = flagged("dialog-warning-symbolic", "warning", &note);
+                            row.set_margin_start(8);
+                            row.set_margin_end(8);
+                            row.set_margin_top(8);
+                            row.set_margin_bottom(8);
+                            list.append(&row);
+                        }
+
+                        // Rows that belong below the explanatory note rather than above it.
+                        let mut after_note: Vec<gtk::Widget> = Vec::new();
                         let (heading, empty_note) = match (status.as_str(), changes.is_empty()) {
+                            ("applying", _) => {
+                                let open = gtk::Button::with_label("Show progress");
+                                open.set_halign(Align::Center);
+                                open.connect_clicked(|_| open_progress_window());
+                                list.append(&open);
+                                (
+                                    "An apply is in progress".to_string(),
+                                    Some("Checks are paused until it finishes."),
+                                )
+                            }
+                            ("not-applied", _) => {
+                                if details.can_revert_lock {
+                                    let revert = gtk::Button::with_label("Revert flake.lock");
+                                    revert.set_tooltip_text(Some(
+                                        "Put the previous flake.lock back. The current one is \
+                                         backed up first.",
+                                    ));
+                                    revert.set_halign(Align::Center);
+                                    let c = c.clone();
+                                    revert.connect_clicked(move |_| {
+                                        let _ = c.revert_lock();
+                                    });
+                                    list.append(&revert);
+                                }
+                                // What applying would change, so an intended edit can be told
+                                // from an accidental one before clicking Apply.
+                                match &details.unapplied {
+                                    Some(u) if u.error.is_some() => after_note.push(
+                                        note_label(
+                                            &format!(
+                                                "<b>Could not list what differs.</b>\n<small>{}</small>",
+                                                glib::markup_escape_text(
+                                                    u.error.as_deref().unwrap_or_default()
+                                                )
+                                            ),
+                                            "dim-label",
+                                        )
+                                        .upcast(),
+                                    ),
+                                    Some(u) if u.changes.is_empty() => after_note.push(
+                                        note_label(
+                                            "<b>No package changes; only configuration differs.</b>",
+                                            "",
+                                        )
+                                        .upcast(),
+                                    ),
+                                    Some(u) => {
+                                        after_note.push(
+                                            note_label(
+                                                &format!(
+                                                    "<b>Applying would change {} package(s):</b>",
+                                                    u.changes.len()
+                                                ),
+                                                "",
+                                            )
+                                            .upcast(),
+                                        );
+                                        let mut ordered: Vec<&PackageChange> =
+                                            u.changes.iter().collect();
+                                        ordered.sort_by_key(|c| (!c.runtime, c.name.clone()));
+                                        after_note
+                                            .extend(ordered.into_iter().map(|c| update_row(c).upcast()));
+                                    }
+                                    None => {}
+                                }
+                                (
+                                    "Your flake is not what is running".to_string(),
+                                    Some(
+                                        "No newer updates, but your flake describes a different \
+                                         system from the one running.\nUsually flake.lock was \
+                                         updated without a switch (an apply that did not finish, \
+                                         or a hand-run `nix flake update`),\nor configuration \
+                                         changes have not been rebuilt yet — including a new \
+                                         commit, if your config embeds its git revision.\n\
+                                         Apply rebuilds from the repo as it is now.",
+                                    ),
+                                )
+                            }
                             ("system-changes", _) => (
                                 "Configuration changes — no package updates".to_string(),
                                 Some(
@@ -151,10 +278,21 @@ fn build_updates_window(app: &Application) {
                                 "Checking for updates…".to_string(),
                                 Some("The daemon is evaluating your flake."),
                             ),
-                            ("error", true) => (
-                                "Last check failed".to_string(),
-                                Some("See the daemon log; press Check now to retry."),
-                            ),
+                            ("error", true) => match &details.check_failure {
+                                Some(f) => {
+                                    list.append(&failure_box("Why it failed", f));
+                                    ("Last check failed".to_string(), None)
+                                }
+                                // An apply failure is shown above; anything else is in the
+                                // daemon's log.
+                                None if details.apply.failure.is_some() => {
+                                    ("Last apply failed".to_string(), None)
+                                }
+                                None => (
+                                    "Last check failed".to_string(),
+                                    Some("See the daemon log; press Check now to retry."),
+                                ),
+                            },
                             // "Up to date" is a claim about a check that happened. Before the
                             // first one completes there is nothing to base it on, and the
                             // window is reachable from the tray at any time — including
@@ -192,6 +330,9 @@ fn build_updates_window(app: &Application) {
                             row.set_margin_bottom(16);
                             row.set_justify(gtk::Justification::Center);
                             list.append(&row);
+                        }
+                        for w in &after_note {
+                            list.append(w);
                         }
                         // Updates to installed software first — that is what the user came
                         // to read; build-time churn is context, not the headline.
@@ -236,15 +377,34 @@ fn build_updates_window(app: &Application) {
 
     // Buttons: Check now (trigger a daemon check), Apply, Refresh.
     let check_btn = gtk::Button::with_label("Check now");
+    let check_spinner = gtk::Spinner::new();
+    let check_label = gtk::Label::new(Some("Checking…"));
+    check_label.add_css_class("dim-label");
+    check_spinner.set_visible(false);
+    check_label.set_visible(false);
+    // Reflect the daemon's status on the button: a check takes from seconds to minutes, so
+    // the feedback has to come from the daemon, not a timer.
+    let show_status = {
+        let check_btn = check_btn.clone();
+        let check_spinner = check_spinner.clone();
+        let check_label = check_label.clone();
+        move |status: &str| {
+            let (checking, sensitive) = check_indicator(status);
+            check_spinner.set_visible(checking);
+            check_spinner.set_spinning(checking);
+            check_label.set_visible(checking);
+            check_btn.set_sensitive(sensitive);
+        }
+    };
     {
         let client = client.clone();
-        let refresh = refresh.clone();
+        let show_status = show_status.clone();
         check_btn.connect_clicked(move |_| {
-            if let Some(c) = &client {
-                let _ = c.check_now();
+            // Until the next status poll confirms it — and only if the daemon took the
+            // request, or nothing would ever clear it.
+            if client.as_ref().is_some_and(|c| c.check_now().is_ok()) {
+                show_status("checking");
             }
-            // Give the daemon a moment to finish, then repaint.
-            glib::timeout_add_local_once(Duration::from_millis(1500), refresh.clone());
         });
     }
 
@@ -273,6 +433,34 @@ fn build_updates_window(app: &Application) {
             glib::ControlFlow::Continue
         });
     }
+    // A cheaper, quicker poll of the status alone, for the check indicator; a change of
+    // status (a check finishing, say) repaints the list straight away.
+    {
+        let client = client.clone();
+        let refresh = refresh.clone();
+        let last: RefCell<Option<String>> = RefCell::new(None);
+        let again = std::cell::Cell::new(false);
+        glib::timeout_add_local(Duration::from_millis(500), move || {
+            // An unreachable daemon is not checking: the indicator must not outlive it.
+            let status = client
+                .as_ref()
+                .and_then(|c| c.status().ok())
+                .map(|(s, _)| s)
+                .unwrap_or_default();
+            show_status(&status);
+            let changed = last.borrow().as_deref() != Some(status.as_str());
+            if changed {
+                *last.borrow_mut() = Some(status);
+            }
+            // The daemon publishes a check's status a moment before its lists, so a change
+            // is repainted on this tick and once more on the next.
+            let changed_last_tick = again.replace(changed);
+            if changed || changed_last_tick {
+                refresh();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 
     let buttons = gtk::Box::new(Orientation::Horizontal, 8);
     buttons.set_margin_start(8);
@@ -280,6 +468,8 @@ fn build_updates_window(app: &Application) {
     buttons.set_margin_top(4);
     buttons.set_margin_bottom(8);
     buttons.append(&check_btn);
+    buttons.append(&check_spinner);
+    buttons.append(&check_label);
     buttons.append(&apply_btn);
     let spacer = gtk::Box::new(Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
@@ -327,6 +517,331 @@ fn relative_time(epoch_secs: u64) -> String {
             format!("{d} day{} ago", if d == 1 { "" } else { "s" })
         }
     }
+}
+
+/// A wrapped, left-aligned label in the list's margins.
+fn note_label(markup: &str, css: &str) -> gtk::Label {
+    let l = gtk::Label::new(None);
+    l.set_markup(markup);
+    l.set_wrap(true);
+    l.set_xalign(0.0);
+    l.set_margin_start(8);
+    l.set_margin_end(8);
+    l.set_margin_top(8);
+    l.set_margin_bottom(8);
+    if !css.is_empty() {
+        l.add_css_class(css);
+    }
+    l
+}
+
+/// For a daemon status (empty when the daemon cannot be reached): whether a check is
+/// running, and whether "Check now" can be clicked. The daemon ignores a check request
+/// during a check or an apply.
+fn check_indicator(status: &str) -> (bool, bool) {
+    let checking = status == "checking";
+    (checking, !checking && status != "applying")
+}
+
+/// `content` led by a symbolic icon in the theme's `error` or `warning` colour.
+///
+/// The colour goes on the icon only. Themes' error and warning colours are not chosen for
+/// small text and can fall well short of readable contrast as text (Breeze Dark's error
+/// red on its window background is about 3.2:1), while the theme's foreground colour is
+/// always readable; an icon needs less contrast to be seen.
+fn flagged(icon: &str, css: &str, content: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let row = gtk::Box::new(Orientation::Horizontal, 6);
+    let image = gtk::Image::from_icon_name(icon);
+    image.add_css_class(css);
+    image.set_valign(Align::Start);
+    row.append(&image);
+    content.set_hexpand(true);
+    row.append(content);
+    row
+}
+
+/// What went wrong, in the order a reader needs it: which step, nix's own error line, a
+/// suggested fix when we recognise the failure, and the full output behind "Show details"
+/// with a Copy button for pasting into an issue.
+fn failure_box(title: &str, f: &Failure) -> gtk::Box {
+    let b = gtk::Box::new(Orientation::Vertical, 4);
+    b.set_margin_start(8);
+    b.set_margin_end(8);
+    b.set_margin_top(8);
+    b.set_margin_bottom(8);
+
+    let head = gtk::Label::new(None);
+    head.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(title)));
+    head.set_xalign(0.0);
+    head.set_wrap(true);
+    b.append(&flagged("dialog-error-symbolic", "error", &head));
+    if !f.step.is_empty() {
+        let step = gtk::Label::new(None);
+        step.set_markup(&format!(
+            "<small>While {}:</small>",
+            glib::markup_escape_text(&f.step)
+        ));
+        step.set_xalign(0.0);
+        step.set_wrap(true);
+        b.append(&step);
+    }
+
+    if !f.summary.is_empty() {
+        let s = gtk::Label::new(Some(&f.summary));
+        s.set_xalign(0.0);
+        s.set_wrap(true);
+        s.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        s.set_selectable(true);
+        b.append(&s);
+    }
+    if let Some(h) = &f.hint {
+        let l = gtk::Label::new(None);
+        l.set_markup(&format!("<b>Fix:</b> {}", glib::markup_escape_text(h)));
+        l.set_xalign(0.0);
+        l.set_wrap(true);
+        l.set_selectable(true);
+        b.append(&l);
+    }
+
+    let buffer = gtk::TextBuffer::new(None);
+    buffer.set_text(&f.details);
+    let view = gtk::TextView::with_buffer(&buffer);
+    view.set_editable(false);
+    view.set_monospace(true);
+    view.set_wrap_mode(gtk::WrapMode::WordChar);
+    let scroller = gtk::ScrolledWindow::builder()
+        .min_content_height(200)
+        .child(&view)
+        .build();
+    let copy = gtk::Button::with_label("Copy");
+    copy.set_halign(Align::Start);
+    {
+        let details = f.details.clone();
+        copy.connect_clicked(move |btn| btn.clipboard().set_text(&details));
+    }
+    let inner = gtk::Box::new(Orientation::Vertical, 4);
+    inner.append(&scroller);
+    inner.append(&copy);
+    let expander = gtk::Expander::new(Some("Show details"));
+    expander.set_child(Some(&inner));
+    b.append(&expander);
+    b
+}
+
+/// Open the apply progress window: another instance of this client, which GTK hands to an
+/// already-open window if there is one.
+fn open_progress_window() {
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if let Ok(mut child) = std::process::Command::new(exe).arg("progress").spawn() {
+                // Reaped off the main loop so the window never leaves a zombie behind.
+                std::thread::spawn(move || child.wait());
+            }
+        }
+        Err(e) => eprintln!("could not locate own executable: {e}"),
+    }
+}
+
+/// The release upgrade section: a newer NixOS release, a choice of target, and the
+/// preview → upgrade flow. `None` when there is nothing to show.
+fn release_box(
+    client: &Rc<Client>,
+    details: &Details,
+    selected: &Rc<RefCell<Option<String>>>,
+) -> Option<gtk::Box> {
+    let offer = details.release.as_ref();
+    let upgrade = &details.upgrade;
+    if offer.is_none() && upgrade.state == UpgradeState::None {
+        return None;
+    }
+    let b = gtk::Box::new(Orientation::Vertical, 6);
+    b.set_margin_start(8);
+    b.set_margin_end(8);
+    b.set_margin_top(8);
+    b.set_margin_bottom(12);
+
+    if let Some(offer) = offer {
+        // Dismissed: a single quiet line, so it can still be reached deliberately.
+        let quiet = details.release_dismissed && upgrade.state == UpgradeState::None;
+        let support = if offer.current_eol {
+            " — <b>your release is no longer supported</b>"
+        } else {
+            ""
+        };
+        let head = gtk::Label::new(None);
+        head.set_markup(&format!(
+            "{}NixOS {} is available{}</span> (you are on {}{support})",
+            if quiet {
+                "<span>"
+            } else {
+                "<span size='large' weight='bold'>"
+            },
+            glib::markup_escape_text(offer.newest()),
+            if quiet { " (dismissed)" } else { "" },
+            glib::markup_escape_text(&offer.current),
+        ));
+        head.set_xalign(0.0);
+        head.set_wrap(true);
+        if quiet {
+            head.add_css_class("dim-label");
+        }
+        b.append(&head);
+
+        if !quiet {
+            let note = gtk::Label::new(Some(
+                "Upgrading moves your release inputs (nixpkgs, home-manager) to the new \
+                 release branch in flake.nix, then shows what would change before anything \
+                 is applied. system.stateVersion is not changed, and should not be. \
+                 Releases often need configuration changes, so read the release notes first.",
+            ));
+            note.set_xalign(0.0);
+            note.set_wrap(true);
+            b.append(&note);
+        }
+
+        let row = gtk::Box::new(Orientation::Horizontal, 8);
+        let versions: Vec<String> = offer.choices.iter().map(|c| c.version.clone()).collect();
+        let labels: Vec<String> = offer
+            .choices
+            .iter()
+            .map(|c| {
+                let mut l = format!("NixOS {}", c.version);
+                if c.next && offer.choices.len() > 1 {
+                    l.push_str(" — next release (one at a time is safest)");
+                }
+                if c.eol {
+                    l.push_str(" — end of life");
+                }
+                l
+            })
+            .collect();
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let dropdown = gtk::DropDown::from_strings(&label_refs);
+        // Default to the newest, unless the user picked something earlier.
+        let pick = selected
+            .borrow()
+            .as_ref()
+            .and_then(|s| versions.iter().position(|v| v == s))
+            .unwrap_or(versions.len().saturating_sub(1));
+        dropdown.set_selected(pick as u32);
+        {
+            let selected = selected.clone();
+            let versions = versions.clone();
+            dropdown.connect_selected_notify(move |d| {
+                *selected.borrow_mut() = versions.get(d.selected() as usize).cloned();
+            });
+        }
+        if versions.len() > 1 {
+            row.append(&dropdown);
+        }
+
+        let preview = gtk::Button::with_label(if versions.len() > 1 {
+            "Preview upgrade"
+        } else {
+            "Preview upgrade…"
+        });
+        preview.set_sensitive(upgrade.state != UpgradeState::Previewing);
+        {
+            let client = client.clone();
+            let dropdown = dropdown.clone();
+            preview.connect_clicked(move |_| {
+                if let Some(v) = versions.get(dropdown.selected() as usize) {
+                    let _ = client.preview_upgrade(v);
+                }
+            });
+        }
+        row.append(&preview);
+
+        let notes = gtk::LinkButton::builder()
+            .uri(&offer.notes_url)
+            .label("Release notes")
+            .build();
+        row.append(&notes);
+
+        if !details.release_dismissed {
+            let dismiss = gtk::Button::with_label("Dismiss");
+            dismiss.set_tooltip_text(Some("Don't mention this release again"));
+            let client = client.clone();
+            dismiss.connect_clicked(move |_| {
+                let _ = client.dismiss_release();
+            });
+            row.append(&dismiss);
+        }
+        b.append(&row);
+    }
+
+    match upgrade.state {
+        UpgradeState::None => {}
+        UpgradeState::Previewing => {
+            let row = gtk::Box::new(Orientation::Horizontal, 8);
+            let spinner = gtk::Spinner::new();
+            spinner.start();
+            row.append(&spinner);
+            row.append(&gtk::Label::new(Some(&format!(
+                "Evaluating your system on NixOS {}… (this downloads the new nixpkgs source)",
+                upgrade.target
+            ))));
+            b.append(&row);
+        }
+        UpgradeState::Failed => {
+            if let Some(f) = &upgrade.failure {
+                b.append(&failure_box(
+                    &format!("Could not prepare the upgrade to NixOS {}", upgrade.target),
+                    f,
+                ));
+            }
+        }
+        UpgradeState::Ready => {
+            let moved: Vec<String> = upgrade
+                .retargeted
+                .iter()
+                .map(|(input, old, new)| format!("{input}: {old} → {new}"))
+                .collect();
+            let installed = upgrade.changes.iter().filter(|c| c.runtime).count();
+            let summary = gtk::Label::new(None);
+            summary.set_markup(&format!(
+                "<b>Upgrade to NixOS {}</b>: {} package change(s), {installed} to installed \
+                 software.\n<small>flake.nix: {}</small>",
+                glib::markup_escape_text(&upgrade.target),
+                upgrade.changes.len(),
+                glib::markup_escape_text(&moved.join(", ")),
+            ));
+            summary.set_xalign(0.0);
+            summary.set_wrap(true);
+            b.append(&summary);
+
+            let changes = gtk::ListBox::new();
+            changes.set_selection_mode(gtk::SelectionMode::None);
+            let mut ordered: Vec<&PackageChange> = upgrade.changes.iter().collect();
+            ordered.sort_by_key(|c| (!c.runtime, c.name.clone()));
+            for c in ordered {
+                changes.append(&update_row(c));
+            }
+            let scroller = gtk::ScrolledWindow::builder()
+                .min_content_height(240)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .child(&changes)
+                .build();
+            let expander = gtk::Expander::new(Some("Show changes"));
+            expander.set_child(Some(&scroller));
+            b.append(&expander);
+
+            let go = gtk::Button::with_label(&format!("Upgrade to NixOS {}…", upgrade.target));
+            go.add_css_class("suggested-action");
+            go.set_halign(Align::Start);
+            go.set_tooltip_text(Some(
+                "Backs up flake.nix and flake.lock, installs the new ones, and runs \
+                 nixos-rebuild switch. Both files are restored if the rebuild fails.",
+            ));
+            let client = client.clone();
+            go.connect_clicked(move |_| {
+                let _ = client.upgrade();
+            });
+            b.append(&go);
+        }
+    }
+    b.append(&gtk::Separator::new(Orientation::Horizontal));
+    Some(b)
 }
 
 fn update_row(change: &PackageChange) -> gtk::Box {
@@ -462,7 +977,18 @@ fn build_settings_window(app: &Application, config_path: &std::path::Path) {
     }
 
     let status = gtk::Label::new(None);
-    status.set_halign(Align::Start);
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.set_hexpand(true);
+    // The outcome's colour goes on this icon, as in `flagged`; the text stays readable.
+    let status_icon = gtk::Image::new();
+    status_icon.set_valign(Align::Start);
+    status_icon.set_visible(false);
+    let status_row = gtk::Box::new(Orientation::Horizontal, 6);
+    status_row.append(&status_icon);
+    status_row.append(&status);
+    status_row.set_margin_start(12);
+    status_row.set_margin_end(12);
 
     let save = gtk::Button::with_label("Save");
     save.add_css_class("suggested-action");
@@ -471,8 +997,9 @@ fn build_settings_window(app: &Application, config_path: &std::path::Path) {
         let entries = entries.clone();
         let config_path = config_path.to_path_buf();
         let status = status.clone();
+        let status_icon = status_icon.clone();
         save.connect_clicked(move |_| {
-            match entries.to_config().and_then(|c| {
+            let result = entries.to_config().and_then(|c| {
                 let text = toml::to_string_pretty(&c).context("serializing config")?;
                 if let Some(parent) = config_path.parent() {
                     std::fs::create_dir_all(parent).ok();
@@ -480,16 +1007,21 @@ fn build_settings_window(app: &Application, config_path: &std::path::Path) {
                 std::fs::write(&config_path, text)
                     .with_context(|| format!("writing {}", config_path.display()))?;
                 Ok::<_, anyhow::Error>(())
-            }) {
-                Ok(()) => status.set_markup(
-                    "<span foreground='green'>Saved. Changes apply on the next check \
-                 (restart the service to change the interval).</span>",
+            });
+            let (icon, css, text) = match result {
+                Ok(()) => (
+                    "object-select-symbolic",
+                    "success",
+                    "Saved. Changes apply on the next check (restart the service to change \
+                     the interval)."
+                        .to_string(),
                 ),
-                Err(e) => status.set_markup(&format!(
-                    "<span foreground='red'>{}</span>",
-                    glib::markup_escape_text(&e.to_string())
-                )),
-            }
+                Err(e) => ("dialog-error-symbolic", "error", e.to_string()),
+            };
+            status_icon.set_icon_name(Some(icon));
+            status_icon.set_css_classes(&[css]);
+            status_icon.set_visible(true);
+            status.set_text(&text);
         });
     }
 
@@ -503,7 +1035,7 @@ fn build_settings_window(app: &Application, config_path: &std::path::Path) {
 
     let vbox = gtk::Box::new(Orientation::Vertical, 12);
     vbox.append(&grid);
-    vbox.append(&status);
+    vbox.append(&status_row);
     vbox.append(&buttons);
     vbox.set_margin_start(4);
     vbox.set_margin_end(4);
@@ -527,8 +1059,10 @@ struct SettingsEntries {
     interval_secs: gtk::Entry,
     notify: gtk::Switch,
     nixpkgs_ref: gtk::Entry,
+    check_releases: gtk::Switch,
     // Fields the form doesn't expose but must not clobber on Save.
     preserved_icons: nun_core::config::Icons,
+    preserved_release_inputs: Vec<String>,
 }
 
 impl SettingsEntries {
@@ -561,7 +1095,16 @@ impl SettingsEntries {
                 cfg.and_then(|c| c.nixpkgs_ref_for_changelogs.clone())
                     .unwrap_or_default(),
             ),
+            check_releases: {
+                let s = gtk::Switch::new();
+                s.set_active(cfg.map(|c| c.check_releases).unwrap_or(true));
+                s.set_halign(Align::Start);
+                s
+            },
             preserved_icons: cfg.map(|c| c.icons.clone()).unwrap_or_default(),
+            preserved_release_inputs: cfg
+                .map(|c| c.release_inputs.clone())
+                .unwrap_or_else(nun_core::config::default_release_inputs),
         }
     }
 
@@ -582,6 +1125,10 @@ impl SettingsEntries {
             (
                 "nixpkgs ref for changelogs",
                 self.nixpkgs_ref.clone().upcast(),
+            ),
+            (
+                "Check for new NixOS releases",
+                self.check_releases.clone().upcast(),
             ),
         ]
     }
@@ -612,6 +1159,8 @@ impl SettingsEntries {
             } else {
                 Some(nixpkgs)
             },
+            check_releases: self.check_releases.is_active(),
+            release_inputs: self.preserved_release_inputs.clone(),
             icons: self.preserved_icons.clone(),
         })
     }
@@ -657,11 +1206,44 @@ fn build_progress_window(app: &Application) {
     subtitle.set_margin_bottom(4);
     subtitle.add_css_class("dim-label");
 
-    // Indeterminate: nixos-rebuild gives no machine-readable overall progress, and inventing
-    // a percentage would be a lie. It pulses only while the apply is actually running.
-    let bar = gtk::ProgressBar::new();
-    bar.set_margin_start(12);
-    bar.set_margin_end(12);
+    // Downloads and builds, each with a count line and a bar. Filled from nix's progress
+    // events; before any arrive (evaluation, the polkit prompt) the first bar just pulses.
+    let progress_label = |text: &str| {
+        let l = gtk::Label::new(Some(text));
+        l.set_halign(Align::Start);
+        l.set_margin_start(12);
+        l.set_margin_end(12);
+        l.set_wrap(true);
+        l.set_xalign(0.0);
+        l
+    };
+    let new_bar = || {
+        let b = gtk::ProgressBar::new();
+        b.set_margin_start(12);
+        b.set_margin_end(12);
+        b
+    };
+    let downloads = progress_label("");
+    let bar = new_bar();
+    let builds = progress_label("");
+    let builds_bar = new_bar();
+    let current = progress_label("");
+    current.add_css_class("dim-label");
+    current.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    current.set_wrap(false);
+    current.set_lines(4);
+    let stall = progress_label("");
+    stall.set_margin_start(0);
+    let stall_row = flagged("dialog-warning-symbolic", "warning", &stall);
+    stall_row.set_margin_start(12);
+    stall
+        .bind_property("visible", &stall_row, "visible")
+        .sync_create()
+        .build();
+    for w in [&downloads, &builds, &current, &stall] {
+        w.set_visible(false);
+    }
+    builds_bar.set_visible(false);
 
     // The rebuild's output, collapsed by default — the same shape as the Ubuntu updater's
     // details pane.
@@ -695,14 +1277,18 @@ fn build_progress_window(app: &Application) {
     buttons.append(&cancel);
     buttons.append(&close);
 
+    // Set once Cancel is clicked, so the poll does not offer it again for the same apply.
+    let cancel_requested = Rc::new(std::cell::Cell::new(false));
     {
         let client = client.clone();
         let cancel_btn = cancel.clone();
         let subtitle = subtitle.clone();
+        let cancel_requested = cancel_requested.clone();
         cancel.connect_clicked(move |_| {
             if let Some(c) = &client {
                 let _ = c.cancel_apply();
             }
+            cancel_requested.set(true);
             // Cancellation is cooperative and may be declined during activation, so say
             // "requested" rather than claiming it stopped.
             cancel_btn.set_sensitive(false);
@@ -716,7 +1302,12 @@ fn build_progress_window(app: &Application) {
     let vbox = gtk::Box::new(Orientation::Vertical, 6);
     vbox.append(&heading);
     vbox.append(&subtitle);
+    vbox.append(&downloads);
     vbox.append(&bar);
+    vbox.append(&builds);
+    vbox.append(&builds_bar);
+    vbox.append(&current);
+    vbox.append(&stall_row);
     vbox.append(&expander);
     vbox.append(&buttons);
 
@@ -733,11 +1324,16 @@ fn build_progress_window(app: &Application) {
         close.connect_clicked(move |_| window.close());
     }
 
-    // Tail the log and follow the daemon's status. Reading from a byte offset means the
-    // window can be opened, closed and reopened during a long apply without replaying or
-    // losing output.
+    // Tail the log and follow the daemon's apply. Reading from a byte offset means the
+    // window can be opened, closed and reopened during a long apply without losing output;
+    // a reopened window replays the log from the start, which rebuilds the totals.
     let log_path = client.as_ref().and_then(|c| c.apply_log().ok());
-    let offset = Rc::new(RefCell::new(0u64));
+    let tail = Rc::new(RefCell::new(LogTail::default()));
+    // The apply this window is showing. Status alone cannot say which apply has finished:
+    // a window still open from a cancelled apply would read a later apply's progress as
+    // its own and report "finished" while the new rebuild is still running.
+    let followed: Rc<RefCell<Option<u64>>> = Rc::new(RefCell::new(None));
+    let started = std::time::Instant::now();
 
     {
         let client = client.clone();
@@ -745,35 +1341,91 @@ fn build_progress_window(app: &Application) {
         let scroller = scroller.clone();
         let heading = heading.clone();
         let subtitle = subtitle.clone();
-        let bar = bar.clone();
         let cancel = cancel.clone();
-        let offset = offset.clone();
 
         glib::timeout_add_local(Duration::from_millis(700), move || {
-            if let Some(path) = &log_path {
-                if let Some(new_text) = read_new(path, &mut offset.borrow_mut()) {
-                    if !new_text.is_empty() {
-                        buffer.insert(&mut buffer.end_iter(), &new_text);
-                        // Follow the tail, as a terminal would.
-                        let adj = scroller.vadjustment();
-                        adj.set_value(adj.upper() - adj.page_size());
+            // A failed call (the daemon restarting, a timeout) is not "no apply": keep what
+            // is on screen until the next poll answers.
+            let apply = match &client {
+                Some(c) => match c.try_details() {
+                    Some(d) => d.apply,
+                    None => return glib::ControlFlow::Continue,
+                },
+                None => Default::default(),
+            };
+
+            // A newer apply than the one on screen: start over with it.
+            if followed.borrow().is_some_and(|id| id != apply.id) || followed.borrow().is_none() {
+                if followed.borrow().is_some() {
+                    buffer.set_text("");
+                    *tail.borrow_mut() = LogTail::default();
+                    heading.set_text("Applying updates…");
+                    subtitle.set_text("Running nixos-rebuild switch.");
+                    cancel_requested.set(false);
+                    for w in [&downloads, &builds, &current, &stall] {
+                        w.set_visible(false);
                     }
+                    builds_bar.set_visible(false);
+                    bar.set_visible(true);
+                    bar.set_fraction(0.0);
+                }
+                *followed.borrow_mut() = Some(apply.id);
+            }
+
+            if let Some(path) = &log_path {
+                let mut t = tail.borrow_mut();
+                let (restarted, shown) = t.read(path);
+                if restarted {
+                    buffer.set_text("");
+                }
+                if !shown.is_empty() {
+                    buffer.insert(&mut buffer.end_iter(), &shown);
+                    // Follow the tail, as a terminal would.
+                    let adj = scroller.vadjustment();
+                    adj.set_value(adj.upper() - adj.page_size());
                 }
             }
 
-            let applying = client
-                .as_ref()
-                .and_then(|c| c.status().ok())
-                .map(|(s, _)| s == "applying")
-                .unwrap_or(false);
+            let t = tail.borrow();
+            let running = apply.state == ApplyState::Running;
+            show_progress(
+                &t.progress,
+                running,
+                started.elapsed().as_secs_f64(),
+                &mut t.rate.borrow_mut(),
+                [&downloads, &builds, &current, &stall],
+                [&bar, &builds_bar],
+            );
 
-            if applying {
-                bar.pulse();
+            cancel.set_sensitive(running && !cancel_requested.get());
+            if running {
+                heading.set_text(&format!("Applying ({})…", apply.kind));
             } else {
-                bar.set_fraction(1.0);
-                heading.set_text("Apply finished");
-                subtitle.set_text("Expand Details for the full output.");
-                cancel.set_sensitive(false);
+                let (h, s) = match apply.state {
+                    ApplyState::Succeeded => (
+                        "Apply finished".to_string(),
+                        "The new system is active.".to_string(),
+                    ),
+                    ApplyState::Failed => (
+                        "Apply failed".to_string(),
+                        apply
+                            .failure
+                            .as_ref()
+                            .map(|f| f.headline().to_string())
+                            .unwrap_or_default(),
+                    ),
+                    ApplyState::PartlyApplied => (
+                        "Apply partly completed".to_string(),
+                        "The new system is active, but part of the switch failed. Retry it \
+                         from the tray once the cause is fixed."
+                            .to_string(),
+                    ),
+                    ApplyState::Running | ApplyState::None => {
+                        ("No apply is running".to_string(), String::new())
+                    }
+                };
+                heading.set_text(&h);
+                subtitle.set_text(&s);
             }
             glib::ControlFlow::Continue
         });
@@ -782,7 +1434,174 @@ fn build_progress_window(app: &Application) {
     window.present();
 }
 
-/// Read whatever has been appended to `path` since `offset`, advancing it.
+/// The apply log as read so far: the byte offset, a partial last line, and the progress
+/// folded from nix's events.
+#[derive(Default)]
+struct LogTail {
+    offset: u64,
+    partial: String,
+    progress: Progress,
+    rate: RefCell<RateMeter>,
+}
+
+impl LogTail {
+    /// Read what has been appended since the last call; returns whether the log started
+    /// over (a new apply truncated it), and the text to show.
+    fn read(&mut self, path: &std::path::Path) -> (bool, String) {
+        let before = self.offset;
+        let Some(new) = read_new(path, &mut self.offset) else {
+            return (false, String::new());
+        };
+        // `read_new` rewinds to the start of a truncated file, so everything it returned
+        // is the new log.
+        let restarted = before > 0 && self.offset == new.len() as u64;
+        if restarted {
+            *self = LogTail {
+                offset: self.offset,
+                ..LogTail::default()
+            };
+        }
+        self.partial.push_str(&new);
+        let mut shown = String::new();
+        // Split off every complete line at once: a reopened window replays a log that can
+        // run to many megabytes, and removing lines from the front one by one is quadratic.
+        let Some(end) = self.partial.rfind('\n') else {
+            return (restarted, shown);
+        };
+        let complete: String = self.partial.drain(..=end).collect();
+        for line in complete.lines() {
+            if let Some(text) = self.progress.feed_line(line) {
+                shown.push_str(&text);
+                shown.push('\n');
+            }
+        }
+        (restarted, shown)
+    }
+}
+
+/// Render download and build progress. Without nix's events (an older log, or before the
+/// build starts) only a pulsing bar shows that something is running.
+fn show_progress(
+    p: &Progress,
+    running: bool,
+    now: f64,
+    rate: &mut RateMeter,
+    labels: [&gtk::Label; 4],
+    bars: [&gtk::ProgressBar; 2],
+) {
+    let [downloads, builds, current, stall] = labels;
+    let [dl_bar, build_bar] = bars;
+
+    let paths = p.counts(act::COPY_PATHS);
+    let bytes = {
+        let dl = p.counts(act::FILE_TRANSFER);
+        if dl.expected > 0 {
+            dl
+        } else {
+            p.counts(act::COPY_PATH)
+        }
+    };
+    let built = p.counts(act::BUILDS);
+
+    if !p.structured || (paths.expected == 0 && built.expected == 0) {
+        if running {
+            dl_bar.pulse();
+        } else {
+            dl_bar.set_fraction(1.0);
+        }
+        return;
+    }
+
+    rate.record(now, bytes.done);
+    if paths.expected > 0 {
+        let mut text = format!("Downloads: {}/{} paths", paths.done, paths.expected);
+        if bytes.expected > 0 {
+            text.push_str(&format!(
+                " · {} / {}",
+                human_bytes(bytes.done),
+                human_bytes(bytes.expected)
+            ));
+        }
+        if let Some(r) = rate.rate().filter(|_| running && paths.running > 0) {
+            text.push_str(&format!(" · {}/s", human_bytes(r as u64)));
+            let left = bytes.expected.saturating_sub(bytes.done) as f64;
+            if r > 0.0 && left > 0.0 {
+                text.push_str(&format!(" · about {} left", eta(left / r)));
+            }
+        }
+        downloads.set_text(&text);
+        downloads.set_visible(true);
+        dl_bar.set_visible(true);
+        dl_bar.set_fraction(bytes.fraction().or(paths.fraction()).unwrap_or(0.0));
+    } else {
+        downloads.set_visible(false);
+        dl_bar.set_visible(false);
+    }
+
+    if built.expected > 0 {
+        let mut text = format!("Builds: {}/{}", built.done, built.expected);
+        if built.running > 0 {
+            text.push_str(&format!(" ({} running)", built.running));
+        }
+        if built.failed > 0 {
+            text.push_str(&format!(" · {} failed", built.failed));
+        }
+        builds.set_text(&text);
+        builds.set_visible(true);
+        build_bar.set_visible(true);
+        build_bar.set_fraction(built.fraction().unwrap_or(0.0));
+    }
+
+    let now_doing: Vec<String> = p
+        .current()
+        .iter()
+        .take(4)
+        .map(|c| {
+            let mut s = c.text.clone();
+            if let Some(phase) = &c.phase {
+                s.push_str(&format!(" ({phase})"));
+            }
+            if c.expected > 0 {
+                s.push_str(&format!(
+                    " — {} / {}",
+                    human_bytes(c.done),
+                    human_bytes(c.expected)
+                ));
+            }
+            s
+        })
+        .collect();
+    current.set_text(&now_doing.join("\n"));
+    current.set_visible(running && !now_doing.is_empty());
+
+    // "Slow" and "stuck" look the same in a log. A download that has not moved for a while
+    // is worth saying out loud, so the user can tell a network problem from a hung build.
+    const STALL_SECS: f64 = 120.0;
+    let idle = rate.idle_for(now);
+    if running && paths.running > 0 && idle >= STALL_SECS {
+        stall.set_text(&format!(
+            "No download progress for {}. Check your network connection; cancelling and \
+             retrying is safe at this stage.",
+            eta(idle)
+        ));
+        stall.set_visible(true);
+    } else {
+        stall.set_visible(false);
+    }
+}
+
+/// A coarse duration: "40 s", "3 min", "1 h 5 min".
+fn eta(secs: f64) -> String {
+    let s = secs.round() as u64;
+    match s {
+        0..=59 => format!("{s} s"),
+        60..=3599 => format!("{} min", s / 60),
+        _ => format!("{} h {} min", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// Read whatever has been appended to `path` since `offset`, advancing it. The bytes are
+/// decoded lossily, so a read that ends mid-character garbles that one character.
 ///
 /// A truncated file (a new apply reusing the same path) resets the offset rather than
 /// producing garbage.
@@ -805,7 +1624,49 @@ fn read_new(path: &std::path::Path, offset: &mut u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::relative_time;
+    use super::{check_indicator, relative_time, LogTail};
+
+    #[test]
+    fn the_check_indicator_follows_the_daemon_and_clears_without_one() {
+        assert_eq!(check_indicator("checking"), (true, false));
+        assert_eq!(check_indicator("applying"), (false, false));
+        assert_eq!(check_indicator("updates"), (false, true));
+        // No daemon to answer: nothing is running, and the indicator must not stick.
+        assert_eq!(check_indicator(""), (false, true));
+    }
+
+    #[test]
+    fn the_log_tail_keeps_partial_lines_and_replays_large_logs_quickly() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("nun-tail-{}.log", std::process::id()));
+        let event = r#"@nix {"action":"result","fields":["compiling foo.c"],"id":7,"type":101}"#;
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            for _ in 0..50_000 {
+                writeln!(f, "{event}").unwrap();
+            }
+            write!(f, "building the sys").unwrap();
+        }
+        let mut t = LogTail::default();
+        let started = std::time::Instant::now();
+        let (_, shown) = t.read(&path);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "replaying ~4 MB took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(shown, "", "build-log events are not shown as text");
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"tem configuration...\n")
+            .unwrap();
+        let (_, shown) = t.read(&path);
+        assert_eq!(shown, "building the system configuration...\n");
+        let _ = std::fs::remove_file(path);
+    }
 
     fn ago(secs: u64) -> String {
         let now = std::time::SystemTime::now()
