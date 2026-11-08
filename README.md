@@ -213,9 +213,9 @@ same state appears for configuration changes you have not rebuilt yet, including
 commit if your config embeds its git revision (`system.configurationRevision`). The update
 window (and `nixos-update-notifier check`) lists what applying would change — e.g.
 `wakeful: (new) -> 0.1.0` — or says that only configuration differs, so you can tell an
-intended edit from an accidental one. Apply rebuilds from the repo as it is. When the newest lock backup is exactly what is running,
-the update window also offers **Revert flake.lock**, which puts it back (backing up the
-current lock first).
+intended edit from an accidental one. Apply rebuilds from the repo as it is. When the newest
+lock backup is exactly what is running, the update window also offers **Revert
+flake.lock**, which puts it back (backing up the current lock first).
 
 ### Release upgrades
 

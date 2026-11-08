@@ -158,17 +158,24 @@ fn build_updates_window(app: &Application) {
                         // rebuilt packages) — there IS something to apply, and saying "no
                         // pending updates" here would flatly contradict the tray icon.
                         if details.running_differs && !changes.is_empty() {
-                            list.append(&flagged(
-                                "dialog-warning-symbolic",
-                                "warning",
-                                &note_label(
-                                    "<b>Your running system is not built from the current \
-                                     flake.lock either.</b>\n<small>The list below shows only \
-                                     what the newer inputs change; applying also builds what is \
-                                     already in the repo.</small>",
-                                    "",
-                                ),
-                            ));
+                            let note = note_label(
+                                "<b>Your running system is not built from the current \
+                                 flake.lock either.</b>\n<small>The list below shows only \
+                                 what the newer inputs change; applying also builds what is \
+                                 already in the repo.</small>",
+                                "",
+                            );
+                            // The row carries the margins, so the icon lines up with the text.
+                            note.set_margin_start(0);
+                            note.set_margin_end(0);
+                            note.set_margin_top(0);
+                            note.set_margin_bottom(0);
+                            let row = flagged("dialog-warning-symbolic", "warning", &note);
+                            row.set_margin_start(8);
+                            row.set_margin_end(8);
+                            row.set_margin_top(8);
+                            row.set_margin_bottom(8);
+                            list.append(&row);
                         }
 
                         // Rows that belong below the explanatory note rather than above it.
@@ -382,23 +389,22 @@ fn build_updates_window(app: &Application) {
         let check_spinner = check_spinner.clone();
         let check_label = check_label.clone();
         move |status: &str| {
-            let checking = status == "checking";
+            let (checking, sensitive) = check_indicator(status);
             check_spinner.set_visible(checking);
             check_spinner.set_spinning(checking);
             check_label.set_visible(checking);
-            // The daemon ignores a check request during a check or an apply.
-            check_btn.set_sensitive(!checking && status != "applying");
+            check_btn.set_sensitive(sensitive);
         }
     };
     {
         let client = client.clone();
         let show_status = show_status.clone();
         check_btn.connect_clicked(move |_| {
-            if let Some(c) = &client {
-                let _ = c.check_now();
+            // Until the next status poll confirms it — and only if the daemon took the
+            // request, or nothing would ever clear it.
+            if client.as_ref().is_some_and(|c| c.check_now().is_ok()) {
+                show_status("checking");
             }
-            // Until the next status poll confirms it.
-            show_status("checking");
         });
     }
 
@@ -434,17 +440,17 @@ fn build_updates_window(app: &Application) {
         let refresh = refresh.clone();
         let last: RefCell<Option<String>> = RefCell::new(None);
         glib::timeout_add_local(Duration::from_millis(500), move || {
-            if let Some(status) = client
+            // An unreachable daemon is not checking: the indicator must not outlive it.
+            let status = client
                 .as_ref()
                 .and_then(|c| c.status().ok())
                 .map(|(s, _)| s)
-            {
-                show_status(&status);
-                let changed = last.borrow().as_deref() != Some(status.as_str());
-                if changed {
-                    *last.borrow_mut() = Some(status);
-                    refresh();
-                }
+                .unwrap_or_default();
+            show_status(&status);
+            let changed = last.borrow().as_deref() != Some(status.as_str());
+            if changed {
+                *last.borrow_mut() = Some(status);
+                refresh();
             }
             glib::ControlFlow::Continue
         });
@@ -523,9 +529,14 @@ fn note_label(markup: &str, css: &str) -> gtk::Label {
     l
 }
 
-/// What went wrong, in the order a reader needs it: which step, nix's own error line, a
-/// suggested fix when we recognise the failure, and the full output behind "Show details"
-/// with a Copy button for pasting into an issue.
+/// For a daemon status (empty when the daemon cannot be reached): whether a check is
+/// running, and whether "Check now" can be clicked. The daemon ignores a check request
+/// during a check or an apply.
+fn check_indicator(status: &str) -> (bool, bool) {
+    let checking = status == "checking";
+    (checking, !checking && status != "applying")
+}
+
 /// `content` led by a symbolic icon in the theme's `error` or `warning` colour.
 ///
 /// The colour goes on the icon only. Themes' error and warning colours are not chosen for
@@ -543,6 +554,9 @@ fn flagged(icon: &str, css: &str, content: &impl IsA<gtk::Widget>) -> gtk::Box {
     row
 }
 
+/// What went wrong, in the order a reader needs it: which step, nix's own error line, a
+/// suggested fix when we recognise the failure, and the full output behind "Show details"
+/// with a Copy button for pasting into an issue.
 fn failure_box(title: &str, f: &Failure) -> gtk::Box {
     let b = gtk::Box::new(Orientation::Vertical, 4);
     b.set_margin_start(8);
@@ -1604,7 +1618,16 @@ fn read_new(path: &std::path::Path, offset: &mut u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{relative_time, LogTail};
+    use super::{check_indicator, relative_time, LogTail};
+
+    #[test]
+    fn the_check_indicator_follows_the_daemon_and_clears_without_one() {
+        assert_eq!(check_indicator("checking"), (true, false));
+        assert_eq!(check_indicator("applying"), (false, false));
+        assert_eq!(check_indicator("updates"), (false, true));
+        // No daemon to answer: nothing is running, and the indicator must not stick.
+        assert_eq!(check_indicator(""), (false, true));
+    }
 
     #[test]
     fn the_log_tail_keeps_partial_lines_and_replays_large_logs_quickly() {
