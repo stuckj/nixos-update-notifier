@@ -197,8 +197,7 @@ mod tests {
 
     #[test]
     fn derives_the_ref_from_the_candidate_lock() {
-        let dir = std::env::temp_dir().join(format!("nun-cl-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::scratch_dir("changelog");
         let p = dir.join("flake.lock");
         std::fs::write(
             &p,
@@ -211,7 +210,6 @@ mod tests {
             nixpkgs_ref(&cfg_with(None), &p).as_deref(),
             Some("github:NixOS/nixpkgs/cafe")
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
