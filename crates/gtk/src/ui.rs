@@ -138,18 +138,18 @@ fn build_updates_window(app: &Application) {
                         for (name, reason) in c.warnings().unwrap_or_default() {
                             let w = gtk::Label::new(None);
                             w.set_markup(&format!(
-                                "<b>⚠ input '{}' was skipped</b>\n<small>{}</small>",
+                                "<b>Input '{}' was skipped</b>\n<small>{}</small>",
                                 glib::markup_escape_text(&name),
                                 glib::markup_escape_text(&reason)
                             ));
                             w.set_wrap(true);
                             w.set_xalign(0.0);
-                            w.set_margin_start(8);
-                            w.set_margin_end(8);
-                            w.set_margin_top(8);
-                            w.set_margin_bottom(8);
-                            w.add_css_class("warning");
-                            list.append(&w);
+                            let row = flagged("dialog-warning-symbolic", "warning", &w);
+                            row.set_margin_start(8);
+                            row.set_margin_end(8);
+                            row.set_margin_top(8);
+                            row.set_margin_bottom(8);
+                            list.append(&row);
                         }
 
                         // An empty list is ambiguous on its own, so let the daemon's status
@@ -158,12 +158,16 @@ fn build_updates_window(app: &Application) {
                         // rebuilt packages) — there IS something to apply, and saying "no
                         // pending updates" here would flatly contradict the tray icon.
                         if details.running_differs && !changes.is_empty() {
-                            list.append(&note_label(
-                                "<b>Your running system is not built from the current \
-                                 flake.lock either.</b>\n<small>The list below shows only what \
-                                 the newer inputs change; applying also builds what is already \
-                                 in the repo.</small>",
+                            list.append(&flagged(
+                                "dialog-warning-symbolic",
                                 "warning",
+                                &note_label(
+                                    "<b>Your running system is not built from the current \
+                                     flake.lock either.</b>\n<small>The list below shows only \
+                                     what the newer inputs change; applying also builds what is \
+                                     already in the repo.</small>",
+                                    "",
+                                ),
                             ));
                         }
 
@@ -522,6 +526,23 @@ fn note_label(markup: &str, css: &str) -> gtk::Label {
 /// What went wrong, in the order a reader needs it: which step, nix's own error line, a
 /// suggested fix when we recognise the failure, and the full output behind "Show details"
 /// with a Copy button for pasting into an issue.
+/// `content` led by a symbolic icon in the theme's `error` or `warning` colour.
+///
+/// The colour goes on the icon only. Themes' error and warning colours are not chosen for
+/// small text and can fall well short of readable contrast as text (Breeze Dark's error
+/// red on its window background is about 3.2:1), while the theme's foreground colour is
+/// always readable; an icon needs less contrast to be seen.
+fn flagged(icon: &str, css: &str, content: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let row = gtk::Box::new(Orientation::Horizontal, 6);
+    let image = gtk::Image::from_icon_name(icon);
+    image.add_css_class(css);
+    image.set_valign(Align::Start);
+    row.append(&image);
+    content.set_hexpand(true);
+    row.append(content);
+    row
+}
+
 fn failure_box(title: &str, f: &Failure) -> gtk::Box {
     let b = gtk::Box::new(Orientation::Vertical, 4);
     b.set_margin_start(8);
@@ -529,19 +550,21 @@ fn failure_box(title: &str, f: &Failure) -> gtk::Box {
     b.set_margin_top(8);
     b.set_margin_bottom(8);
 
-    let mut markup = format!("<b>{}</b>", glib::markup_escape_text(title));
-    if !f.step.is_empty() {
-        markup.push_str(&format!(
-            "\n<small>While {}:</small>",
-            glib::markup_escape_text(&f.step)
-        ));
-    }
     let head = gtk::Label::new(None);
-    head.set_markup(&markup);
+    head.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(title)));
     head.set_xalign(0.0);
     head.set_wrap(true);
-    head.add_css_class("error");
-    b.append(&head);
+    b.append(&flagged("dialog-error-symbolic", "error", &head));
+    if !f.step.is_empty() {
+        let step = gtk::Label::new(None);
+        step.set_markup(&format!(
+            "<small>While {}:</small>",
+            glib::markup_escape_text(&f.step)
+        ));
+        step.set_xalign(0.0);
+        step.set_wrap(true);
+        b.append(&step);
+    }
 
     if !f.summary.is_empty() {
         let s = gtk::Label::new(Some(&f.summary));
@@ -934,7 +957,18 @@ fn build_settings_window(app: &Application, config_path: &std::path::Path) {
     }
 
     let status = gtk::Label::new(None);
-    status.set_halign(Align::Start);
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.set_hexpand(true);
+    // The outcome's colour goes on this icon, as in `flagged`; the text stays readable.
+    let status_icon = gtk::Image::new();
+    status_icon.set_valign(Align::Start);
+    status_icon.set_visible(false);
+    let status_row = gtk::Box::new(Orientation::Horizontal, 6);
+    status_row.append(&status_icon);
+    status_row.append(&status);
+    status_row.set_margin_start(12);
+    status_row.set_margin_end(12);
 
     let save = gtk::Button::with_label("Save");
     save.add_css_class("suggested-action");
@@ -943,8 +977,9 @@ fn build_settings_window(app: &Application, config_path: &std::path::Path) {
         let entries = entries.clone();
         let config_path = config_path.to_path_buf();
         let status = status.clone();
+        let status_icon = status_icon.clone();
         save.connect_clicked(move |_| {
-            match entries.to_config().and_then(|c| {
+            let result = entries.to_config().and_then(|c| {
                 let text = toml::to_string_pretty(&c).context("serializing config")?;
                 if let Some(parent) = config_path.parent() {
                     std::fs::create_dir_all(parent).ok();
@@ -952,16 +987,21 @@ fn build_settings_window(app: &Application, config_path: &std::path::Path) {
                 std::fs::write(&config_path, text)
                     .with_context(|| format!("writing {}", config_path.display()))?;
                 Ok::<_, anyhow::Error>(())
-            }) {
-                Ok(()) => status.set_markup(
-                    "<span foreground='green'>Saved. Changes apply on the next check \
-                 (restart the service to change the interval).</span>",
+            });
+            let (icon, css, text) = match result {
+                Ok(()) => (
+                    "object-select-symbolic",
+                    "success",
+                    "Saved. Changes apply on the next check (restart the service to change \
+                     the interval)."
+                        .to_string(),
                 ),
-                Err(e) => status.set_markup(&format!(
-                    "<span foreground='red'>{}</span>",
-                    glib::markup_escape_text(&e.to_string())
-                )),
-            }
+                Err(e) => ("dialog-error-symbolic", "error", e.to_string()),
+            };
+            status_icon.set_icon_name(Some(icon));
+            status_icon.set_css_classes(&[css]);
+            status_icon.set_visible(true);
+            status.set_text(&text);
         });
     }
 
@@ -975,7 +1015,7 @@ fn build_settings_window(app: &Application, config_path: &std::path::Path) {
 
     let vbox = gtk::Box::new(Orientation::Vertical, 12);
     vbox.append(&grid);
-    vbox.append(&status);
+    vbox.append(&status_row);
     vbox.append(&buttons);
     vbox.set_margin_start(4);
     vbox.set_margin_end(4);
@@ -1173,7 +1213,13 @@ fn build_progress_window(app: &Application) {
     current.set_wrap(false);
     current.set_lines(4);
     let stall = progress_label("");
-    stall.add_css_class("warning");
+    stall.set_margin_start(0);
+    let stall_row = flagged("dialog-warning-symbolic", "warning", &stall);
+    stall_row.set_margin_start(12);
+    stall
+        .bind_property("visible", &stall_row, "visible")
+        .sync_create()
+        .build();
     for w in [&downloads, &builds, &current, &stall] {
         w.set_visible(false);
     }
@@ -1241,7 +1287,7 @@ fn build_progress_window(app: &Application) {
     vbox.append(&builds);
     vbox.append(&builds_bar);
     vbox.append(&current);
-    vbox.append(&stall);
+    vbox.append(&stall_row);
     vbox.append(&expander);
     vbox.append(&buttons);
 
