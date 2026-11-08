@@ -4,7 +4,7 @@
 
 use crate::dbus::Updater;
 use crate::notify;
-use crate::state::{Command, Shared, SharedState, Status};
+use crate::state::{Command, RevertVouch, Shared, SharedState, Status};
 use crate::tray::NixTray;
 use anyhow::{Context, Result};
 use ksni::TrayMethods;
@@ -215,7 +215,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                         s.release = None;
                         s.running_differs = false;
                         s.unapplied = None;
-                        s.can_revert_lock = false;
+                        s.revert = None;
                         repo_gen += 1;
                     }
                 }
@@ -375,7 +375,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 {
                     let mut s = shared.lock().await;
                     // Vouched for against the lock this apply is about to replace.
-                    s.can_revert_lock = false;
+                    s.revert = None;
                     s.apply = ApplyInfo {
                         id: s.apply.id + 1,
                         state: ApplyState::Running,
@@ -414,15 +414,19 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 }
                 // Only what the last check vouched for, once: after a revert the newest
                 // backup is the lock just replaced, and acting again would undo it.
-                if !std::mem::take(&mut shared.lock().await.can_revert_lock) {
+                let Some(vouch) = shared.lock().await.revert.take() else {
                     tracing::info!("no revert is on offer; ignoring");
                     continue;
-                }
-                let Some(backup) = nun_core::apply::revertable_lock_backup(&cfg.flake_path).await
-                else {
-                    tracing::info!("no flake.lock backup differs from the current lock");
-                    continue;
                 };
+                if !vouch.still_holds(&cfg.flake_path) {
+                    tracing::info!(
+                        "the repo or running system changed since the check; checking again \
+                         instead of reverting"
+                    );
+                    let _ = tx.send(Command::CheckNow);
+                    continue;
+                }
+                let backup = vouch.backup;
                 // Installed like any candidate, so the lock being replaced is itself backed
                 // up first and the revert can be undone.
                 match nun_core::apply::install_candidate_lock(&cfg.flake_path, &backup).await {
@@ -523,7 +527,15 @@ async fn handle_check_result(
     shared: &SharedState,
     tray_handle: &ksni::Handle<NixTray>,
 ) {
-    let can_revert = result.as_ref().is_ok_and(|o| o.revert_matches_running);
+    let revert = match &result {
+        Ok(o) if o.revert_matches_running => {
+            match nun_core::apply::revertable_lock_backup(&cfg.flake_path).await {
+                Some(backup) => RevertVouch::record(&cfg.flake_path, backup, &o.base_lock),
+                None => None,
+            }
+        }
+        _ => None,
+    };
     // Stamped for every outcome, including a failed check: "we looked and it went wrong"
     // is still information the window should be able to show.
     {
@@ -532,7 +544,7 @@ async fn handle_check_result(
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .map(|d| d.as_secs());
-        s.can_revert_lock = can_revert;
+        s.revert = revert;
     }
 
     match result {
@@ -959,27 +971,46 @@ async fn apply_flow(
     apply_rebuild(cfg, &exe, lock_backup, nix_backup, shared, handle).await
 }
 
+/// The notification's line about the repo after a failed apply: nothing when nothing was
+/// staged, and no claim of a rollback that did not fully happen.
+fn restore_note(restored: Option<bool>) -> &'static str {
+    match restored {
+        None => "",
+        Some(true) => "\nThe previous flake files were restored.",
+        Some(false) => {
+            "\nThe flake files were not all restored (edited during the update, or the \
+             copy failed); `journalctl --user -u nixos-update-notifier` says where the \
+             previous versions are."
+        }
+    }
+}
+
 /// What the apply log says went wrong: its text (with nix's JSON events folded back into
 /// messages), as a [`Failure`].
 fn apply_log_failure() -> Failure {
+    match std::fs::File::open(nun_core::apply::apply_log_path()) {
+        Ok(f) => failure_from_log(std::io::BufReader::new(f)),
+        Err(_) => failure_from_log(std::io::empty()),
+    }
+}
+
+/// Fold the whole apply log, streaming. A build's output is attached to its failure only if
+/// its start was seen, which can be megabytes before the end; memory stays bounded since
+/// only the shown lines' tail is kept.
+fn failure_from_log(log: impl std::io::BufRead) -> Failure {
     const TAIL_LINES: usize = 200;
-    // nix logs every builder output line as an event, so a source build leaves megabytes;
-    // the cause is at the end.
-    const TAIL_BYTES: u64 = 1 << 20;
-    let text = (|| -> std::io::Result<String> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(nun_core::apply::apply_log_path())?;
-        let len = f.metadata()?.len();
-        f.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        Ok(String::from_utf8_lossy(&buf).into_owned())
-    })()
-    .unwrap_or_default();
     let mut progress = nun_core::progress::Progress::default();
-    let lines: Vec<String> = text.lines().filter_map(|l| progress.feed_line(l)).collect();
-    let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
-    Failure::from_output("applying updates (nixos-rebuild switch)", &tail)
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for line in log.split(b'\n').map_while(Result::ok) {
+        if let Some(shown) = progress.feed_line(&String::from_utf8_lossy(&line)) {
+            if tail.len() == TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(shown);
+        }
+    }
+    let text = Vec::from(tail).join("\n");
+    Failure::from_output("applying updates (nixos-rebuild switch)", &text)
 }
 
 /// Run the privileged rebuild and report the outcome. The backups are `(backup, installed
@@ -1049,13 +1080,19 @@ async fn apply_rebuild(
     // "the new system is already live but a later step failed".
     let system_before = nun_core::apply::current_system();
 
+    // `None` when nothing was staged; otherwise whether every staged file was put back.
     let restore_all = || async {
+        if lock_backup.is_none() && nix_backup.is_none() {
+            return None;
+        }
+        let mut all = true;
         if let Some((b, installed)) = &lock_backup {
-            nun_core::apply::restore_lock(&cfg.flake_path, b, installed).await;
+            all &= nun_core::apply::restore_lock(&cfg.flake_path, b, installed).await;
         }
         if let Some((b, installed)) = &nix_backup {
-            nun_core::apply::restore_flake_nix(&cfg.flake_path, b, installed).await;
+            all &= nun_core::apply::restore_flake_nix(&cfg.flake_path, b, installed).await;
         }
+        Some(all)
     };
 
     match cmd.status().await {
@@ -1130,14 +1167,11 @@ async fn apply_rebuild(
                 // Covers a failed build and a cancelled/denied polkit prompt alike: put the
                 // previous files back so the repo is left exactly as it was. A rebuild
                 // staged nothing, so there is nothing to restore.
-                restore_all().await;
+                let restored = restore_all().await;
                 if cfg.notify {
                     let _ = notify::notify(
                         "NixOS update failed",
-                        &format!(
-                            "{}\nThe previous flake files were restored.",
-                            failure.headline()
-                        ),
+                        &format!("{}{}", failure.headline(), restore_note(restored)),
                         &cfg.icons.error,
                     )
                     .await;
@@ -1152,11 +1186,14 @@ async fn apply_rebuild(
         }
         Err(e) => {
             tracing::error!("could not launch pkexec: {e:#}");
-            restore_all().await;
+            let restored = restore_all().await;
             if cfg.notify {
                 let _ = notify::notify(
                     "NixOS update failed",
-                    "Could not launch the privileged helper (pkexec).",
+                    &format!(
+                        "Could not launch the privileged helper (pkexec).{}",
+                        restore_note(restored)
+                    ),
                     &cfg.icons.error,
                 )
                 .await;
@@ -1168,5 +1205,49 @@ async fn apply_rebuild(
                 failure: Some(Failure::from_error(&e)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restore_note;
+
+    #[test]
+    fn a_failed_apply_claims_only_the_rollback_that_happened() {
+        assert_eq!(
+            restore_note(None),
+            "",
+            "a rebuild staged nothing to restore"
+        );
+        assert!(restore_note(Some(true)).contains("were restored"));
+        assert!(!restore_note(Some(false)).contains("were restored"));
+    }
+
+    /// The failing build's start sits megabytes before the end of a real log; its output
+    /// must still reach the failure.
+    #[test]
+    fn a_failure_far_into_a_long_log_keeps_the_builder_output() {
+        let fixture = include_str!("../../core/tests/fixtures/nix-log/build-failure.jsonl");
+        // ~2 MB of progress events right after the build starts, as other activity would
+        // leave in a real rebuild.
+        let padding = r#"@nix {"action":"result","fields":[1,2,0,0],"id":1,"type":105}"#;
+        let mut log = String::new();
+        for line in fixture.lines() {
+            log.push_str(line);
+            log.push('\n');
+            if line.contains(r#""text":"building '"#) {
+                for _ in 0..40_000 {
+                    log.push_str(padding);
+                    log.push('\n');
+                }
+            }
+        }
+        assert!(log.len() > 2 << 20, "the padding was not inserted");
+        let f = super::failure_from_log(std::io::Cursor::new(log));
+        assert!(
+            f.details.contains("foo.c:3: error: expected semicolon"),
+            "{}",
+            &f.details[f.details.len().saturating_sub(800)..]
+        );
     }
 }

@@ -11,7 +11,7 @@
 //! and what a parent announced with `setExpected`.
 
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// Activity types (`ActivityType` in nix's `logging.hh`).
 pub mod act {
@@ -24,6 +24,7 @@ pub mod act {
 
 /// Result types (`ResultType` in nix's `logging.hh`).
 mod res {
+    pub const BUILD_LOG_LINE: u64 = 101;
     pub const SET_PHASE: u64 = 104;
     pub const PROGRESS: u64 = 105;
     pub const SET_EXPECTED: u64 = 106;
@@ -33,10 +34,19 @@ mod res {
 /// plain rebuild prints.
 const LVL_INFO: u64 = 3;
 
+/// Builder output kept per build, and how many finished builds' output is kept. With the
+/// JSON log format nix's own build-failure error carries no builder output, so without
+/// this a failed compile would report only "builder failed with exit code 1".
+const LOG_TAIL_LINES: usize = 25;
+const LOG_TAIL_BUILDS: usize = 64;
+
 #[derive(Debug, Clone, Default)]
 struct Activity {
     kind: u64,
     text: String,
+    /// For a build: the derivation, and the last lines its builder printed.
+    drv: Option<String>,
+    log: VecDeque<String>,
     phase: Option<String>,
     done: u64,
     expected: u64,
@@ -82,6 +92,8 @@ pub struct Current {
 pub struct Progress {
     activities: BTreeMap<u64, Activity>,
     totals: HashMap<u64, TypeTotals>,
+    /// The output tail of recently finished builds, by derivation, oldest first.
+    build_logs: VecDeque<(String, VecDeque<String>)>,
     /// Whether any `@nix` event has been seen, i.e. whether there is progress to show.
     pub structured: bool,
 }
@@ -103,18 +115,27 @@ impl Progress {
             "msg" => {
                 let level = u("level").unwrap_or(0);
                 let msg = ev.get("msg").and_then(Value::as_str).unwrap_or("");
-                (level <= LVL_INFO).then(|| strip_ansi(msg))
+                (level <= LVL_INFO).then(|| self.with_build_log(strip_ansi(msg)))
             }
             "start" => {
                 let kind = u("type").unwrap_or(0);
                 let text = strip_ansi(ev.get("text").and_then(Value::as_str).unwrap_or(""));
                 let level = u("level").unwrap_or(0);
                 let shown = (level <= LVL_INFO && !text.is_empty()).then(|| text.clone());
+                let drv = (kind == act::BUILD)
+                    .then(|| {
+                        ev.get("fields")
+                            .and_then(|f| f.get(0))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .flatten();
                 self.activities.insert(
                     id,
                     Activity {
                         kind,
                         text,
+                        drv,
                         ..Default::default()
                     },
                 );
@@ -122,6 +143,12 @@ impl Progress {
             }
             "stop" => {
                 if let Some(a) = self.activities.remove(&id) {
+                    if let (Some(drv), false) = (&a.drv, a.log.is_empty()) {
+                        if self.build_logs.len() == LOG_TAIL_BUILDS {
+                            self.build_logs.pop_front();
+                        }
+                        self.build_logs.push_back((drv.clone(), a.log.clone()));
+                    }
                     let t = self.totals.entry(a.kind).or_default();
                     t.done += a.done;
                     t.failed += a.failed;
@@ -152,6 +179,14 @@ impl Progress {
                             t.expected = (t.expected + n).saturating_sub(prev);
                         }
                     }
+                    Some(res::BUILD_LOG_LINE) if a.drv.is_some() => {
+                        if let Some(line) = fields.and_then(|f| f.first()).and_then(Value::as_str) {
+                            if a.log.len() == LOG_TAIL_LINES {
+                                a.log.pop_front();
+                            }
+                            a.log.push_back(strip_ansi(line));
+                        }
+                    }
                     Some(res::SET_PHASE) => {
                         a.phase = fields
                             .and_then(|f| f.first())
@@ -163,6 +198,35 @@ impl Progress {
                 None
             }
             _ => None,
+        }
+    }
+
+    /// Append the builder output of a build the message reports as failed, which nix's
+    /// own message leaves out under the JSON log format.
+    fn with_build_log(&self, msg: String) -> String {
+        let drv = msg
+            .split(['\'', ' ', '\n'])
+            .find(|w| w.starts_with("/nix/store/") && w.ends_with(".drv"));
+        let tail = drv.and_then(|d| {
+            self.build_logs
+                .iter()
+                .rev()
+                .find(|(drv, _)| drv == d)
+                .map(|(_, log)| log)
+        });
+        match tail {
+            Some(log) if msg.contains("failed") || msg.contains("Cannot build") => {
+                let mut out = msg;
+                out.push_str("\n       Last lines of the build log:");
+                // Marked as nix marks builder output, so a builder's own `error: …` line
+                // is not read as nix's error (which names the failed package).
+                for l in log {
+                    out.push_str("\n       > ");
+                    out.push_str(l);
+                }
+                out
+            }
+            _ => msg,
         }
     }
 
@@ -311,6 +375,61 @@ mod tests {
         assert_eq!(dl.done, dl.expected);
         assert_eq!(human_bytes(dl.done), "14.6 MiB");
         assert!(p.current().is_empty());
+    }
+
+    #[test]
+    fn a_failed_build_reports_what_its_builder_printed() {
+        // Real `nix build --log-format internal-json` (nix 2.35) of a builder that prints a
+        // compiler error and exits 1: nix's own error says only "builder failed with exit
+        // code 1"; the compiler's line arrives as a build-log result before it.
+        let text = include_str!("../tests/fixtures/nix-log/build-failure.jsonl");
+        let mut p = Progress::default();
+        let shown: Vec<String> = text.lines().filter_map(|l| p.feed_line(l)).collect();
+        let error = shown
+            .iter()
+            .find(|l| l.starts_with("error: Cannot build"))
+            .expect("nix's failure message");
+        assert!(error.contains("builder failed with exit code 1"), "{error}");
+        assert!(
+            error.contains("foo.c:3: error: expected semicolon"),
+            "builder output missing: {error}"
+        );
+        // Builder output is not streamed into the log as it happens.
+        assert!(!shown.iter().any(|l| l == "compiling foo.c"));
+        let failure = crate::failure::Failure::from_output("applying", &shown.join("\n"));
+        assert!(
+            failure.details.contains("foo.c:3: error"),
+            "{}",
+            failure.details
+        );
+    }
+
+    /// The shape of a nixos-rebuild failure: the failing derivation is a dependency of the
+    /// one requested (real nix 2.35 log). Its build stops before nix reports it, and the
+    /// requested one then fails only because its dependency did.
+    #[test]
+    fn a_failed_dependency_reports_its_builder_output() {
+        let text = include_str!("../tests/fixtures/nix-log/dependency-failure.jsonl");
+        let mut p = Progress::default();
+        let shown: Vec<String> = text.lines().filter_map(|l| p.feed_line(l)).collect();
+        let dep = shown
+            .iter()
+            .find(|l| l.contains("Cannot build") && l.contains("nun-dep-fail.drv"))
+            .expect("the dependency's failure");
+        assert!(dep.contains("> dep.c:7: error: unknown type"), "{dep}");
+        let top = shown
+            .iter()
+            .find(|l| l.contains("Cannot build") && l.contains("nun-top.drv"))
+            .expect("the requested derivation's failure");
+        assert!(!top.contains("Last lines"), "{top}");
+
+        // The builder's own `error:` text does not displace nix's line as the summary.
+        let failure = crate::failure::Failure::from_output("applying", &shown.join("\n"));
+        assert!(
+            failure.summary.contains("nun-dep-fail.drv"),
+            "{}",
+            failure.summary
+        );
     }
 
     #[test]

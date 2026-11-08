@@ -1,0 +1,85 @@
+@nix {"action":"start","id":25769803776,"level":6,"parent":0,"text":"querying info about missing paths","type":0}
+@nix {"action":"start","fields":["https://cache.nixos.org/nix-cache-info"],"id":25769803777,"level":4,"parent":0,"text":"downloading 'https://cache.nixos.org/nix-cache-info'","type":101}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[51,51,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[51,51,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[51,51,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[51,51,0,0],"id":25769803777,"type":105}
+@nix {"action":"stop","id":25769803777}
+@nix {"action":"start","fields":["/nix/store/d80wanj7ymd22n9nv0c4naa5s98zyqzp-nun-top","https://cache.nixos.org"],"id":25769803778,"level":4,"parent":0,"text":"querying info about '/nix/store/d80wanj7ymd22n9nv0c4naa5s98zyqzp-nun-top' on 'https://cache.nixos.org'","type":109}
+@nix {"action":"start","fields":["https://cache.nixos.org/d80wanj7ymd22n9nv0c4naa5s98zyqzp.narinfo"],"id":25769803779,"level":4,"parent":25769803778,"text":"downloading 'https://cache.nixos.org/d80wanj7ymd22n9nv0c4naa5s98zyqzp.narinfo'","type":101}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":25769803779,"type":105}
+@nix {"action":"stop","id":25769803778}
+@nix {"action":"stop","id":25769803779}
+@nix {"action":"start","fields":["/nix/store/x1ycvximikfkxnjfiylz5bv2nss9hyi0-nun-dep-fail","https://cache.nixos.org"],"id":25769803780,"level":4,"parent":0,"text":"querying info about '/nix/store/x1ycvximikfkxnjfiylz5bv2nss9hyi0-nun-dep-fail' on 'https://cache.nixos.org'","type":109}
+@nix {"action":"start","fields":["https://cache.nixos.org/x1ycvximikfkxnjfiylz5bv2nss9hyi0.narinfo"],"id":25769803781,"level":4,"parent":25769803780,"text":"downloading 'https://cache.nixos.org/x1ycvximikfkxnjfiylz5bv2nss9hyi0.narinfo'","type":101}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":25769803781,"type":105}
+@nix {"action":"stop","id":25769803780}
+@nix {"action":"stop","id":25769803781}
+@nix {"action":"stop","id":25769803776}
+@nix {"action":"msg","level":3,"msg":"these 2 derivations will be built:"}
+@nix {"action":"msg","level":3,"msg":"  /nix/store/5nblnc3l4pblnvad8pwzdkz4a22vm78a-nun-dep-fail.drv"}
+@nix {"action":"msg","level":3,"msg":"  /nix/store/52jfjzs7q6di82gdl7f7bishcb37d90k-nun-top.drv"}
+@nix {"action":"start","id":25769803782,"level":0,"parent":0,"text":"","type":102}
+@nix {"action":"start","id":25769803783,"level":0,"parent":0,"text":"","type":104}
+@nix {"action":"start","id":25769803784,"level":0,"parent":0,"text":"","type":103}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803783,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803784,"type":105}
+@nix {"action":"result","fields":[101,0],"id":25769803782,"type":106}
+@nix {"action":"result","fields":[100,0],"id":25769803782,"type":106}
+@nix {"action":"result","fields":[0,1,0,0],"id":25769803783,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803784,"type":105}
+@nix {"action":"result","fields":[101,0],"id":25769803782,"type":106}
+@nix {"action":"result","fields":[100,0],"id":25769803782,"type":106}
+@nix {"action":"result","fields":[0,1,0,0],"id":25769803783,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803784,"type":105}
+@nix {"action":"result","fields":[101,0],"id":25769803782,"type":106}
+@nix {"action":"result","fields":[100,0],"id":25769803782,"type":106}
+@nix {"action":"result","fields":[0,2,0,0],"id":25769803783,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803784,"type":105}
+@nix {"action":"result","fields":[101,0],"id":25769803782,"type":106}
+@nix {"action":"result","fields":[100,0],"id":25769803782,"type":106}
+@nix {"action":"start","fields":["/nix/store/5nblnc3l4pblnvad8pwzdkz4a22vm78a-nun-dep-fail.drv","",1,1],"id":25769803785,"level":3,"parent":0,"text":"building '/nix/store/5nblnc3l4pblnvad8pwzdkz4a22vm78a-nun-dep-fail.drv'","type":105}
+@nix {"action":"result","fields":[0,2,1,0],"id":25769803783,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803784,"type":105}
+@nix {"action":"result","fields":[101,0],"id":25769803782,"type":106}
+@nix {"action":"result","fields":[100,0],"id":25769803782,"type":106}
+@nix {"action":"result","fields":["compiling dep.c"],"id":25769803785,"type":101}
+@nix {"action":"result","fields":["dep.c:7: error: unknown type"],"id":25769803785,"type":101}
+@nix {"action":"result","fields":[0,2,0,1],"id":25769803783,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803784,"type":105}
+@nix {"action":"result","fields":[101,0],"id":25769803782,"type":106}
+@nix {"action":"result","fields":[100,0],"id":25769803782,"type":106}
+@nix {"action":"stop","id":25769803785}
+@nix {"action":"msg","column":null,"file":null,"level":0,"line":null,"msg":"\u001b[31;1merror:\u001b[0m Cannot build '\u001b[35;1m/nix/store/5nblnc3l4pblnvad8pwzdkz4a22vm78a-nun-dep-fail.drv\u001b[0m'.\n       Reason: \u001b[31;1mbuilder failed with exit code 2\u001b[0m.\n       Output paths:\n         \u001b[35;1m/nix/store/x1ycvximikfkxnjfiylz5bv2nss9hyi0-nun-dep-fail\u001b[0m","raw_msg":"Cannot build '\u001b[35;1m/nix/store/5nblnc3l4pblnvad8pwzdkz4a22vm78a-nun-dep-fail.drv\u001b[0m'.\nReason: \u001b[31;1mbuilder failed with exit code 2\u001b[0m.\nOutput paths:\n  \u001b[35;1m/nix/store/x1ycvximikfkxnjfiylz5bv2nss9hyi0-nun-dep-fail\u001b[0m"}
+@nix {"action":"result","fields":[0,0,0,1],"id":25769803783,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803784,"type":105}
+@nix {"action":"result","fields":[101,0],"id":25769803782,"type":106}
+@nix {"action":"result","fields":[100,0],"id":25769803782,"type":106}
+@nix {"action":"stop","id":25769803784}
+@nix {"action":"stop","id":25769803783}
+@nix {"action":"stop","id":25769803782}
+@nix {"action":"msg","column":null,"file":null,"level":0,"line":null,"msg":"\u001b[31;1merror:\u001b[0m Cannot build '\u001b[35;1m/nix/store/52jfjzs7q6di82gdl7f7bishcb37d90k-nun-top.drv\u001b[0m'.\n       Reason: \u001b[31;1m1 dependency failed\u001b[0m.\n       Output paths:\n         \u001b[35;1m/nix/store/d80wanj7ymd22n9nv0c4naa5s98zyqzp-nun-top\u001b[0m","raw_msg":"Cannot build '\u001b[35;1m/nix/store/52jfjzs7q6di82gdl7f7bishcb37d90k-nun-top.drv\u001b[0m'.\nReason: \u001b[31;1m1 dependency failed\u001b[0m.\nOutput paths:\n  \u001b[35;1m/nix/store/d80wanj7ymd22n9nv0c4naa5s98zyqzp-nun-top\u001b[0m"}

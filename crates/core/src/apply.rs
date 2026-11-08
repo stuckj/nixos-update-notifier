@@ -200,20 +200,20 @@ pub async fn install_candidate_flake_nix(repo: &Path, candidate: &Path) -> Resul
 /// Restore a lock backup taken by [`install_candidate_lock`], leaving the repo as it was —
 /// provided the lock is still the `installed` candidate. Best-effort: a failure here is
 /// logged, not propagated, since it runs on an error path.
-pub async fn restore_lock(repo: &Path, backup: &Path, installed: &Path) {
+pub async fn restore_lock(repo: &Path, backup: &Path, installed: &Path) -> bool {
     restore_if_untouched(repo, "flake.lock", backup, installed).await
 }
 
 /// Restore a `flake.nix` backup taken by [`install_candidate_flake_nix`], provided the file
 /// is still the `installed` candidate. Best-effort.
-pub async fn restore_flake_nix(repo: &Path, backup: &Path, installed: &Path) {
+pub async fn restore_flake_nix(repo: &Path, backup: &Path, installed: &Path) -> bool {
     restore_if_untouched(repo, "flake.nix", backup, installed).await
 }
 
 /// A rebuild can run for many minutes, and the user may edit the repo meanwhile. Putting
 /// the backup back over such an edit would lose it (the backup predates it), so a file
 /// that no longer holds what was installed is left alone.
-async fn restore_if_untouched(repo: &Path, file: &str, backup: &Path, installed: &Path) {
+async fn restore_if_untouched(repo: &Path, file: &str, backup: &Path, installed: &Path) -> bool {
     let now = tokio::fs::read(repo.join(file)).await.ok();
     let ours = tokio::fs::read(installed).await.ok();
     if now.is_none() || now != ours {
@@ -222,20 +222,27 @@ async fn restore_if_untouched(repo: &Path, file: &str, backup: &Path, installed:
              is in {})",
             backup.display()
         );
-        return;
+        return false;
     }
     restore(repo, file, backup).await
 }
 
-async fn restore(repo: &Path, file: &str, backup: &Path) {
+/// Whether the backup is back in place.
+async fn restore(repo: &Path, file: &str, backup: &Path) -> bool {
     let real = repo.join(file);
     match tokio::fs::copy(backup, &real).await {
-        Ok(_) => tracing::info!("restored previous {file} from {}", backup.display()),
-        Err(e) => tracing::error!(
-            "could not restore {} -> {}: {e}",
-            backup.display(),
-            real.display()
-        ),
+        Ok(_) => {
+            tracing::info!("restored previous {file} from {}", backup.display());
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                "could not restore {} -> {}: {e}",
+                backup.display(),
+                real.display()
+            );
+            false
+        }
     }
 }
 

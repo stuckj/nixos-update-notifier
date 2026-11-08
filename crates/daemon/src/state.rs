@@ -5,7 +5,7 @@ use nun_core::diff::PackageChange;
 use nun_core::failure::Failure;
 use nun_core::ipc::{ApplyInfo, Details, UnappliedDiff, UpgradeInfo};
 use nun_core::release::{ReleaseOffer, UpgradePreview};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -160,8 +160,8 @@ pub struct Shared {
     /// The repo describes a different system from the running one (see `Status::NotApplied`;
     /// also shown alongside pending updates).
     pub running_differs: bool,
-    /// Restoring the newest `flake.lock` backup would make the repo match the running system.
-    pub can_revert_lock: bool,
+    /// A revert the last check found would make the repo match the running system.
+    pub revert: Option<RevertVouch>,
     /// The current or most recent apply.
     pub apply: ApplyInfo,
     /// Newer NixOS releases, from the last check.
@@ -187,7 +187,7 @@ impl Shared {
             apply: self.apply.clone(),
             check_failure: self.check_failure.clone(),
             running_differs: self.running_differs,
-            can_revert_lock: self.can_revert_lock,
+            can_revert_lock: self.revert.is_some(),
             release: self.release.clone(),
             release_dismissed,
             upgrade: self.upgrade.clone(),
@@ -197,3 +197,71 @@ impl Shared {
 }
 
 pub type SharedState = Arc<Mutex<Shared>>;
+
+/// What a check established when it offered Revert: putting `backup` (with these contents)
+/// over this `flake.lock`, beside this `flake.nix`, gives the system that was running.
+/// Revert acts only while all of it still holds; a rebuild by hand, an edit or a newer
+/// backup since then was never checked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevertVouch {
+    pub backup: PathBuf,
+    backup_bytes: Vec<u8>,
+    lock: Vec<u8>,
+    flake_nix: Vec<u8>,
+    running: Option<PathBuf>,
+}
+
+impl RevertVouch {
+    /// Record the repo as it is now, for a revert to `backup`. `base_lock` is the lock the
+    /// check evaluated; a repo already moved past it is not vouched for.
+    pub fn record(repo: &Path, backup: PathBuf, base_lock: &str) -> Option<Self> {
+        let vouch = Self {
+            backup_bytes: std::fs::read(&backup).ok()?,
+            backup,
+            lock: std::fs::read(repo.join("flake.lock")).ok()?,
+            flake_nix: std::fs::read(repo.join("flake.nix")).ok()?,
+            running: nun_core::apply::current_system(),
+        };
+        (vouch.lock == base_lock.as_bytes()).then_some(vouch)
+    }
+
+    pub fn still_holds(&self, repo: &Path) -> bool {
+        std::fs::read(&self.backup).ok().as_ref() == Some(&self.backup_bytes)
+            && std::fs::read(repo.join("flake.lock")).ok().as_ref() == Some(&self.lock)
+            && std::fs::read(repo.join("flake.nix")).ok().as_ref() == Some(&self.flake_nix)
+            && nun_core::apply::current_system() == self.running
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RevertVouch;
+
+    #[test]
+    fn a_revert_is_vouched_for_only_while_nothing_moved() {
+        let repo = std::env::temp_dir().join(format!("nun-vouch-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).unwrap();
+        let backup = repo.join("flake.lock.bak.1");
+        std::fs::write(&backup, "old lock").unwrap();
+        std::fs::write(repo.join("flake.lock"), "advanced lock").unwrap();
+        std::fs::write(repo.join("flake.nix"), "nix").unwrap();
+
+        // A repo that moved during the check is not vouched for at all.
+        assert!(RevertVouch::record(&repo, backup.clone(), "another lock").is_none());
+
+        let v = RevertVouch::record(&repo, backup.clone(), "advanced lock").unwrap();
+        assert!(v.still_holds(&repo));
+        for (file, edit) in [
+            ("flake.nix", "edited"),
+            ("flake.lock", "relocked"),
+            ("flake.lock.bak.1", "replaced"),
+        ] {
+            let before = std::fs::read(repo.join(file)).unwrap();
+            std::fs::write(repo.join(file), edit).unwrap();
+            assert!(!v.still_holds(&repo), "{file} changed");
+            std::fs::write(repo.join(file), before).unwrap();
+        }
+        assert!(v.still_holds(&repo));
+        let _ = std::fs::remove_dir_all(repo);
+    }
+}
