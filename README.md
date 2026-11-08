@@ -191,7 +191,8 @@ $ systemctl --user kill -s SIGUSR1 nixos-update-notifier.service
 
 **Apply updates** installs the new `flake.lock` into your repo and runs
 `nixos-rebuild switch` behind a polkit prompt. Your previous lock is backed up first and
-restored automatically if the rebuild fails or you cancel the prompt.
+restored automatically if the rebuild fails or you cancel the prompt — unless you edited
+it while the rebuild ran, in which case your version is kept and the notification says so.
 
 Those backups are written next to your lock as `flake.lock.bak.<epoch>` (and
 `flake.nix.bak.<epoch>` for a release upgrade), and only the newest three of each are kept.

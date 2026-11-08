@@ -1,0 +1,59 @@
+@nix {"action":"start","id":25769803776,"level":6,"parent":0,"text":"querying info about missing paths","type":0}
+@nix {"action":"start","fields":["https://cache.nixos.org/nix-cache-info"],"id":25769803777,"level":4,"parent":0,"text":"downloading 'https://cache.nixos.org/nix-cache-info'","type":101}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[51,51,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[51,51,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[51,51,0,0],"id":25769803777,"type":105}
+@nix {"action":"result","fields":[51,51,0,0],"id":25769803777,"type":105}
+@nix {"action":"stop","id":25769803777}
+@nix {"action":"start","fields":["/nix/store/wdp9a304wsmv6gx6xvf5r9lp61w0vqr9-nun-fail-probe","https://cache.nixos.org"],"id":25769803778,"level":4,"parent":0,"text":"querying info about '/nix/store/wdp9a304wsmv6gx6xvf5r9lp61w0vqr9-nun-fail-probe' on 'https://cache.nixos.org'","type":109}
+@nix {"action":"start","fields":["https://cache.nixos.org/wdp9a304wsmv6gx6xvf5r9lp61w0vqr9.narinfo"],"id":25769803779,"level":4,"parent":25769803778,"text":"downloading 'https://cache.nixos.org/wdp9a304wsmv6gx6xvf5r9lp61w0vqr9.narinfo'","type":101}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":25769803779,"type":105}
+@nix {"action":"result","fields":[3,3,0,0],"id":25769803779,"type":105}
+@nix {"action":"stop","id":25769803778}
+@nix {"action":"stop","id":25769803779}
+@nix {"action":"stop","id":25769803776}
+@nix {"action":"msg","level":3,"msg":"this derivation will be built:"}
+@nix {"action":"msg","level":3,"msg":"  /nix/store/acmzrbb4j9j1hc1g0i0ywdvrnqhjff6h-nun-fail-probe.drv"}
+@nix {"action":"start","id":25769803780,"level":0,"parent":0,"text":"","type":102}
+@nix {"action":"start","id":25769803781,"level":0,"parent":0,"text":"","type":104}
+@nix {"action":"start","id":25769803782,"level":0,"parent":0,"text":"","type":103}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803782,"type":105}
+@nix {"action":"result","fields":[101,0],"id":25769803780,"type":106}
+@nix {"action":"result","fields":[100,0],"id":25769803780,"type":106}
+@nix {"action":"result","fields":[0,1,0,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803782,"type":105}
+@nix {"action":"result","fields":[101,0],"id":25769803780,"type":106}
+@nix {"action":"result","fields":[100,0],"id":25769803780,"type":106}
+@nix {"action":"start","fields":["/nix/store/acmzrbb4j9j1hc1g0i0ywdvrnqhjff6h-nun-fail-probe.drv","",1,1],"id":25769803783,"level":3,"parent":0,"text":"building '/nix/store/acmzrbb4j9j1hc1g0i0ywdvrnqhjff6h-nun-fail-probe.drv'","type":105}
+@nix {"action":"result","fields":[0,1,1,0],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803782,"type":105}
+@nix {"action":"result","fields":[101,0],"id":25769803780,"type":106}
+@nix {"action":"result","fields":[100,0],"id":25769803780,"type":106}
+@nix {"action":"result","fields":["compiling foo.c"],"id":25769803783,"type":101}
+@nix {"action":"result","fields":["foo.c:3: error: expected semicolon"],"id":25769803783,"type":101}
+@nix {"action":"result","fields":[0,1,0,1],"id":25769803781,"type":105}
+@nix {"action":"result","fields":[0,0,0,0],"id":25769803782,"type":105}
+@nix {"action":"result","fields":[101,0],"id":25769803780,"type":106}
+@nix {"action":"result","fields":[100,0],"id":25769803780,"type":106}
+@nix {"action":"stop","id":25769803783}
+@nix {"action":"stop","id":25769803782}
+@nix {"action":"stop","id":25769803781}
+@nix {"action":"stop","id":25769803780}
+@nix {"action":"msg","column":null,"file":null,"level":0,"line":null,"msg":"\u001b[31;1merror:\u001b[0m Cannot build '\u001b[35;1m/nix/store/acmzrbb4j9j1hc1g0i0ywdvrnqhjff6h-nun-fail-probe.drv\u001b[0m'.\n       Reason: \u001b[31;1mbuilder failed with exit code 1\u001b[0m.\n       Output paths:\n         \u001b[35;1m/nix/store/wdp9a304wsmv6gx6xvf5r9lp61w0vqr9-nun-fail-probe\u001b[0m","raw_msg":"Cannot build '\u001b[35;1m/nix/store/acmzrbb4j9j1hc1g0i0ywdvrnqhjff6h-nun-fail-probe.drv\u001b[0m'.\nReason: \u001b[31;1mbuilder failed with exit code 1\u001b[0m.\nOutput paths:\n  \u001b[35;1m/nix/store/wdp9a304wsmv6gx6xvf5r9lp61w0vqr9-nun-fail-probe\u001b[0m"}

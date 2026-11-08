@@ -380,6 +380,7 @@ pub async fn preview(cfg: &Config, target: Version) -> Result<UpgradePreview> {
     let new_lock = tokio::fs::read_to_string(scratch.join("flake.lock"))
         .await
         .context("reading the relocked flake.lock")?;
+    ensure_retargeted(&new_lock, &targets, target)?;
 
     // The repo's own flake.nix still names the old branches, and nix would relock an input
     // whose lock entry no longer matches it. Overriding the retargeted inputs with the
@@ -427,6 +428,25 @@ pub async fn preview(cfg: &Config, target: Version) -> Result<UpgradePreview> {
         base_flake_nix: flake_nix,
         base_flake_lock: lock_json,
     })
+}
+
+/// Fail unless every retargeted input was actually relocked from the new branch. The
+/// rewrite of `flake.nix` is textual: a branch name matched elsewhere (a comment, say)
+/// while the input's URL is built from a variable leaves the input on the old release,
+/// and the preview would present an in-release update as an upgrade.
+fn ensure_retargeted(new_lock: &str, targets: &[(String, String)], to: Version) -> Result<()> {
+    for (input, old) in targets {
+        let (prefix, _) = branch_version(old).context("not a release branch")?;
+        let want = format!("{prefix}-{to}");
+        let got = lock::original_ref(new_lock, input);
+        anyhow::ensure!(
+            got.as_deref() == Some(want.as_str()),
+            "{input} is still locked from {} after rewriting flake.nix, so its branch \
+             is not written literally there; change it to {want} by hand",
+            got.as_deref().unwrap_or("no branch")
+        );
+    }
+    Ok(())
 }
 
 /// Fail if `flake.nix` or `flake.lock` in the repo is no longer what `preview` was made
@@ -697,6 +717,26 @@ g\trefs/heads/nixos-24.11
         let e = ensure_repo_unchanged(&dir, &p).await.unwrap_err();
         assert!(e.to_string().contains("flake.nix"), "{e}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_input_left_on_the_old_branch_is_not_an_upgrade() {
+        let targets = vec![
+            ("nixpkgs".to_string(), "nixos-26.05".to_string()),
+            ("home-manager".to_string(), "release-26.05".to_string()),
+        ];
+        let moved = lock_with(&[
+            ("nixpkgs", "nixos-26.11"),
+            ("home-manager", "release-26.11"),
+        ]);
+        ensure_retargeted(&moved, &targets, v("26.11")).unwrap();
+        // The rewrite hit a comment, not the input: nixpkgs relocked on its old branch.
+        let stayed = lock_with(&[
+            ("nixpkgs", "nixos-26.05"),
+            ("home-manager", "release-26.11"),
+        ]);
+        let e = ensure_retargeted(&stayed, &targets, v("26.11")).unwrap_err();
+        assert!(e.to_string().contains("nixpkgs"), "{e}");
     }
 
     #[test]

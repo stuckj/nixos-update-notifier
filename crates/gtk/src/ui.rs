@@ -1508,6 +1508,11 @@ fn show_progress(
             dl_bar.pulse();
         } else {
             dl_bar.set_fraction(1.0);
+            // An apply that ended early leaves nothing in flight to report.
+            for w in [current, stall, builds] {
+                w.set_visible(false);
+            }
+            build_bar.set_visible(false);
         }
         return;
     }
@@ -1550,6 +1555,9 @@ fn show_progress(
         builds.set_visible(true);
         build_bar.set_visible(true);
         build_bar.set_fraction(built.fraction().unwrap_or(0.0));
+    } else {
+        builds.set_visible(false);
+        build_bar.set_visible(false);
     }
 
     let now_doing: Vec<String> = p
