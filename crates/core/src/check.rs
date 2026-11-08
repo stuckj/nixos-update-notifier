@@ -376,8 +376,8 @@ async fn unapplied_diff(cfg: &Config, repo_drv: &str) -> crate::ipc::UnappliedDi
     }
     if !nix::deriver_present(&key.1).await {
         return unavailable(
-            "the running system was not built on this machine (its derivation is not in \
-             the store), so what differs cannot be listed"
+            "the running system's derivation is not in the local store (it was built \
+             elsewhere, or garbage-collected), so what differs cannot be listed"
                 .into(),
         );
     }
