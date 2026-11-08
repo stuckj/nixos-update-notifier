@@ -127,7 +127,13 @@ async fn run_check_cli(config_path: &std::path::Path, json: bool, exact: bool) -
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&outcome.changes)?);
+        // What applying would change: the pending updates, or with none, what the repo
+        // would change on the running system.
+        let changes = match &outcome.unapplied {
+            Some(u) if !outcome.updates_available => &u.changes,
+            _ => &outcome.changes,
+        };
+        println!("{}", serde_json::to_string_pretty(changes)?);
         return Ok(());
     }
 

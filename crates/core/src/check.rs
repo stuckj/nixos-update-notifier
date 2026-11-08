@@ -354,13 +354,56 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
 /// output path to the derivation that built it) to the repo's. A failure to list it does
 /// not fail the check; it is reported instead, since the state itself is already known.
 async fn unapplied_diff(cfg: &Config, repo_drv: &str) -> crate::ipc::UnappliedDiff {
-    let Some(running) = crate::apply::current_system() else {
-        return crate::ipc::UnappliedDiff {
-            changes: Vec::new(),
-            error: Some("could not resolve /run/current-system".into()),
-        };
+    let unavailable = |why: String| crate::ipc::UnappliedDiff {
+        changes: Vec::new(),
+        error: Some(why),
     };
-    match pkgs::diff(&running.display().to_string(), repo_drv).await {
+    let Some(running) = crate::apply::current_system() else {
+        return unavailable("could not resolve /run/current-system".into());
+    };
+    let base = diff_base(&running, Path::new("/nix/var/nix/profiles/system"));
+    let key = (base.display().to_string(), repo_drv.to_string());
+    if let Some((k, cached)) = UNAPPLIED_CACHE.lock().ok().and_then(|c| c.clone()) {
+        if k == key {
+            return cached;
+        }
+    }
+    if !nix::deriver_present(&key.0).await {
+        return unavailable(
+            "the running system was not built on this machine (its derivation is not in \
+             the store), so what differs cannot be listed"
+                .into(),
+        );
+    }
+    let result = diff_running(cfg, &key.0, repo_drv).await;
+    if result.error.is_none() {
+        if let Ok(mut c) = UNAPPLIED_CACHE.lock() {
+            *c = Some((key, result.clone()));
+        }
+    }
+    result
+}
+
+/// The last listed difference, by (running system, repo derivation). The not-applied state
+/// can last for days (a config edit kept unapplied) and every check would otherwise read
+/// both closures again to produce the same list.
+type UnappliedKey = (String, String);
+static UNAPPLIED_CACHE: std::sync::Mutex<Option<(UnappliedKey, crate::ipc::UnappliedDiff)>> =
+    std::sync::Mutex::new(None);
+
+/// The system to diff the repo's toplevel against. Booted or switched into a
+/// specialisation, `/run/current-system` is that specialisation, while the repo's toplevel
+/// is the whole generation (base plus every specialisation); the generation it belongs to
+/// is the like-for-like comparison.
+fn diff_base(running: &Path, profile: &Path) -> PathBuf {
+    match std::fs::canonicalize(profile) {
+        Ok(gen) if gen != running && is_system_or_specialisation(&gen, running) => gen,
+        _ => running.to_path_buf(),
+    }
+}
+
+async fn diff_running(cfg: &Config, running: &str, repo_drv: &str) -> crate::ipc::UnappliedDiff {
+    match pkgs::diff(running, repo_drv).await {
         Ok(mut changes) => {
             annotate_runtime(&mut changes).await;
             // Installed-ness is judged against the running system, where a package the
@@ -449,7 +492,32 @@ fn is_system_or_specialisation(toplevel: &Path, running: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_system_or_specialisation;
+    use super::{diff_base, is_system_or_specialisation};
+
+    /// Running a specialisation, the diff starts from the generation it belongs to (what
+    /// the repo's toplevel is comparable with); otherwise from the running system itself.
+    #[test]
+    fn the_diff_starts_from_the_generation_of_a_running_specialisation() {
+        let root = std::env::temp_dir().join(format!("nun-base-{}", std::process::id()));
+        let gen = root.join("aaa-nixos-system");
+        let gaming = root.join("bbb-nixos-system-gaming");
+        let older = root.join("ccc-nixos-system");
+        for d in [&gen, &gaming, &older] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir_all(gen.join("specialisation")).unwrap();
+        std::os::unix::fs::symlink(&gaming, gen.join("specialisation/gaming")).unwrap();
+        let profile = root.join("system");
+        std::os::unix::fs::symlink(&gen, &profile).unwrap();
+
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+        assert_eq!(diff_base(&canon(&gaming), &profile), canon(&gen));
+        assert_eq!(diff_base(&canon(&gen), &profile), canon(&gen));
+        // Running something the current profile does not contain (an older generation
+        // switched to by hand): diff from what is running.
+        assert_eq!(diff_base(&canon(&older), &profile), canon(&older));
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// Mirrors the store layout: a specialisation is its own store path, linked from
     /// `<toplevel>/specialisation/<name>`, and `/run/current-system` points at it directly.

@@ -208,6 +208,20 @@ pub async fn toplevel_drv_path(
     Ok(path)
 }
 
+/// Whether the derivation that built `path` is in the local store. A system copied in from
+/// another machine (`--target-host`, deploy tools) has no local derivation to read.
+pub async fn deriver_present(path: &str) -> bool {
+    let mut c = Command::new("nix-store");
+    c.args(["--query", "--deriver", path]);
+    match run_capture(&mut c).await {
+        Ok(out) => {
+            let drv = out.trim();
+            drv.starts_with('/') && Path::new(drv).exists()
+        }
+        Err(_) => false,
+    }
+}
+
 /// The `out` path of an instantiated derivation. Reads the `.drv`; builds nothing.
 pub async fn drv_out_path(drv: &str) -> Result<String> {
     let mut c = Command::new("nix-store");
