@@ -148,23 +148,101 @@ async fn run_check_cli(config_path: &std::path::Path, json: bool, exact: bool) -
     if !outcome.updates_available {
         if outcome.running_differs {
             println!("No newer updates, but the repo has not been applied to this system.");
+            for line in not_applied_lines(outcome.unapplied.as_ref()) {
+                println!("{line}");
+            }
         } else {
             println!("System is up to date — no changes from advancing those inputs.");
         }
         return Ok(());
     }
 
+    print_changes(&outcome.changes, exact);
+    Ok(())
+}
+
+/// What applying the repo would change on the running system, for `check`.
+fn not_applied_lines(unapplied: Option<&nun_core::ipc::UnappliedDiff>) -> Vec<String> {
+    let Some(u) = unapplied else {
+        return Vec::new();
+    };
+    if let Some(e) = &u.error {
+        return vec![format!("Could not list what differs: {e}")];
+    }
+    if u.changes.is_empty() {
+        return vec!["No package changes; only configuration differs.".into()];
+    }
+    let mut out = vec![format!(
+        "Applying would change {} package(s) (this check downloaded nothing):\n",
+        u.changes.len()
+    )];
+    out.extend(u.changes.iter().map(change_line));
+    out
+}
+
+fn change_line(c: &diff::PackageChange) -> String {
+    match &c.changelog {
+        Some(url) => format!("  {}   [changelog: {}]", c.render_line(), url),
+        None => format!("  {}", c.render_line()),
+    }
+}
+
+fn print_changes(changes: &[diff::PackageChange], exact: bool) {
     let note = if exact {
         "exact runtime diff (candidate was built)"
     } else {
         "this check downloaded nothing"
     };
-    println!("{} package change(s) ({note}):\n", outcome.changes.len());
-    for c in &outcome.changes {
-        match &c.changelog {
-            Some(url) => println!("  {}   [changelog: {}]", c.render_line(), url),
-            None => println!("  {}", c.render_line()),
+    println!("{} package change(s) ({note}):\n", changes.len());
+    for c in changes {
+        println!("{}", change_line(c));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::not_applied_lines;
+    use nun_core::diff::{ChangeKind, PackageChange};
+    use nun_core::ipc::UnappliedDiff;
+
+    fn added(name: &str, v: &str) -> PackageChange {
+        PackageChange {
+            name: name.into(),
+            old: vec![],
+            new: vec![v.into()],
+            kind: ChangeKind::Added,
+            size_delta: None,
+            changelog: None,
+            runtime: true,
         }
     }
-    Ok(())
+
+    #[test]
+    fn not_applied_output_lists_what_would_change() {
+        let u = UnappliedDiff {
+            changes: vec![added("wakeful", "0.1.0")],
+            error: None,
+        };
+        let lines = not_applied_lines(Some(&u));
+        assert!(lines[0].starts_with("Applying would change 1 package(s)"));
+        assert_eq!(lines[1], "  wakeful: (new) -> 0.1.0");
+    }
+
+    #[test]
+    fn not_applied_output_says_when_only_configuration_differs() {
+        let u = UnappliedDiff::default();
+        assert_eq!(
+            not_applied_lines(Some(&u)),
+            vec!["No package changes; only configuration differs."]
+        );
+        let failed = UnappliedDiff {
+            changes: vec![],
+            error: Some("no deriver".into()),
+        };
+        assert_eq!(
+            not_applied_lines(Some(&failed)),
+            vec!["Could not list what differs: no deriver"]
+        );
+        assert!(not_applied_lines(None).is_empty());
+    }
 }

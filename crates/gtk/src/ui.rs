@@ -167,6 +167,8 @@ fn build_updates_window(app: &Application) {
                             ));
                         }
 
+                        // Rows that belong below the explanatory note rather than above it.
+                        let mut after_note: Vec<gtk::Widget> = Vec::new();
                         let (heading, empty_note) = match (status.as_str(), changes.is_empty()) {
                             ("applying", _) => {
                                 let open = gtk::Button::with_label("Show progress");
@@ -191,6 +193,47 @@ fn build_updates_window(app: &Application) {
                                         let _ = c.revert_lock();
                                     });
                                     list.append(&revert);
+                                }
+                                // What applying would change, so an intended edit can be told
+                                // from an accidental one before clicking Apply.
+                                match &details.unapplied {
+                                    Some(u) if u.error.is_some() => after_note.push(
+                                        note_label(
+                                            &format!(
+                                                "<b>Could not list what differs.</b>\n<small>{}</small>",
+                                                glib::markup_escape_text(
+                                                    u.error.as_deref().unwrap_or_default()
+                                                )
+                                            ),
+                                            "dim-label",
+                                        )
+                                        .upcast(),
+                                    ),
+                                    Some(u) if u.changes.is_empty() => after_note.push(
+                                        note_label(
+                                            "<b>No package changes; only configuration differs.</b>",
+                                            "",
+                                        )
+                                        .upcast(),
+                                    ),
+                                    Some(u) => {
+                                        after_note.push(
+                                            note_label(
+                                                &format!(
+                                                    "<b>Applying would change {} package(s):</b>",
+                                                    u.changes.len()
+                                                ),
+                                                "",
+                                            )
+                                            .upcast(),
+                                        );
+                                        let mut ordered: Vec<&PackageChange> =
+                                            u.changes.iter().collect();
+                                        ordered.sort_by_key(|c| (!c.runtime, c.name.clone()));
+                                        after_note
+                                            .extend(ordered.into_iter().map(|c| update_row(c).upcast()));
+                                    }
+                                    None => {}
                                 }
                                 (
                                     "Your flake is not what is running".to_string(),
@@ -277,6 +320,9 @@ fn build_updates_window(app: &Application) {
                             row.set_justify(gtk::Justification::Center);
                             list.append(&row);
                         }
+                        for w in &after_note {
+                            list.append(w);
+                        }
                         // Updates to installed software first — that is what the user came
                         // to read; build-time churn is context, not the headline.
                         let mut ordered: Vec<&PackageChange> = changes.iter().collect();
@@ -320,15 +366,35 @@ fn build_updates_window(app: &Application) {
 
     // Buttons: Check now (trigger a daemon check), Apply, Refresh.
     let check_btn = gtk::Button::with_label("Check now");
+    let check_spinner = gtk::Spinner::new();
+    let check_label = gtk::Label::new(Some("Checking…"));
+    check_label.add_css_class("dim-label");
+    check_spinner.set_visible(false);
+    check_label.set_visible(false);
+    // Reflect the daemon's status on the button: a check takes from seconds to minutes, so
+    // the feedback has to come from the daemon, not a timer.
+    let show_status = {
+        let check_btn = check_btn.clone();
+        let check_spinner = check_spinner.clone();
+        let check_label = check_label.clone();
+        move |status: &str| {
+            let checking = status == "checking";
+            check_spinner.set_visible(checking);
+            check_spinner.set_spinning(checking);
+            check_label.set_visible(checking);
+            // The daemon ignores a check request during a check or an apply.
+            check_btn.set_sensitive(!checking && status != "applying");
+        }
+    };
     {
         let client = client.clone();
-        let refresh = refresh.clone();
+        let show_status = show_status.clone();
         check_btn.connect_clicked(move |_| {
             if let Some(c) = &client {
                 let _ = c.check_now();
             }
-            // Give the daemon a moment to finish, then repaint.
-            glib::timeout_add_local_once(Duration::from_millis(1500), refresh.clone());
+            // Until the next status poll confirms it.
+            show_status("checking");
         });
     }
 
@@ -357,6 +423,28 @@ fn build_updates_window(app: &Application) {
             glib::ControlFlow::Continue
         });
     }
+    // A cheaper, quicker poll of the status alone, for the check indicator; a change of
+    // status (a check finishing, say) repaints the list straight away.
+    {
+        let client = client.clone();
+        let refresh = refresh.clone();
+        let last: RefCell<Option<String>> = RefCell::new(None);
+        glib::timeout_add_local(Duration::from_millis(500), move || {
+            if let Some(status) = client
+                .as_ref()
+                .and_then(|c| c.status().ok())
+                .map(|(s, _)| s)
+            {
+                show_status(&status);
+                let changed = last.borrow().as_deref() != Some(status.as_str());
+                if changed {
+                    *last.borrow_mut() = Some(status);
+                    refresh();
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 
     let buttons = gtk::Box::new(Orientation::Horizontal, 8);
     buttons.set_margin_start(8);
@@ -364,6 +452,8 @@ fn build_updates_window(app: &Application) {
     buttons.set_margin_top(4);
     buttons.set_margin_bottom(8);
     buttons.append(&check_btn);
+    buttons.append(&check_spinner);
+    buttons.append(&check_label);
     buttons.append(&apply_btn);
     let spacer = gtk::Box::new(Orientation::Horizontal, 0);
     spacer.set_hexpand(true);

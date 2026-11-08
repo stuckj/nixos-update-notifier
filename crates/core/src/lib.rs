@@ -45,6 +45,18 @@ pub mod ipc {
         /// Whether the user dismissed `release`'s newest version.
         pub release_dismissed: bool,
         pub upgrade: UpgradeInfo,
+        /// What the running system lacks compared with the repo, when it is not applied.
+        pub unapplied: Option<UnappliedDiff>,
+    }
+
+    /// The package difference between the running system and the repo as it is now.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct UnappliedDiff {
+        /// Empty with no `error`: only configuration differs, no package version.
+        pub changes: Vec<PackageChange>,
+        /// Why the difference could not be listed.
+        pub error: Option<String>,
     }
 
     /// The current or most recent apply. `id` increases with every apply, so a window

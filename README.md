@@ -210,8 +210,10 @@ the full log. Cancel is safe while building and downloading.
 If `flake.lock` ends up ahead of the running system — an apply that never finished, or a
 hand-run `nix flake update` — the tray shows **not applied** rather than "up to date". The
 same state appears for configuration changes you have not rebuilt yet, including a new
-commit if your config embeds its git revision (`system.configurationRevision`). Apply
-rebuilds from the repo as it is. When the newest lock backup is exactly what is running,
+commit if your config embeds its git revision (`system.configurationRevision`). The update
+window (and `nixos-update-notifier check`) lists what applying would change — e.g.
+`wakeful: (new) -> 0.1.0` — or says that only configuration differs, so you can tell an
+intended edit from an accidental one. Apply rebuilds from the repo as it is. When the newest lock backup is exactly what is running,
 the update window also offers **Revert flake.lock**, which puts it back (backing up the
 current lock first).
 

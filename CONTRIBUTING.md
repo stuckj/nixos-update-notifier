@@ -161,7 +161,9 @@ baseline's output path is also compared with `/run/current-system`; if they diff
 advanced without a switch, or configuration edits not yet rebuilt — the state is
 `NotApplied`, offering a rebuild of the repo as it is instead of a false "up to date" — and
 a revert to the newest `flake.lock.bak.*` only when evaluating with that backup gives the
-running system exactly.
+running system exactly. In that state the check also lists what differs: the same
+inventory diff, from the running system's derivation (`nix derivation show -r` resolves an
+output path to the derivation that built it) to the repo's.
 
 ### Failures
 

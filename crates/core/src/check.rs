@@ -46,6 +46,9 @@ pub struct CheckOutcome {
     pub base_lock: String,
     /// …and with the newest `flake.lock` backup instead, it describes the running system.
     pub revert_matches_running: bool,
+    /// With nothing newer upstream but the repo not applied: what differs from the running
+    /// system.
+    pub unapplied: Option<crate::ipc::UnappliedDiff>,
 }
 
 impl CheckOutcome {
@@ -302,6 +305,11 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         // Revert is offered only in this state (nothing newer, system not applied), so the
         // extra evaluation is spent only here.
         let revert_matches_running = running_differs && backup_matches_running(cfg).await;
+        let unapplied = if running_differs {
+            Some(unapplied_diff(cfg, &current_drv).await)
+        } else {
+            None
+        };
         return Ok(CheckOutcome {
             updates_available: false,
             changes: Vec::new(),
@@ -311,6 +319,7 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
             failed_inputs,
             running_differs,
             revert_matches_running,
+            unapplied,
             base_lock,
         });
     }
@@ -335,8 +344,47 @@ pub async fn run(cfg: &Config) -> Result<CheckOutcome> {
         failed_inputs,
         running_differs,
         revert_matches_running: false,
+        unapplied: None,
         base_lock,
     })
+}
+
+/// What the running system lacks compared with the repo: the same download-free diff a
+/// check makes, from the running system's derivation (`nix derivation show` resolves an
+/// output path to the derivation that built it) to the repo's. A failure to list it does
+/// not fail the check; it is reported instead, since the state itself is already known.
+async fn unapplied_diff(cfg: &Config, repo_drv: &str) -> crate::ipc::UnappliedDiff {
+    let Some(running) = crate::apply::current_system() else {
+        return crate::ipc::UnappliedDiff {
+            changes: Vec::new(),
+            error: Some("could not resolve /run/current-system".into()),
+        };
+    };
+    match pkgs::diff(&running.display().to_string(), repo_drv).await {
+        Ok(mut changes) => {
+            annotate_runtime(&mut changes).await;
+            // Installed-ness is judged against the running system, where a package the
+            // repo adds cannot be yet; without building the repo's system there is no
+            // telling an added program from an added build input, so it is listed plainly.
+            for c in changes.iter_mut() {
+                if c.kind == diff::ChangeKind::Added {
+                    c.runtime = true;
+                }
+            }
+            changelog::enrich(cfg, &cfg.flake_path.join("flake.lock"), &mut changes).await;
+            crate::ipc::UnappliedDiff {
+                changes,
+                error: None,
+            }
+        }
+        Err(e) => {
+            tracing::warn!("could not diff the running system against the repo: {e:#}");
+            crate::ipc::UnappliedDiff {
+                changes: Vec::new(),
+                error: Some(format!("{e:#}")),
+            }
+        }
+    }
 }
 
 /// Whether restoring the newest `flake.lock` backup would make the repo describe exactly

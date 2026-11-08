@@ -214,6 +214,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                         s.candidate_drv = None;
                         s.release = None;
                         s.running_differs = false;
+                        s.unapplied = None;
                         s.can_revert_lock = false;
                         repo_gen += 1;
                     }
@@ -584,6 +585,7 @@ async fn handle_check_result(
             s.candidate_drv = Some(outcome.candidate_drv.clone());
             s.failed_inputs = outcome.failed_inputs.clone();
             s.running_differs = outcome.running_differs;
+            s.unapplied = None;
             s.check_failure = None;
             s.notified_failure = None;
             if notified {
@@ -609,6 +611,7 @@ async fn handle_check_result(
             // was silently skipped, so the client must still be able to say so.
             s.failed_inputs = up_to_date.failed_inputs.clone();
             s.running_differs = up_to_date.running_differs;
+            s.unapplied = up_to_date.unapplied.clone();
             s.check_failure = None;
             s.notified_failure = None;
         }
@@ -647,6 +650,7 @@ async fn handle_check_result(
             s.candidate_base_lock = None;
             s.candidate_drv = None;
             s.running_differs = false;
+            s.unapplied = None;
             if notify_now {
                 s.notified_failure = Some(failure.headline().to_string());
             }

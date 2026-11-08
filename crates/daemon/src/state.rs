@@ -3,7 +3,7 @@
 use nun_core::config::Icons;
 use nun_core::diff::PackageChange;
 use nun_core::failure::Failure;
-use nun_core::ipc::{ApplyInfo, Details, UpgradeInfo};
+use nun_core::ipc::{ApplyInfo, Details, UnappliedDiff, UpgradeInfo};
 use nun_core::release::{ReleaseOffer, UpgradePreview};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -170,6 +170,8 @@ pub struct Shared {
     pub upgrade: UpgradeInfo,
     /// …and what applying it installs, once it is ready.
     pub upgrade_plan: Option<UpgradePreview>,
+    /// What differs from the running system, in the not-applied state.
+    pub unapplied: Option<UnappliedDiff>,
     /// Remembered across restarts so a release is announced once.
     pub persisted: crate::persist::Persisted,
 }
@@ -189,6 +191,7 @@ impl Shared {
             release: self.release.clone(),
             release_dismissed,
             upgrade: self.upgrade.clone(),
+            unapplied: self.unapplied.clone(),
         }
     }
 }
