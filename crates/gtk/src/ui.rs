@@ -1509,7 +1509,7 @@ fn show_progress(
         } else {
             dl_bar.set_fraction(1.0);
             // An apply that ended early leaves nothing in flight to report.
-            for w in [current, stall, builds] {
+            for w in [downloads, current, stall, builds] {
                 w.set_visible(false);
             }
             build_bar.set_visible(false);

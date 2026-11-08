@@ -979,7 +979,8 @@ fn restore_note(restored: Option<bool>) -> &'static str {
         Some(true) => "\nThe previous flake files were restored.",
         Some(false) => {
             "\nThe flake files were not all restored (edited during the update, or the \
-             copy failed); see the log for where the previous versions are."
+             copy failed); `journalctl --user -u nixos-update-notifier` says where the \
+             previous versions are."
         }
     }
 }
@@ -987,24 +988,29 @@ fn restore_note(restored: Option<bool>) -> &'static str {
 /// What the apply log says went wrong: its text (with nix's JSON events folded back into
 /// messages), as a [`Failure`].
 fn apply_log_failure() -> Failure {
+    match std::fs::File::open(nun_core::apply::apply_log_path()) {
+        Ok(f) => failure_from_log(std::io::BufReader::new(f)),
+        Err(_) => failure_from_log(std::io::empty()),
+    }
+}
+
+/// Fold the whole apply log, streaming. A build's output is attached to its failure only if
+/// its start was seen, which can be megabytes before the end; memory stays bounded since
+/// only the shown lines' tail is kept.
+fn failure_from_log(log: impl std::io::BufRead) -> Failure {
     const TAIL_LINES: usize = 200;
-    // nix logs every builder output line as an event, so a source build leaves megabytes;
-    // the cause is at the end.
-    const TAIL_BYTES: u64 = 1 << 20;
-    let text = (|| -> std::io::Result<String> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(nun_core::apply::apply_log_path())?;
-        let len = f.metadata()?.len();
-        f.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        Ok(String::from_utf8_lossy(&buf).into_owned())
-    })()
-    .unwrap_or_default();
     let mut progress = nun_core::progress::Progress::default();
-    let lines: Vec<String> = text.lines().filter_map(|l| progress.feed_line(l)).collect();
-    let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
-    Failure::from_output("applying updates (nixos-rebuild switch)", &tail)
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for line in log.split(b'\n').map_while(Result::ok) {
+        if let Some(shown) = progress.feed_line(&String::from_utf8_lossy(&line)) {
+            if tail.len() == TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(shown);
+        }
+    }
+    let text = Vec::from(tail).join("\n");
+    Failure::from_output("applying updates (nixos-rebuild switch)", &text)
 }
 
 /// Run the privileged rebuild and report the outcome. The backups are `(backup, installed
@@ -1215,5 +1221,33 @@ mod tests {
         );
         assert!(restore_note(Some(true)).contains("were restored"));
         assert!(!restore_note(Some(false)).contains("were restored"));
+    }
+
+    /// The failing build's start sits megabytes before the end of a real log; its output
+    /// must still reach the failure.
+    #[test]
+    fn a_failure_far_into_a_long_log_keeps_the_builder_output() {
+        let fixture = include_str!("../../core/tests/fixtures/nix-log/build-failure.jsonl");
+        // ~2 MB of progress events right after the build starts, as other activity would
+        // leave in a real rebuild.
+        let padding = r#"@nix {"action":"result","fields":[1,2,0,0],"id":1,"type":105}"#;
+        let mut log = String::new();
+        for line in fixture.lines() {
+            log.push_str(line);
+            log.push('\n');
+            if line.contains(r#""text":"building '"#) {
+                for _ in 0..40_000 {
+                    log.push_str(padding);
+                    log.push('\n');
+                }
+            }
+        }
+        assert!(log.len() > 2 << 20, "the padding was not inserted");
+        let f = super::failure_from_log(std::io::Cursor::new(log));
+        assert!(
+            f.details.contains("foo.c:3: error: expected semicolon"),
+            "{}",
+            &f.details[f.details.len().saturating_sub(800)..]
+        );
     }
 }

@@ -218,8 +218,10 @@ impl Progress {
             Some(log) if msg.contains("failed") || msg.contains("Cannot build") => {
                 let mut out = msg;
                 out.push_str("\n       Last lines of the build log:");
+                // Marked as nix marks builder output, so a builder's own `error: …` line
+                // is not read as nix's error (which names the failed package).
                 for l in log {
-                    out.push_str("\n         ");
+                    out.push_str("\n       > ");
                     out.push_str(l);
                 }
                 out
@@ -399,6 +401,34 @@ mod tests {
             failure.details.contains("foo.c:3: error"),
             "{}",
             failure.details
+        );
+    }
+
+    /// The shape of a nixos-rebuild failure: the failing derivation is a dependency of the
+    /// one requested (real nix 2.35 log). Its build stops before nix reports it, and the
+    /// requested one then fails only because its dependency did.
+    #[test]
+    fn a_failed_dependency_reports_its_builder_output() {
+        let text = include_str!("../tests/fixtures/nix-log/dependency-failure.jsonl");
+        let mut p = Progress::default();
+        let shown: Vec<String> = text.lines().filter_map(|l| p.feed_line(l)).collect();
+        let dep = shown
+            .iter()
+            .find(|l| l.contains("Cannot build") && l.contains("nun-dep-fail.drv"))
+            .expect("the dependency's failure");
+        assert!(dep.contains("> dep.c:7: error: unknown type"), "{dep}");
+        let top = shown
+            .iter()
+            .find(|l| l.contains("Cannot build") && l.contains("nun-top.drv"))
+            .expect("the requested derivation's failure");
+        assert!(!top.contains("Last lines"), "{top}");
+
+        // The builder's own `error:` text does not displace nix's line as the summary.
+        let failure = crate::failure::Failure::from_output("applying", &shown.join("\n"));
+        assert!(
+            failure.summary.contains("nun-dep-fail.drv"),
+            "{}",
+            failure.summary
         );
     }
 
