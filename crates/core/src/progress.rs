@@ -299,7 +299,7 @@ impl RateMeter {
 
     /// Record the cumulative byte count at time `t` (seconds, any monotonic origin).
     pub fn record(&mut self, t: f64, bytes: u64) {
-        let changed = self.samples.last().map_or(true, |(_, b)| *b != bytes);
+        let changed = self.samples.last().is_none_or(|(_, b)| *b != bytes);
         if changed {
             self.last_change = Some(t);
         }
