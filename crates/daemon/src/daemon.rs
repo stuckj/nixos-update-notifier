@@ -164,7 +164,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         let cmd = tokio::select! {
             _ = ticker.tick() => {
                 // Due only when enough WALL-CLOCK time has passed since the last check.
-                let due = last_check.map_or(true, |t| {
+                let due = last_check.is_none_or(|t| {
                     // A clock that went backwards yields Err; treat that as "due" rather
                     // than never checking again.
                     t.elapsed().map(|e| e >= cfg.interval()).unwrap_or(true)
