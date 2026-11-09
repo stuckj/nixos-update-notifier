@@ -242,11 +242,20 @@ fi
 
 echo "== GTK client =="
 MON=""
+# Members of our interface called in the monitored traffic, one per line. The monitor sees
+# the whole session bus, so a message counts only if it carries our interface itself;
+# nothing else calls the daemon while this runs.
+our_calls() {
+  awk -v iface="Interface=$IFACE" '
+    /Type=/ { mine = 0; member = "" }
+    index($0, iface) { mine = 1 }
+    match($0, /Member=[A-Za-z]+/) { member = substr($0, RSTART + 7, RLENGTH - 7) }
+    mine && member != "" { print member; mine = 0 }
+  ' "$1" | sort -u
+}
 if [[ "$NONINTERACTIVE" -eq 1 ]]; then
-  # Nothing else calls the daemon while this runs, so any GetStatus/GetUpdates call seen
-  # here comes from the GTK client.
   MON="$(mktemp --suffix=.busmon)"
-  $BUS monitor --match "type='method_call',destination='$SVC'" >"$MON" 2>&1 &
+  $BUS monitor >"$MON" 2>&1 &
   MPID=$!
   sleep 1
 fi
@@ -255,16 +264,16 @@ info "launching: $gtk_bin updates"
 GPID=$!
 if [[ "$NONINTERACTIVE" -eq 1 ]]; then
   for _ in $(seq 1 30); do
-    grep -qE 'Member=(GetStatus|GetUpdates)' "$MON" && break
+    our_calls "$MON" | grep -qxE 'GetStatus|GetUpdates' && break
     kill -0 "$GPID" 2>/dev/null || break
     sleep 0.5
   done
   sleep 2
   kill "$MPID" 2>/dev/null
-  if grep -qE 'Member=(GetStatus|GetUpdates)' "$MON"; then
-    ok "GTK client called the daemon over D-Bus ($(grep -oE 'Member=Get[A-Za-z]+' "$MON" | sort -u | tr '\n' ' '))"
+  if our_calls "$MON" | grep -qxE 'GetStatus|GetUpdates'; then
+    ok "GTK client called the daemon over D-Bus ($(our_calls "$MON" | tr '\n' ' '))"
   else
-    no "no GetStatus/GetUpdates call from the GTK client within 15s (monitor log: $MON)"
+    no "no $IFACE GetStatus/GetUpdates call from the GTK client within 15s (monitor log: $MON)"
   fi
   if kill -0 "$GPID" 2>/dev/null; then
     ok "GTK client is still running"
