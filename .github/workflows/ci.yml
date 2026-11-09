@@ -62,7 +62,9 @@ jobs:
       - name: build the VM test driver
         run: nix build -L .#vmTests.plasma-smoke.driver
       - name: run the smoke test in the VM
-        run: ./result/bin/nixos-test-driver --output_directory smoke-out
+        run: |
+          mkdir -p smoke-out
+          ./result/bin/nixos-test-driver --output_directory smoke-out
       - name: upload screenshots
         if: always()
         uses: actions/upload-artifact@v7
