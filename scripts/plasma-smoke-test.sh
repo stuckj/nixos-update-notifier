@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Manual smoke test for a real KDE Plasma 6 / Wayland session.
+# Smoke test for a real KDE Plasma 6 / Wayland session.
 #
-# Verifies the parts that can't be exercised headlessly: the SNI tray registration, the
-# D-Bus service, desktop notifications, and the GTK client connecting to the daemon. It is
-# strictly READ-ONLY — it never applies an update.
+# Verifies what unit tests can't: the SNI tray registration, the D-Bus service, desktop
+# notifications, and the GTK client connecting to the daemon. It is strictly READ-ONLY —
+# it never applies an update.
 #
 # Usage:
 #   scripts/plasma-smoke-test.sh --config ~/.config/nixos-update-notifier/config.toml
@@ -12,15 +12,21 @@
 #
 # If a daemon is already running (e.g. the systemd user service), it is reused and no
 # config is needed. Otherwise one is started from --config, or from --flake + --host.
+#
+# --non-interactive replaces each y/N question with a check a machine can make, for the
+# CI VM test (nix/tests/plasma-smoke.nix). --keep-running leaves the daemon and the GTK
+# window up on exit so the caller can screenshot them.
 set -uo pipefail
 
-CONFIG="" FLAKE="" HOST="" BIN_DIR=""
+CONFIG="" FLAKE="" HOST="" BIN_DIR="" NONINTERACTIVE=0 KEEP_RUNNING=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config)  CONFIG="$2"; shift 2 ;;
     --flake)   FLAKE="$2"; shift 2 ;;
     --host)    HOST="$2"; shift 2 ;;
     --bin-dir) BIN_DIR="$2"; shift 2 ;;
+    --non-interactive) NONINTERACTIVE=1; shift ;;
+    --keep-running)    KEEP_RUNNING=1; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -30,7 +36,7 @@ PASS=0 FAIL=0
 ok()   { echo "  [PASS] $*"; PASS=$((PASS + 1)); }
 no()   { echo "  [FAIL] $*"; FAIL=$((FAIL + 1)); }
 info() { echo "  [info] $*"; }
-ask()  { # ask "<question>" "<label>"
+ask()  { # ask "<question>" "<label>"; not reached with --non-interactive
   local a
   read -r -p "  [ ?  ] $1 [y/N] " a
   if [[ "$a" == [yY]* ]]; then ok "$2"; else no "$2"; fi
@@ -184,30 +190,100 @@ if [[ -n "${DPID:-}" ]]; then
     else info "$prop '$name' not found in this process's icon paths — confirm it renders"; fi
   done
 fi
-items=$($BUS get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
-  org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems 2>/dev/null)
-if echo "$items" | grep -qi "UpdateNotifier"; then
-  ok "our item is registered with the StatusNotifierWatcher"
+registered_items() {
+  $BUS get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
+    org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems 2>/dev/null
+}
+# ksni registers asynchronously, under org.kde.StatusNotifierItem-<pid>-<n>.
+our_item="UpdateNotifier"
+[[ -n "${DPID:-}" ]] && our_item="StatusNotifierItem-${DPID}-"
+items=""
+for _ in $(seq 1 20); do
+  items=$(registered_items)
+  echo "$items" | grep -qi -- "$our_item" && break
+  sleep 1
+done
+if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+  if echo "$items" | grep -qi -- "$our_item"; then
+    ok "our item is registered with the StatusNotifierWatcher (the tray shows registered items)"
+  else
+    no "our item ($our_item) is not registered; watcher items: ${items:-<none>}"
+  fi
 else
-  info "watcher items: ${items:-<none>} (ksni may register under a generated name)"
+  if echo "$items" | grep -qi -- "$our_item"; then
+    ok "our item is registered with the StatusNotifierWatcher"
+  else
+    info "watcher items: ${items:-<none>} (ksni may register under a generated name)"
+  fi
+  ask "Is the NixOS update-notifier tray icon visible in your system tray?" "tray icon visible"
 fi
-ask "Is the NixOS update-notifier tray icon visible in your system tray?" "tray icon visible"
 
 echo "== Notifications =="
 if command -v notify-send >/dev/null 2>&1; then
-  notify-send -a "nixos-update-notifier" "Smoke test" "If you can see this, notifications work."
-  ask "Did a test desktop notification appear?" "notifications render"
+  if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+    # The notification server returns an id only once it has accepted the notification.
+    if nid=$(notify-send -p -a "nixos-update-notifier" "Smoke test" "Automated notification check.") \
+        && [[ "$nid" =~ ^[0-9]+$ ]]; then
+      ok "notification server accepted a notification (id $nid)"
+    else
+      no "notify-send did not get a notification id back: '${nid:-}'"
+    fi
+  else
+    notify-send -a "nixos-update-notifier" "Smoke test" "If you can see this, notifications work."
+    ask "Did a test desktop notification appear?" "notifications render"
+  fi
 else
-  info "notify-send not installed; skipping (the daemon calls the Notifications D-Bus API directly)"
+  if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+    no "notify-send not installed; the notification check needs it"
+  else
+    info "notify-send not installed; skipping (the daemon calls the Notifications D-Bus API directly)"
+  fi
 fi
 
 echo "== GTK client =="
+MON=""
+if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+  # Nothing else calls the daemon while this runs, so any GetStatus/GetUpdates call seen
+  # here comes from the GTK client.
+  MON="$(mktemp --suffix=.busmon)"
+  $BUS monitor --match "type='method_call',destination='$SVC'" >"$MON" 2>&1 &
+  MPID=$!
+  sleep 1
+fi
 info "launching: $gtk_bin updates"
 "$gtk_bin" updates >/dev/null 2>&1 &
 GPID=$!
-sleep 3
-ask "Did the 'NixOS — Pending updates' window open and show a status/list (not 'Daemon not running')?" \
-  "GTK client opens and connects over D-Bus"
+if [[ "$NONINTERACTIVE" -eq 1 ]]; then
+  for _ in $(seq 1 30); do
+    grep -qE 'Member=(GetStatus|GetUpdates)' "$MON" && break
+    kill -0 "$GPID" 2>/dev/null || break
+    sleep 0.5
+  done
+  sleep 2
+  kill "$MPID" 2>/dev/null
+  if grep -qE 'Member=(GetStatus|GetUpdates)' "$MON"; then
+    ok "GTK client called the daemon over D-Bus ($(grep -oE 'Member=Get[A-Za-z]+' "$MON" | sort -u | tr '\n' ' '))"
+  else
+    no "no GetStatus/GetUpdates call from the GTK client within 15s (monitor log: $MON)"
+  fi
+  if kill -0 "$GPID" 2>/dev/null; then
+    ok "GTK client is still running"
+  else
+    wait "$GPID"; no "GTK client exited early (status $?)"
+  fi
+else
+  sleep 3
+  ask "Did the 'NixOS — Pending updates' window open and show a status/list (not 'Daemon not running')?" \
+    "GTK client opens and connects over D-Bus"
+fi
+
+if [[ "$KEEP_RUNNING" -eq 1 ]]; then
+  info "--keep-running: leaving the GTK client (pid $GPID) and daemon (pid ${DPID:-reused}) up"
+  echo
+  echo "== Summary: $PASS passed, $FAIL failed =="
+  [[ "$FAIL" -eq 0 ]]
+  exit
+fi
 kill "$GPID" 2>/dev/null
 
 if [[ "$STARTED" -eq 1 && -n "$DPID" ]]; then

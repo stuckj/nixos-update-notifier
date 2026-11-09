@@ -56,6 +56,15 @@
         }
       );
 
+      # VM tests need KVM, which `nix flake check` must not require, so they sit outside
+      # `checks`; CI builds them in their own job. See nix/tests/plasma-smoke.nix.
+      legacyPackages = forAllSystems (pkgs: {
+        vmTests.plasma-smoke = import ./nix/tests/plasma-smoke.nix {
+          inherit pkgs;
+          package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
+      });
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           name = "nixos-update-notifier-dev";

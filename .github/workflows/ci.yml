@@ -48,6 +48,29 @@ jobs:
       - name: build package
         run: nix build -L
 
+  # Tier 2b: scripts/plasma-smoke-test.sh unattended in a NixOS VM running a real Plasma 6
+  # Wayland session: SNI tray registration, notifications, the D-Bus service and the GTK
+  # client against the daemon. Runs the test driver directly rather than `nix build` so the
+  # screenshots survive a failure.
+  plasma-smoke:
+    name: Plasma smoke test (NixOS VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: build the VM test driver
+        run: nix build -L .#vmTests.plasma-smoke.driver
+      - name: run the smoke test in the VM
+        run: ./result/bin/nixos-test-driver --output_directory smoke-out
+      - name: upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: plasma-smoke-screenshots
+          path: smoke-out/
+          if-no-files-found: ignore
+
   # Tier 3: integration tests that drive the REAL `nix` invocations against tiny committed
   # fixture flakes — input listing and the `nix store diff-closures` output format. These
   # guard the parser against Nix-version output drift. They are `#[ignore]`d so they only
