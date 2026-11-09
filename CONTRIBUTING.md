@@ -238,14 +238,15 @@ README; it cannot be fixed without changing what the tool is for.
 | Unit | `cargo test -p nun-core -p nixos-update-notifier` | nothing |
 | Integration | `cargo test -p nun-core --test integration -- --ignored` | real `nix` |
 | Smoke | `scripts/plasma-smoke-test.sh` | a live Plasma session |
+| Smoke (VM) | `nix build -L .#vmTests.plasma-smoke` | KVM |
 
 Integration tests drive real `nix` against committed fixture flakes and pin the
 `diff-closures` output format so a future nix release can't silently break the parser. They
 are `#[ignore]`d so a plain `cargo test` works where `nix` is absent.
 
-The smoke test covers what can't be tested headlessly — SNI registration, the D-Bus
-service and its caller checks, mid-check responsiveness, icon-name resolution, and the GTK
-client. It is strictly read-only and never applies an update:
+The smoke test covers what unit tests can't — SNI registration, the D-Bus service and its
+caller checks, mid-check responsiveness, icon-name resolution, and the GTK client. It is
+strictly read-only and never applies an update:
 
 ```console
 $ nix build
@@ -253,23 +254,34 @@ $ scripts/plasma-smoke-test.sh --bin-dir ./result/bin \
     --flake ~/dev/personal/nixos-config --host nixos-x1
 ```
 
-Please run it before merging anything that touches the tray, the D-Bus interface, or the
-windows. Most of the bugs found in this project so far were invisible to unit tests and CI:
-a blank tray icon logs nothing anywhere, and a daemon that ignores its menu looks identical
-to a working one until you click.
+CI runs the same script unattended (`--non-interactive`) in a NixOS VM with a real Plasma 6
+Wayland session (`nix/tests/plasma-smoke.nix`). There, the three questions become checks:
+
+- **Tray icon:** the item is registered with Plasma's StatusNotifierWatcher.
+- **Notifications:** the notification server accepted one and returned an id.
+- **GTK client:** it called the daemon over D-Bus and stayed up, and OCR finds its "Pending
+  updates" window on screen.
+
+What the VM can't judge is whether the icon *looks* right in your theme and panel. So still
+run the script by hand before merging changes to the tray's appearance. Most of the bugs
+found here so far were invisible to unit tests: a blank tray icon logs nothing anywhere, and
+a daemon that ignores its menu looks identical to a working one until you click.
 
 ---
 
 ## CI
 
-`ci.yml` runs three jobs on every push and PR:
+`ci.yml` runs four jobs on every push and PR:
 
 1. **lint + unit tests** — `rustfmt`, `clippy -D warnings`, unit tests and `shellcheck`, on
    a bare runner with no apt packages (this is what the crate split buys).
 2. **nix flake check + build** — builds the GTK client and both Nix modules.
-3. **fixture-flake integration** — the real-`nix` tests.
+3. **Plasma smoke test (NixOS VM)** — the smoke test above, in a Plasma 6 VM on KVM. Its
+   screenshots are uploaded as the `plasma-smoke-screenshots` artifact, including when it
+   fails.
+4. **fixture-flake integration** — the real-`nix` tests.
 
-No graphical environment is involved anywhere; the GUI is only ever compiled.
+The VM test is kept out of `checks` so `nix flake check` still works without KVM.
 
 ---
 
