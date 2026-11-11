@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "nixos-update-notifier"
-version = "0.10.3-canary.3"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "nixos-update-notifier-gtk"
-version = "0.10.3-canary.3"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "nun-core"
-version = "0.10.3-canary.3"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "directories",
