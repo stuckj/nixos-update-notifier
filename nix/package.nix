@@ -15,7 +15,7 @@
 }:
 rustPlatform.buildRustPackage rec {
   pname = "nixos-update-notifier";
-  version = "0.10.3-canary.1";
+  version = "0.10.3-canary.2";
 
   # Canary builds carry the GTK client's hidden `replay` subcommand for checking the
   # progress window against a recorded apply log; stable versions never do.
