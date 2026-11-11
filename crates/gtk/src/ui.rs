@@ -12,7 +12,7 @@ use nun_core::config::Config;
 use nun_core::diff::{ChangeKind, PackageChange};
 use nun_core::failure::Failure;
 use nun_core::ipc::{ApplyState, Details, UpgradeState};
-use nun_core::progress::{act, human_bytes, Progress, RateMeter};
+use nun_core::progress::{act, human_bytes, Current, Progress, RateMeter};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -1227,11 +1227,18 @@ fn build_progress_window(app: &Application) {
     let bar = new_bar();
     let builds = progress_label("");
     let builds_bar = new_bar();
-    let current = progress_label("");
-    current.add_css_class("dim-label");
-    current.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    current.set_wrap(false);
-    current.set_lines(4);
+    // One single-line label per entry in flight. A single multi-line ellipsized label
+    // requests less height than it draws, and overlaps the widgets around it.
+    let current = gtk::Box::new(Orientation::Vertical, 2);
+    for _ in 0..MAX_ACTIVITY_LINES {
+        let l = progress_label("");
+        l.add_css_class("dim-label");
+        l.set_wrap(false);
+        l.set_single_line_mode(true);
+        l.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        current.append(&l);
+    }
+    current.set_visible(false);
     let stall = progress_label("");
     stall.set_margin_start(0);
     let stall_row = flagged("dialog-warning-symbolic", "warning", &stall);
@@ -1240,7 +1247,7 @@ fn build_progress_window(app: &Application) {
         .bind_property("visible", &stall_row, "visible")
         .sync_create()
         .build();
-    for w in [&downloads, &builds, &current, &stall] {
+    for w in [&downloads, &builds, &stall] {
         w.set_visible(false);
     }
     builds_bar.set_visible(false);
@@ -1362,9 +1369,10 @@ fn build_progress_window(app: &Application) {
                     heading.set_text("Applying updates…");
                     subtitle.set_text("Running nixos-rebuild switch.");
                     cancel_requested.set(false);
-                    for w in [&downloads, &builds, &current, &stall] {
+                    for w in [&downloads, &builds, &stall] {
                         w.set_visible(false);
                     }
+                    current.set_visible(false);
                     builds_bar.set_visible(false);
                     bar.set_visible(true);
                     bar.set_fraction(0.0);
@@ -1393,7 +1401,8 @@ fn build_progress_window(app: &Application) {
                 running,
                 started.elapsed().as_secs_f64(),
                 &mut t.rate.borrow_mut(),
-                [&downloads, &builds, &current, &stall],
+                [&downloads, &builds, &stall],
+                &current,
                 [&bar, &builds_bar],
             );
 
@@ -1486,10 +1495,11 @@ fn show_progress(
     running: bool,
     now: f64,
     rate: &mut RateMeter,
-    labels: [&gtk::Label; 4],
+    labels: [&gtk::Label; 3],
+    current: &gtk::Box,
     bars: [&gtk::ProgressBar; 2],
 ) {
-    let [downloads, builds, current, stall] = labels;
+    let [downloads, builds, stall] = labels;
     let [dl_bar, build_bar] = bars;
 
     let paths = p.counts(act::COPY_PATHS);
@@ -1509,9 +1519,10 @@ fn show_progress(
         } else {
             dl_bar.set_fraction(1.0);
             // An apply that ended early leaves nothing in flight to report.
-            for w in [downloads, current, stall, builds] {
+            for w in [downloads, stall, builds] {
                 w.set_visible(false);
             }
+            current.set_visible(false);
             build_bar.set_visible(false);
         }
         return;
@@ -1563,23 +1574,23 @@ fn show_progress(
     let now_doing: Vec<String> = p
         .current()
         .iter()
-        .take(4)
-        .map(|c| {
-            let mut s = c.text.clone();
-            if let Some(phase) = &c.phase {
-                s.push_str(&format!(" ({phase})"));
-            }
-            if c.expected > 0 {
-                s.push_str(&format!(
-                    " — {} / {}",
-                    human_bytes(c.done),
-                    human_bytes(c.expected)
-                ));
-            }
-            s
-        })
+        .take(MAX_ACTIVITY_LINES)
+        .map(activity_line)
         .collect();
-    current.set_text(&now_doing.join("\n"));
+    let mut row = current.first_child();
+    let mut lines = now_doing.iter();
+    while let Some(w) = row {
+        if let Some(label) = w.downcast_ref::<gtk::Label>() {
+            match lines.next() {
+                Some(text) => {
+                    label.set_text(text);
+                    label.set_visible(true);
+                }
+                None => label.set_visible(false),
+            }
+        }
+        row = w.next_sibling();
+    }
     current.set_visible(running && !now_doing.is_empty());
 
     // "Slow" and "stuck" look the same in a log. A download that has not moved for a while
@@ -1596,6 +1607,33 @@ fn show_progress(
     } else {
         stall.set_visible(false);
     }
+}
+
+/// How many in-flight downloads and builds the apply window lists.
+const MAX_ACTIVITY_LINES: usize = 4;
+
+/// One line of the apply window's in-flight list. The substituter a path is copied from
+/// is dropped: it is nearly always the same cache, and it is what makes the line too long
+/// to fit.
+fn activity_line(c: &Current) -> String {
+    let mut s = c.text.as_str();
+    if c.kind == act::COPY_PATH {
+        if let Some(i) = s.rfind(" from '") {
+            s = &s[..i];
+        }
+    }
+    let mut s = s.to_string();
+    if let Some(phase) = &c.phase {
+        s.push_str(&format!(" ({phase})"));
+    }
+    if c.expected > 0 {
+        s.push_str(&format!(
+            " — {} / {}",
+            human_bytes(c.done),
+            human_bytes(c.expected)
+        ));
+    }
+    s
 }
 
 /// A coarse duration: "40 s", "3 min", "1 h 5 min".
@@ -1632,7 +1670,38 @@ fn read_new(path: &std::path::Path, offset: &mut u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_indicator, relative_time, LogTail};
+    use super::{activity_line, check_indicator, relative_time, LogTail};
+    use nun_core::progress::{act, Current};
+
+    #[test]
+    fn activity_lines_drop_the_substituter_but_keep_progress() {
+        let copy = Current {
+            kind: act::COPY_PATH,
+            text: "copying path '/nix/store/803czfj-inkscape-1.4.4' from 'https://cache.nixos.org'"
+                .into(),
+            phase: None,
+            done: 1024,
+            expected: 2048,
+        };
+        let line = activity_line(&copy);
+        assert!(
+            line.starts_with("copying path '/nix/store/803czfj-inkscape-1.4.4' — "),
+            "{line}"
+        );
+        assert!(!line.contains("cache.nixos.org"), "{line}");
+
+        let build = Current {
+            kind: act::BUILD,
+            text: "building '/nix/store/3d0nsfa-foo.drv' from 'x'".into(),
+            phase: Some("buildPhase".into()),
+            done: 0,
+            expected: 0,
+        };
+        assert_eq!(
+            activity_line(&build),
+            "building '/nix/store/3d0nsfa-foo.drv' from 'x' (buildPhase)"
+        );
+    }
 
     #[test]
     fn the_check_indicator_follows_the_daemon_and_clears_without_one() {
