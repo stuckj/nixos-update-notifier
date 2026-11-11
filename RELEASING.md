@@ -58,9 +58,10 @@ $ nixos-update-notifier-gtk replay ~/.cache/nixos-update-notifier/apply.log
 $ nixos-update-notifier-gtk replay crates/gtk/fixtures/apply-many-downloads.log
 ```
 
-It feeds `--lines-per-poll` lines (default 200) every 0.7 s and reports the apply as running
+It feeds `--lines-per-poll` lines (default 800) every 0.7 s and reports the apply as running
 throughout, so whatever is in flight when the log runs out stays on screen; `--until <n>`
-stops after line `n`. The fixture holds four long downloads and builds in flight at once.
+stops after line `n`. The fixture holds eleven long downloads and builds in flight at once,
+more than the window shows without scrolling.
 
 The release workflow's build job fails if a canary lacks the subcommand or a stable
 release has it. A branch merged into `main` with a canary version still in tree builds

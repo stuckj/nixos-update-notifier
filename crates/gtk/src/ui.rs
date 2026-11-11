@@ -1256,18 +1256,23 @@ fn build_progress_window(app: &Application, client: Option<Rc<dyn ApplyFeed>>) {
     let bar = new_bar();
     let builds = progress_label("");
     let builds_bar = new_bar();
-    // One single-line label per entry in flight. A single multi-line ellipsized label
-    // requests less height than it draws, and overlaps the widgets around it.
-    let current = gtk::Box::new(Orientation::Vertical, 2);
-    for _ in 0..MAX_ACTIVITY_LINES {
-        let l = progress_label("");
-        l.add_css_class("dim-label");
-        l.set_wrap(false);
-        l.set_single_line_mode(true);
-        l.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        current.append(&l);
-    }
+    // One single-line label per entry in flight, added as needed. A single multi-line
+    // ellipsized label requests less height than it draws, and overlaps the widgets around
+    // it. The list grows to VISIBLE_ACTIVITY_LINES and scrolls beyond that.
+    let rows = gtk::Box::new(Orientation::Vertical, ACTIVITY_SPACING);
+    let (_, line_height) = activity_row().create_pango_layout(Some("Xg")).pixel_size();
+    let current = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(VISIBLE_ACTIVITY_LINES * (line_height + ACTIVITY_SPACING))
+        .child(&rows)
+        .build();
     current.set_visible(false);
+    let activities = ActivityList {
+        scroller: current.clone(),
+        rows,
+    };
     let stall = progress_label("");
     stall.set_margin_start(0);
     let stall_row = flagged("dialog-warning-symbolic", "warning", &stall);
@@ -1431,7 +1436,7 @@ fn build_progress_window(app: &Application, client: Option<Rc<dyn ApplyFeed>>) {
                 started.elapsed().as_secs_f64(),
                 &mut t.rate.borrow_mut(),
                 [&downloads, &builds, &stall],
-                &current,
+                &activities,
                 [&bar, &builds_bar],
             );
 
@@ -1525,10 +1530,11 @@ fn show_progress(
     now: f64,
     rate: &mut RateMeter,
     labels: [&gtk::Label; 3],
-    current: &gtk::Box,
+    activities: &ActivityList,
     bars: [&gtk::ProgressBar; 2],
 ) {
     let [downloads, builds, stall] = labels;
+    let current = &activities.scroller;
     let [dl_bar, build_bar] = bars;
 
     let paths = p.counts(act::COPY_PATHS);
@@ -1600,24 +1606,23 @@ fn show_progress(
         build_bar.set_visible(false);
     }
 
-    let now_doing: Vec<String> = p
-        .current()
-        .iter()
-        .take(MAX_ACTIVITY_LINES)
-        .map(activity_line)
-        .collect();
-    let mut row = current.first_child();
-    let mut lines = now_doing.iter();
-    while let Some(w) = row {
-        if let Some(label) = w.downcast_ref::<gtk::Label>() {
-            match lines.next() {
-                Some(text) => {
-                    label.set_text(text);
-                    label.set_visible(true);
-                }
-                None => label.set_visible(false),
+    let now_doing: Vec<String> = p.current().iter().map(activity_line).collect();
+    let mut row = activities.rows.first_child();
+    for text in &now_doing {
+        let label = match row.as_ref().and_then(|w| w.downcast_ref::<gtk::Label>()) {
+            Some(l) => l.clone(),
+            None => {
+                let l = activity_row();
+                activities.rows.append(&l);
+                l
             }
-        }
+        };
+        label.set_text(text);
+        label.set_visible(true);
+        row = label.next_sibling();
+    }
+    while let Some(w) = row {
+        w.set_visible(false);
         row = w.next_sibling();
     }
     current.set_visible(running && !now_doing.is_empty());
@@ -1638,8 +1643,27 @@ fn show_progress(
     }
 }
 
-/// How many in-flight downloads and builds the apply window lists.
-const MAX_ACTIVITY_LINES: usize = 4;
+/// How many in-flight downloads and builds the apply window shows before scrolling.
+const VISIBLE_ACTIVITY_LINES: i32 = 6;
+const ACTIVITY_SPACING: i32 = 2;
+
+/// The apply window's list of downloads and builds in flight.
+struct ActivityList {
+    scroller: gtk::ScrolledWindow,
+    rows: gtk::Box,
+}
+
+fn activity_row() -> gtk::Label {
+    let l = gtk::Label::new(None);
+    l.set_halign(Align::Start);
+    l.set_margin_start(12);
+    l.set_margin_end(12);
+    l.set_xalign(0.0);
+    l.add_css_class("dim-label");
+    l.set_single_line_mode(true);
+    l.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    l
+}
 
 /// One line of the apply window's in-flight list. The substituter a path is copied from
 /// is dropped: it is nearly always the same cache, and it is what makes the line too long
@@ -1702,15 +1726,17 @@ mod tests {
     use super::{activity_line, check_indicator, relative_time, LogTail};
     use nun_core::progress::{act, Current};
 
-    /// The replay fixture reproduces the window from issue #38: four entries in flight.
+    /// The replay fixture reproduces the window from issue #38, with every entry its counts
+    /// say is running (3 downloads, 8 builds): more than the list shows without scrolling.
     #[test]
-    fn the_replay_fixture_has_four_entries_in_flight() {
+    fn the_replay_fixture_has_more_entries_in_flight_than_fit() {
         let mut p = nun_core::progress::Progress::default();
         for line in include_str!("../fixtures/apply-many-downloads.log").lines() {
             p.feed_line(line);
         }
         let lines: Vec<String> = p.current().iter().map(activity_line).collect();
-        assert_eq!(lines.len(), 4, "{lines:#?}");
+        assert_eq!(lines.len(), 11, "{lines:#?}");
+        assert!(lines.len() > super::VISIBLE_ACTIVITY_LINES as usize);
         assert!(lines[0].contains("inkscape-1.4.4' — "), "{}", lines[0]);
         assert!(lines[3].starts_with("building '"), "{}", lines[3]);
     }

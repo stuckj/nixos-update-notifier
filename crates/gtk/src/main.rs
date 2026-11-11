@@ -38,7 +38,7 @@ enum Cmd {
         /// An apply log, e.g. ~/.cache/nixos-update-notifier/apply.log.
         log: PathBuf,
         /// Log lines fed each poll (every 0.7 s).
-        #[arg(long, default_value_t = 200)]
+        #[arg(long, default_value_t = 800)]
         lines_per_poll: usize,
         /// Stop after this many lines and hold the window there.
         #[arg(long)]
