@@ -11,8 +11,8 @@ use gtk::{glib, Align, Application, ApplicationWindow, Orientation};
 use nun_core::config::Config;
 use nun_core::diff::{ChangeKind, PackageChange};
 use nun_core::failure::Failure;
-use nun_core::ipc::{ApplyState, Details, UpgradeState};
-use nun_core::progress::{act, human_bytes, Progress, RateMeter};
+use nun_core::ipc::{ApplyInfo, ApplyState, Details, UpgradeState};
+use nun_core::progress::{act, human_bytes, Current, Progress, RateMeter};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -1176,24 +1176,53 @@ const APP_ID_PROGRESS: &str = "org.nixos.UpdateNotifier.Progress";
 /// apply failed the reason was a single line the user never saw. (The first real failure
 /// was `curl: (22) … error 525` from a vendor download server, buried at line 6881.)
 pub fn run_progress_window() -> Result<()> {
-    let app = Application::builder()
-        .application_id(APP_ID_PROGRESS)
-        .build();
+    run_progress(APP_ID_PROGRESS, || {
+        Client::connect()
+            .ok()
+            .map(|c| Rc::new(c) as Rc<dyn ApplyFeed>)
+    })
+}
 
-    app.connect_activate(|app| {
+/// What the progress window follows: the daemon, or (in canary builds) a replayed log.
+pub(crate) trait ApplyFeed {
+    /// The apply to show; `None` when the source did not answer this time.
+    fn apply(&self) -> Option<ApplyInfo>;
+    fn log_path(&self) -> Option<PathBuf>;
+    fn cancel(&self);
+}
+
+impl ApplyFeed for Client {
+    fn apply(&self) -> Option<ApplyInfo> {
+        self.try_details().map(|d| d.apply)
+    }
+
+    fn log_path(&self) -> Option<PathBuf> {
+        self.apply_log().ok()
+    }
+
+    fn cancel(&self) {
+        let _ = self.cancel_apply();
+    }
+}
+
+pub(crate) fn run_progress(
+    app_id: &str,
+    feed: impl Fn() -> Option<Rc<dyn ApplyFeed>> + 'static,
+) -> Result<()> {
+    let app = Application::builder().application_id(app_id).build();
+
+    app.connect_activate(move |app| {
         if let Some(existing) = app.active_window() {
             existing.present();
             return;
         }
-        build_progress_window(app);
+        build_progress_window(app, feed());
     });
     app.run_with_args::<&str>(&[]);
     Ok(())
 }
 
-fn build_progress_window(app: &Application) {
-    let client: Option<Rc<Client>> = Client::connect().ok().map(Rc::new);
-
+fn build_progress_window(app: &Application, client: Option<Rc<dyn ApplyFeed>>) {
     let heading = gtk::Label::new(Some("Applying updates…"));
     heading.set_halign(Align::Start);
     heading.set_margin_start(12);
@@ -1227,11 +1256,23 @@ fn build_progress_window(app: &Application) {
     let bar = new_bar();
     let builds = progress_label("");
     let builds_bar = new_bar();
-    let current = progress_label("");
-    current.add_css_class("dim-label");
-    current.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    current.set_wrap(false);
-    current.set_lines(4);
+    // One single-line label per entry in flight, added as needed. A single multi-line
+    // ellipsized label requests less height than it draws, and overlaps the widgets around
+    // it. The list grows to VISIBLE_ACTIVITY_LINES and scrolls beyond that.
+    let rows = gtk::Box::new(Orientation::Vertical, ACTIVITY_SPACING);
+    let (_, line_height) = activity_row().create_pango_layout(Some("Xg")).pixel_size();
+    let current = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(VISIBLE_ACTIVITY_LINES * (line_height + ACTIVITY_SPACING))
+        .child(&rows)
+        .build();
+    current.set_visible(false);
+    let activities = ActivityList {
+        scroller: current.clone(),
+        rows,
+    };
     let stall = progress_label("");
     stall.set_margin_start(0);
     let stall_row = flagged("dialog-warning-symbolic", "warning", &stall);
@@ -1240,7 +1281,7 @@ fn build_progress_window(app: &Application) {
         .bind_property("visible", &stall_row, "visible")
         .sync_create()
         .build();
-    for w in [&downloads, &builds, &current, &stall] {
+    for w in [&downloads, &builds, &stall] {
         w.set_visible(false);
     }
     builds_bar.set_visible(false);
@@ -1286,7 +1327,7 @@ fn build_progress_window(app: &Application) {
         let cancel_requested = cancel_requested.clone();
         cancel.connect_clicked(move |_| {
             if let Some(c) = &client {
-                let _ = c.cancel_apply();
+                c.cancel();
             }
             cancel_requested.set(true);
             // Cancellation is cooperative and may be declined during activation, so say
@@ -1327,7 +1368,7 @@ fn build_progress_window(app: &Application) {
     // Tail the log and follow the daemon's apply. Reading from a byte offset means the
     // window can be opened, closed and reopened during a long apply without losing output;
     // a reopened window replays the log from the start, which rebuilds the totals.
-    let log_path = client.as_ref().and_then(|c| c.apply_log().ok());
+    let log_path = client.as_ref().and_then(|c| c.log_path());
     let tail = Rc::new(RefCell::new(LogTail::default()));
     // The apply this window is showing. Status alone cannot say which apply has finished:
     // a window still open from a cancelled apply would read a later apply's progress as
@@ -1347,8 +1388,8 @@ fn build_progress_window(app: &Application) {
             // A failed call (the daemon restarting, a timeout) is not "no apply": keep what
             // is on screen until the next poll answers.
             let apply = match &client {
-                Some(c) => match c.try_details() {
-                    Some(d) => d.apply,
+                Some(c) => match c.apply() {
+                    Some(a) => a,
                     None => return glib::ControlFlow::Continue,
                 },
                 None => Default::default(),
@@ -1362,9 +1403,10 @@ fn build_progress_window(app: &Application) {
                     heading.set_text("Applying updates…");
                     subtitle.set_text("Running nixos-rebuild switch.");
                     cancel_requested.set(false);
-                    for w in [&downloads, &builds, &current, &stall] {
+                    for w in [&downloads, &builds, &stall] {
                         w.set_visible(false);
                     }
+                    current.set_visible(false);
                     builds_bar.set_visible(false);
                     bar.set_visible(true);
                     bar.set_fraction(0.0);
@@ -1393,7 +1435,8 @@ fn build_progress_window(app: &Application) {
                 running,
                 started.elapsed().as_secs_f64(),
                 &mut t.rate.borrow_mut(),
-                [&downloads, &builds, &current, &stall],
+                [&downloads, &builds, &stall],
+                &activities,
                 [&bar, &builds_bar],
             );
 
@@ -1486,10 +1529,12 @@ fn show_progress(
     running: bool,
     now: f64,
     rate: &mut RateMeter,
-    labels: [&gtk::Label; 4],
+    labels: [&gtk::Label; 3],
+    activities: &ActivityList,
     bars: [&gtk::ProgressBar; 2],
 ) {
-    let [downloads, builds, current, stall] = labels;
+    let [downloads, builds, stall] = labels;
+    let current = &activities.scroller;
     let [dl_bar, build_bar] = bars;
 
     let paths = p.counts(act::COPY_PATHS);
@@ -1509,9 +1554,10 @@ fn show_progress(
         } else {
             dl_bar.set_fraction(1.0);
             // An apply that ended early leaves nothing in flight to report.
-            for w in [downloads, current, stall, builds] {
+            for w in [downloads, stall, builds] {
                 w.set_visible(false);
             }
+            current.set_visible(false);
             build_bar.set_visible(false);
         }
         return;
@@ -1560,26 +1606,25 @@ fn show_progress(
         build_bar.set_visible(false);
     }
 
-    let now_doing: Vec<String> = p
-        .current()
-        .iter()
-        .take(4)
-        .map(|c| {
-            let mut s = c.text.clone();
-            if let Some(phase) = &c.phase {
-                s.push_str(&format!(" ({phase})"));
+    let now_doing: Vec<String> = p.current().iter().map(activity_line).collect();
+    let mut row = activities.rows.first_child();
+    for text in &now_doing {
+        let label = match row.as_ref().and_then(|w| w.downcast_ref::<gtk::Label>()) {
+            Some(l) => l.clone(),
+            None => {
+                let l = activity_row();
+                activities.rows.append(&l);
+                l
             }
-            if c.expected > 0 {
-                s.push_str(&format!(
-                    " — {} / {}",
-                    human_bytes(c.done),
-                    human_bytes(c.expected)
-                ));
-            }
-            s
-        })
-        .collect();
-    current.set_text(&now_doing.join("\n"));
+        };
+        label.set_text(text);
+        label.set_visible(true);
+        row = label.next_sibling();
+    }
+    while let Some(w) = row {
+        w.set_visible(false);
+        row = w.next_sibling();
+    }
     current.set_visible(running && !now_doing.is_empty());
 
     // "Slow" and "stuck" look the same in a log. A download that has not moved for a while
@@ -1596,6 +1641,52 @@ fn show_progress(
     } else {
         stall.set_visible(false);
     }
+}
+
+/// How many in-flight downloads and builds the apply window shows before scrolling.
+const VISIBLE_ACTIVITY_LINES: i32 = 6;
+const ACTIVITY_SPACING: i32 = 2;
+
+/// The apply window's list of downloads and builds in flight.
+struct ActivityList {
+    scroller: gtk::ScrolledWindow,
+    rows: gtk::Box,
+}
+
+fn activity_row() -> gtk::Label {
+    let l = gtk::Label::new(None);
+    l.set_halign(Align::Start);
+    l.set_margin_start(12);
+    l.set_margin_end(12);
+    l.set_xalign(0.0);
+    l.add_css_class("dim-label");
+    l.set_single_line_mode(true);
+    l.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    l
+}
+
+/// One line of the apply window's in-flight list. The substituter a path is copied from
+/// is dropped: it is nearly always the same cache, and it is what makes the line too long
+/// to fit.
+fn activity_line(c: &Current) -> String {
+    let mut s = c.text.as_str();
+    if c.kind == act::COPY_PATH {
+        if let Some(i) = s.rfind(" from '") {
+            s = &s[..i];
+        }
+    }
+    let mut s = s.to_string();
+    if let Some(phase) = &c.phase {
+        s.push_str(&format!(" ({phase})"));
+    }
+    if c.expected > 0 {
+        s.push_str(&format!(
+            " — {} / {}",
+            human_bytes(c.done),
+            human_bytes(c.expected)
+        ));
+    }
+    s
 }
 
 /// A coarse duration: "40 s", "3 min", "1 h 5 min".
@@ -1632,7 +1723,53 @@ fn read_new(path: &std::path::Path, offset: &mut u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_indicator, relative_time, LogTail};
+    use super::{activity_line, check_indicator, relative_time, LogTail};
+    use nun_core::progress::{act, Current};
+
+    /// The replay fixture reproduces the window from issue #38, with every entry its counts
+    /// say is running (3 downloads, 8 builds): more than the list shows without scrolling.
+    #[test]
+    fn the_replay_fixture_has_more_entries_in_flight_than_fit() {
+        let mut p = nun_core::progress::Progress::default();
+        for line in include_str!("../fixtures/apply-many-downloads.log").lines() {
+            p.feed_line(line);
+        }
+        let lines: Vec<String> = p.current().iter().map(activity_line).collect();
+        assert_eq!(lines.len(), 11, "{lines:#?}");
+        assert!(lines.len() > super::VISIBLE_ACTIVITY_LINES as usize);
+        assert!(lines[0].contains("inkscape-1.4.4' — "), "{}", lines[0]);
+        assert!(lines[3].starts_with("building '"), "{}", lines[3]);
+    }
+
+    #[test]
+    fn activity_lines_drop_the_substituter_but_keep_progress() {
+        let copy = Current {
+            kind: act::COPY_PATH,
+            text: "copying path '/nix/store/803czfj-inkscape-1.4.4' from 'https://cache.nixos.org'"
+                .into(),
+            phase: None,
+            done: 1024,
+            expected: 2048,
+        };
+        let line = activity_line(&copy);
+        assert!(
+            line.starts_with("copying path '/nix/store/803czfj-inkscape-1.4.4' — "),
+            "{line}"
+        );
+        assert!(!line.contains("cache.nixos.org"), "{line}");
+
+        let build = Current {
+            kind: act::BUILD,
+            text: "building '/nix/store/3d0nsfa-foo.drv' from 'x'".into(),
+            phase: Some("buildPhase".into()),
+            done: 0,
+            expected: 0,
+        };
+        assert_eq!(
+            activity_line(&build),
+            "building '/nix/store/3d0nsfa-foo.drv' from 'x' (buildPhase)"
+        );
+    }
 
     #[test]
     fn the_check_indicator_follows_the_daemon_and_clears_without_one() {

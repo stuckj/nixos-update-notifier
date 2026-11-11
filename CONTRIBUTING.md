@@ -45,7 +45,7 @@ crates/
   core/   src/{config,nix,check,diff,changelog,apply,lock,failure,progress,release}.rs, lib.rs
           tests/integration.rs + tests/fixtures/
   daemon/ src/{main,daemon,tray,notify,state,dbus,persist}.rs
-  gtk/    src/{main,ui,client}.rs
+  gtk/    src/{main,ui,client,replay}.rs   (replay: canary builds only, see RELEASING.md)
 nix/      package.nix, hm-module.nix, nixos-module.nix
 scripts/  set-version.sh, plasma-smoke-test.sh
 ```
@@ -236,6 +236,7 @@ README; it cannot be fixed without changing what the tool is for.
 | Tier | Command | Needs |
 |---|---|---|
 | Unit | `cargo test -p nun-core -p nixos-update-notifier` | nothing |
+| MSRV | `RUSTUP_TOOLCHAIN=<rust-version> cargo check --locked -p nun-core -p nixos-update-notifier --all-targets` | the toolchain named by `rust-version` in `Cargo.toml` |
 | Integration | `cargo test -p nun-core --test integration -- --ignored` | real `nix` |
 | Smoke | `scripts/plasma-smoke-test.sh` | a live Plasma session |
 | Smoke (VM) | `nix build -L .#vmTests.plasma-smoke` | KVM |

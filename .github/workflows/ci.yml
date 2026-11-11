@@ -35,6 +35,30 @@ jobs:
       - name: shellcheck scripts
         run: shellcheck scripts/*.sh
 
+  # The declared `rust-version`, read from Cargo.toml. Every other job builds with a newer
+  # compiler, so without this a dependency that raises its own minimum passes CI while ours
+  # stops building. GTK is left out for the same reason as above.
+  msrv:
+    name: check on declared rust-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: read rust-version
+        id: msrv
+        run: |
+          v=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$v" || { echo "::error::no rust-version in Cargo.toml"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (core + daemon)
+        # Overrides rust-toolchain.toml, which pins `stable`.
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+        run: cargo check --locked -p nun-core -p nixos-update-notifier --all-targets
+
   # Tier 2: build the whole flake (package incl. the GTK client + both Nix modules) and run
   # the in-sandbox test suite. This is what proves the GUI compiles and the flake is sound.
   nix:

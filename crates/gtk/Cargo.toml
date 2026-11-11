@@ -11,6 +11,10 @@ repository.workspace = true
 name = "nixos-update-notifier-gtk"
 path = "src/main.rs"
 
+[features]
+# Hidden `replay <log>` subcommand. nix/package.nix enables it for canary versions only.
+replay = []
+
 [dependencies]
 nun-core = { path = "../core" }
 # The only crate in the workspace that links GTK system libraries.

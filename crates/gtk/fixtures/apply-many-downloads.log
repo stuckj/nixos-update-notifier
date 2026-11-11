@@ -1,0 +1,22 @@
+building the system configuration...
+@nix {"action":"start","id":1,"level":0,"parent":0,"text":"","type":103,"fields":[]}
+@nix {"action":"result","id":1,"type":106,"fields":[100,2254857830]}
+@nix {"action":"result","id":1,"type":105,"fields":[333,492,3,0]}
+@nix {"action":"start","id":2,"level":0,"parent":0,"text":"","type":104,"fields":[]}
+@nix {"action":"result","id":2,"type":105,"fields":[75,326,8,0]}
+@nix {"action":"start","id":10,"level":3,"parent":1,"text":"copying path '/nix/store/803czfjbq1l7m5n3vrh6aw2rdzqkx0g9-inkscape-1.4.4' from 'https://cache.nixos.org'","type":100,"fields":[]}
+@nix {"action":"result","id":10,"type":105,"fields":[211392922,212441498,0,0]}
+@nix {"action":"start","id":11,"level":3,"parent":1,"text":"copying path '/nix/store/c8qih5a0yrwz4m1kd9vbx6s2jlnf37pc-libreoffice-26.2.1.2' from 'https://cache.nixos.org'","type":100,"fields":[]}
+@nix {"action":"result","id":11,"type":105,"fields":[93218406,1503238553,0,0]}
+@nix {"action":"start","id":12,"level":3,"parent":1,"text":"copying path '/nix/store/7x7kln2s9qdfm0w4hb1zrc8vya6jp3ge-gcc-15.2.0' from 'https://cache.nixos.org'","type":100,"fields":[]}
+@nix {"action":"result","id":12,"type":105,"fields":[157705830,276404634,0,0]}
+@nix {"action":"start","id":20,"level":3,"parent":2,"text":"building '/nix/store/3d0nsfa8kw2pq6vz1m9yhl4cxr7bj05t-Antigravity-20IDE.tar.gz.drv'","type":105,"fields":[]}
+@nix {"action":"start","id":21,"level":3,"parent":2,"text":"building '/nix/store/9f2kq7m1xw0bz4n8vpa3rjd6ys5lhc0g-python3.13-numpy-2.3.4.drv'","type":105,"fields":[]}
+@nix {"action":"result","id":21,"type":104,"fields":["checkPhase"]}
+@nix {"action":"start","id":22,"level":3,"parent":2,"text":"building '/nix/store/k4w8n0qz2m7xv1b9pd3ra6fjys5hc0lt-linux-6.17.8-modules-shrunk.drv'","type":105,"fields":[]}
+@nix {"action":"start","id":23,"level":3,"parent":2,"text":"building '/nix/store/a1s7d9f3g5h2j8k4l6z0x9c7v5b3n1m2-firefox-unwrapped-145.0.drv'","type":105,"fields":[]}
+@nix {"action":"result","id":23,"type":104,"fields":["buildPhase"]}
+@nix {"action":"start","id":24,"level":3,"parent":2,"text":"building '/nix/store/q0w9e8r7t6y5u4i3o2p1a0s9d8f7g6h5-system-path.drv'","type":105,"fields":[]}
+@nix {"action":"start","id":25,"level":3,"parent":2,"text":"building '/nix/store/z1x2c3v4b5n6m7a8s9d0f1g2h3j4k5l6-etc-fonts-conf.d.drv'","type":105,"fields":[]}
+@nix {"action":"start","id":26,"level":3,"parent":2,"text":"building '/nix/store/p9o8i7u6y5t4r3e2w1q0a9s8d7f6g5h4-home-manager-generation.drv'","type":105,"fields":[]}
+@nix {"action":"start","id":27,"level":3,"parent":2,"text":"building '/nix/store/m3n2b1v0c9x8z7l6k5j4h3g2f1d0s9a8-unit-nixos-update-notifier.service.drv'","type":105,"fields":[]}

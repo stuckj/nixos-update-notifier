@@ -4,6 +4,8 @@
 //! to the running daemon over D-Bus; it holds no update logic of its own.
 
 mod client;
+#[cfg(feature = "replay")]
+mod replay;
 mod ui;
 
 use anyhow::Result;
@@ -29,6 +31,19 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Replay a recorded apply log in the progress window, without the daemon.
+    #[cfg(feature = "replay")]
+    #[command(hide = true)]
+    Replay {
+        /// An apply log, e.g. ~/.cache/nixos-update-notifier/apply.log.
+        log: PathBuf,
+        /// Log lines fed each poll (every 0.7 s).
+        #[arg(long, default_value_t = 800)]
+        lines_per_poll: usize,
+        /// Stop after this many lines and hold the window there.
+        #[arg(long)]
+        until: Option<usize>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -40,5 +55,11 @@ fn main() -> Result<()> {
             let path = Config::resolve_path(config)?;
             ui::run_settings_window(path)
         }
+        #[cfg(feature = "replay")]
+        Cmd::Replay {
+            log,
+            lines_per_poll,
+            until,
+        } => replay::run(&log, lines_per_poll, until),
     }
 }
