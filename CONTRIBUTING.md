@@ -45,7 +45,7 @@ crates/
   core/   src/{config,nix,check,diff,changelog,apply,lock,failure,progress,release}.rs, lib.rs
           tests/integration.rs + tests/fixtures/
   daemon/ src/{main,daemon,tray,notify,state,dbus,persist}.rs
-  gtk/    src/{main,ui,client}.rs
+  gtk/    src/{main,ui,client,replay}.rs   (replay: canary builds only, see RELEASING.md)
 nix/      package.nix, hm-module.nix, nixos-module.nix
 scripts/  set-version.sh, plasma-smoke-test.sh
 ```

@@ -11,7 +11,7 @@ use gtk::{glib, Align, Application, ApplicationWindow, Orientation};
 use nun_core::config::Config;
 use nun_core::diff::{ChangeKind, PackageChange};
 use nun_core::failure::Failure;
-use nun_core::ipc::{ApplyState, Details, UpgradeState};
+use nun_core::ipc::{ApplyInfo, ApplyState, Details, UpgradeState};
 use nun_core::progress::{act, human_bytes, Current, Progress, RateMeter};
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -1176,24 +1176,53 @@ const APP_ID_PROGRESS: &str = "org.nixos.UpdateNotifier.Progress";
 /// apply failed the reason was a single line the user never saw. (The first real failure
 /// was `curl: (22) … error 525` from a vendor download server, buried at line 6881.)
 pub fn run_progress_window() -> Result<()> {
-    let app = Application::builder()
-        .application_id(APP_ID_PROGRESS)
-        .build();
+    run_progress(APP_ID_PROGRESS, || {
+        Client::connect()
+            .ok()
+            .map(|c| Rc::new(c) as Rc<dyn ApplyFeed>)
+    })
+}
 
-    app.connect_activate(|app| {
+/// What the progress window follows: the daemon, or (in canary builds) a replayed log.
+pub(crate) trait ApplyFeed {
+    /// The apply to show; `None` when the source did not answer this time.
+    fn apply(&self) -> Option<ApplyInfo>;
+    fn log_path(&self) -> Option<PathBuf>;
+    fn cancel(&self);
+}
+
+impl ApplyFeed for Client {
+    fn apply(&self) -> Option<ApplyInfo> {
+        self.try_details().map(|d| d.apply)
+    }
+
+    fn log_path(&self) -> Option<PathBuf> {
+        self.apply_log().ok()
+    }
+
+    fn cancel(&self) {
+        let _ = self.cancel_apply();
+    }
+}
+
+pub(crate) fn run_progress(
+    app_id: &str,
+    feed: impl Fn() -> Option<Rc<dyn ApplyFeed>> + 'static,
+) -> Result<()> {
+    let app = Application::builder().application_id(app_id).build();
+
+    app.connect_activate(move |app| {
         if let Some(existing) = app.active_window() {
             existing.present();
             return;
         }
-        build_progress_window(app);
+        build_progress_window(app, feed());
     });
     app.run_with_args::<&str>(&[]);
     Ok(())
 }
 
-fn build_progress_window(app: &Application) {
-    let client: Option<Rc<Client>> = Client::connect().ok().map(Rc::new);
-
+fn build_progress_window(app: &Application, client: Option<Rc<dyn ApplyFeed>>) {
     let heading = gtk::Label::new(Some("Applying updates…"));
     heading.set_halign(Align::Start);
     heading.set_margin_start(12);
@@ -1293,7 +1322,7 @@ fn build_progress_window(app: &Application) {
         let cancel_requested = cancel_requested.clone();
         cancel.connect_clicked(move |_| {
             if let Some(c) = &client {
-                let _ = c.cancel_apply();
+                c.cancel();
             }
             cancel_requested.set(true);
             // Cancellation is cooperative and may be declined during activation, so say
@@ -1334,7 +1363,7 @@ fn build_progress_window(app: &Application) {
     // Tail the log and follow the daemon's apply. Reading from a byte offset means the
     // window can be opened, closed and reopened during a long apply without losing output;
     // a reopened window replays the log from the start, which rebuilds the totals.
-    let log_path = client.as_ref().and_then(|c| c.apply_log().ok());
+    let log_path = client.as_ref().and_then(|c| c.log_path());
     let tail = Rc::new(RefCell::new(LogTail::default()));
     // The apply this window is showing. Status alone cannot say which apply has finished:
     // a window still open from a cancelled apply would read a later apply's progress as
@@ -1354,8 +1383,8 @@ fn build_progress_window(app: &Application) {
             // A failed call (the daemon restarting, a timeout) is not "no apply": keep what
             // is on screen until the next poll answers.
             let apply = match &client {
-                Some(c) => match c.try_details() {
-                    Some(d) => d.apply,
+                Some(c) => match c.apply() {
+                    Some(a) => a,
                     None => return glib::ControlFlow::Continue,
                 },
                 None => Default::default(),
@@ -1672,6 +1701,19 @@ fn read_new(path: &std::path::Path, offset: &mut u64) -> Option<String> {
 mod tests {
     use super::{activity_line, check_indicator, relative_time, LogTail};
     use nun_core::progress::{act, Current};
+
+    /// The replay fixture reproduces the window from issue #38: four entries in flight.
+    #[test]
+    fn the_replay_fixture_has_four_entries_in_flight() {
+        let mut p = nun_core::progress::Progress::default();
+        for line in include_str!("../fixtures/apply-many-downloads.log").lines() {
+            p.feed_line(line);
+        }
+        let lines: Vec<String> = p.current().iter().map(activity_line).collect();
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        assert!(lines[0].contains("inkscape-1.4.4' — "), "{}", lines[0]);
+        assert!(lines[3].starts_with("building '"), "{}", lines[3]);
+    }
 
     #[test]
     fn activity_lines_drop_the_substituter_but_keep_progress() {

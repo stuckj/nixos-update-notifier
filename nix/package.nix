@@ -13,9 +13,13 @@
   git,
   makeBinaryWrapper,
 }:
-rustPlatform.buildRustPackage {
+rustPlatform.buildRustPackage rec {
   pname = "nixos-update-notifier";
   version = "0.10.3-canary.1";
+
+  # Canary builds carry the GTK client's hidden `replay` subcommand for checking the
+  # progress window against a recorded apply log; stable versions never do.
+  buildFeatures = lib.optional (lib.hasInfix "-canary." version) "replay";
 
   # Cargo workspace: builds both the `nixos-update-notifier` (daemon+CLI) and
   # `nixos-update-notifier-gtk` (GUI client) binaries. Only the GTK crate links GTK.

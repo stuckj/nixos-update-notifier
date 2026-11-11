@@ -1,0 +1,13 @@
+building the system configuration...
+@nix {"action":"start","id":1,"level":0,"parent":0,"text":"","type":103,"fields":[]}
+@nix {"action":"result","id":1,"type":106,"fields":[100,2254857830]}
+@nix {"action":"result","id":1,"type":105,"fields":[333,492,3,0]}
+@nix {"action":"start","id":2,"level":0,"parent":0,"text":"","type":104,"fields":[]}
+@nix {"action":"result","id":2,"type":105,"fields":[75,326,8,0]}
+@nix {"action":"start","id":10,"level":3,"parent":1,"text":"copying path '/nix/store/803czfjbq1l7m5n3vrh6aw2rdzqkx0g9-inkscape-1.4.4' from 'https://cache.nixos.org'","type":100,"fields":[]}
+@nix {"action":"result","id":10,"type":105,"fields":[211392922,212441498,0,0]}
+@nix {"action":"start","id":11,"level":3,"parent":1,"text":"copying path '/nix/store/c8qih5a0yrwz4m1kd9vbx6s2jlnf37pc-libreoffice-26.2.1.2' from 'https://cache.nixos.org'","type":100,"fields":[]}
+@nix {"action":"result","id":11,"type":105,"fields":[93218406,1503238553,0,0]}
+@nix {"action":"start","id":12,"level":3,"parent":1,"text":"copying path '/nix/store/7x7kln2s9qdfm0w4hb1zrc8vya6jp3ge-gcc-15.2.0' from 'https://cache.nixos.org'","type":100,"fields":[]}
+@nix {"action":"result","id":12,"type":105,"fields":[157705830,276404634,0,0]}
+@nix {"action":"start","id":20,"level":3,"parent":2,"text":"building '/nix/store/3d0nsfa8kw2pq6vz1m9yhl4cxr7bj05t-Antigravity-20IDE.tar.gz.drv'","type":105,"fields":[]}

@@ -169,6 +169,22 @@ jobs:
       - name: Build package
         run: nix build -L
 
+      # The GTK client's `replay` subcommand is for verifying canaries and must never ship
+      # in a stable release.
+      - name: Check replay is in canaries only
+        env:
+          IS_CANARY: ${{ needs.prepare.outputs.is_canary }}
+        run: |
+          if ./result/bin/nixos-update-notifier-gtk replay --help >/dev/null 2>&1; then
+            has=true
+          else
+            has=false
+          fi
+          if [ "$has" != "$IS_CANARY" ]; then
+            echo "::error::replay subcommand present=$has, but is_canary=$IS_CANARY"
+            exit 1
+          fi
+
       - name: Assemble release tarball
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
